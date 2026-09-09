@@ -1,0 +1,9 @@
+.claude/
+.vscode/
+__pycache__/
+
+ip.txt
+
+build/
+dist/
+*.egg-info/

@@ -1,0 +1,7 @@
+meshcat
+mujoco
+numpy
+pin>=4.1
+robot_descriptions
+xacrodoc
+xarm-python-sdk

@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xarm7_lib"
+version = "0.1.0"
+description = "Simulated and real UFACTORY xArm7 control behind one interface, with self-collision and workspace safety checks"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "meshcat",
+    "mujoco",
+    "numpy",
+    # provides both the `pinocchio` and `coal` modules used by safety.py
+    "pin>=4.1",
+    "robot_descriptions",
+    "xacrodoc",
+    "xarm-python-sdk",
+]
+
+[project.urls]
+Homepage = "https://github.com/tooflesswulf/16384-prototype-lib"
+
+[tool.setuptools.packages.find]
+where = ["src"]
