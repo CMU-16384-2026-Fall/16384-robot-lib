@@ -26,13 +26,20 @@ that module's own imports.
 The file is one header row and then a row per sample, in the library's own
 units — **seconds and radians**, not degrees:
 
-    t,joint1,joint2,joint3,joint4,joint5,joint6,joint7
+    t,joint1,joint4,joint7
 
-`t` starts at zero on the first sample. To read one back:
+Those are the three joints the guided hold releases, the ones a student can
+actually turn; the other four are clamped at the pose that makes the arm
+planar and would only write four constant columns. Pass `--all-joints` to
+record all seven anyway.
+
+The angles are **absolute** — each is the joint's own position as the
+controller reports it, not an offset from wherever the recording started. Only
+`t` is relative, starting at zero on the first sample. To read one back:
 
     import numpy as np
     data = np.loadtxt("recordings/joints-....csv", delimiter=",", skiprows=1)
-    t, q = data[:, 0], data[:, 1:]      # (n,) and (n, 7)
+    t, q = data[:, 0], data[:, 1:]      # (n,) and (n, 3)
 """
 
 import argparse
@@ -45,7 +52,13 @@ from pathlib import Path
 
 import numpy as np
 
-from goto_pose import controller_ip
+from goto_pose import FREE_SERVOS, controller_ip
+
+# The joints worth recording, as the controller numbers them: exactly the ones
+# `goto_pose.py --guided` releases, so the two scripts cannot disagree about
+# which joints are the free ones.
+DEFAULT_JOINTS = FREE_SERVOS
+ALL_JOINTS = tuple(range(1, 8))
 
 DEFAULT_RATE = 50.0  # Hz
 _STATUS_PERIOD = 0.5  # s between status lines on a terminal
@@ -80,6 +93,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--duration", type=float,
         help="seconds to record for. Without this it runs until ctrl-c.",
+    )
+    parser.add_argument(
+        "--all-joints", action="store_true",
+        help="record all seven joints instead of just the three the guided hold "
+        f"releases ({', '.join(f'joint{n}' for n in DEFAULT_JOINTS)})",
     )
     parser.add_argument(
         "--out",
@@ -162,16 +180,23 @@ def main(argv=None):
     path.parent.mkdir(parents=True, exist_ok=True)
     period = 1.0 / args.rate
 
+    joints = ALL_JOINTS if args.all_joints else DEFAULT_JOINTS
+    columns = [n - 1 for n in joints]  # the controller counts from 1, numpy from 0
+
     source = open_source(args)
     rows = 0
     fresh = 0  # samples that differed from the one before
     started = None
     previous = None
+    low = np.full(len(columns), np.inf)
+    high = np.full(len(columns), -np.inf)
 
     try:
         with open(path, "w", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["t"] + [f"joint{i + 1}" for i in range(7)])
+            writer.writerow(["t"] + [f"joint{n}" for n in joints])
+            print(f"[rec] recording {', '.join(f'joint{n}' for n in joints)} — "
+                  "absolute angles, in radians")
 
             print(f"[rec] writing {path} at {args.rate:g} Hz; ctrl-c to stop.")
             # In place on a terminal, one line at a time into a file — the same
@@ -182,7 +207,7 @@ def main(argv=None):
             next_status = next_tick
             while True:
                 now = time.perf_counter()
-                q = source.read()
+                q = source.read()[columns]
                 if started is None:
                     started = now
                 writer.writerow(
@@ -192,12 +217,14 @@ def main(argv=None):
                 if previous is None or not np.array_equal(q, previous):
                     fresh += 1
                 previous = q
+                low = np.minimum(low, q)
+                high = np.maximum(high, q)
 
                 if now >= next_status:
                     next_status = now + status_period
-                    joints = " ".join(f"{math.degrees(v):7.2f}" for v in q)
+                    shown = " ".join(f"{math.degrees(v):7.2f}" for v in q)
                     line = (f"[rec] {rows:6d} rows  {now - started:6.1f}s  "
-                            f"[{joints}] deg")
+                            f"[{shown}] deg")
                     if live:
                         print(f"\r{line}", end="", flush=True)
                     else:
@@ -216,15 +243,16 @@ def main(argv=None):
                     next_tick = time.perf_counter()
     except KeyboardInterrupt:
         print()
-        return report(path, rows, fresh, started, args.rate) or 130
+        return report(path, rows, fresh, started, args.rate,
+                      joints, low, high) or 130
     finally:
         source.close()
 
     print()
-    return report(path, rows, fresh, started, args.rate)
+    return report(path, rows, fresh, started, args.rate, joints, low, high)
 
 
-def report(path, rows, fresh, started, asked):
+def report(path, rows, fresh, started, asked, joints, low, high):
     """Say what was written. Returns 0, or 1 if nothing was."""
     if not rows or started is None:
         print(f"[rec] nothing recorded; {path} is empty.")
@@ -244,6 +272,22 @@ def report(path, rows, fresh, started, asked):
         print(f"[rec] the report stream is updating well below {asked:g} Hz — "
               "either the arm\n      was still, or a lower --rate would record "
               "the same information.")
+
+    # How far each joint actually travelled. A column that never moved is the
+    # thing to know about: it says the joint was not released, was not turned,
+    # or is not being reported — and which of those it is, is a question for
+    # the arm rather than for this file.
+    travel = np.degrees(high - low)
+    print("[rec] travel: " + "  ".join(
+        f"joint{n} {t:.2f}" for n, t in zip(joints, travel)
+    ) + " deg")
+    still = [n for n, t in zip(joints, travel) if t < 0.05]
+    if still and len(still) < len(joints):
+        names = ", ".join(f"joint{n}" for n in still)
+        subject, verb = ("it", "was") if len(still) == 1 else ("they", "were")
+        print(f"[rec] {names} never moved while the others did. If {subject} "
+              f"{verb} released\n      and turned by hand, the controller is "
+              "not reporting that joint.")
     return 0
 
 
