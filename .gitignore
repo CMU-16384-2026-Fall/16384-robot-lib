@@ -3,6 +3,7 @@
 __pycache__/
 
 ip.txt
+recordings/
 
 build/
 dist/
