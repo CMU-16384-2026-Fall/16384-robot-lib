@@ -10,9 +10,8 @@ class Robot(RobotInterface):
                  safety_margin=DEFAULT_MARGIN, guard=True):
         super().__init__()
         safety = dict(safety_box=safety_box, safety_margin=safety_margin, guard=guard)
-        if os.path.exists('ip.txt') and not sim:
-            with open('ip.txt', 'r') as f:
-                ip = f.read().strip()
+        ip = os.environ.get('ROBOT_IP', '').strip()
+        if ip and not sim:
             self.robot = RealXArm7(ip, **safety)
         else:
             self.robot = SimulatedXArm7(visualize=True, **safety)

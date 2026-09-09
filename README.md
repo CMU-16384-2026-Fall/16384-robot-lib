@@ -20,8 +20,8 @@ robot = RealXArm7(ip='192.168.1.?')
 robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0])
 ```
 
-`Robot` picks the backend for you — the real arm when an `ip.txt` sits in the
-working directory, the MuJoCo simulation otherwise:
+`Robot` picks the backend for you — the real arm when the `ROBOT_IP`
+environment variable is set, the MuJoCo simulation otherwise:
 ```python
 from xarm7_lib import Robot
 robot = Robot()

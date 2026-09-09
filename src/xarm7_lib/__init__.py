@@ -1,7 +1,7 @@
 """Python library for driving a UFACTORY xArm7, in simulation or for real.
 
-`Robot` is the usual entry point: it picks the real arm when an `ip.txt` sits
-in the working directory and the MuJoCo simulation otherwise, so the same
+`Robot` is the usual entry point: it picks the real arm when the `ROBOT_IP`
+environment variable is set and the MuJoCo simulation otherwise, so the same
 script runs against either. The backends are also importable directly as
 `RealXArm7` and `SimulatedXArm7`.
 """
