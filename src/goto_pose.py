@@ -92,10 +92,6 @@ _SETTLE_GRACE = 15.0  # s added to a move's travel time before the wait gives up
 _PLANAR_TOLERANCE = math.radians(3.0)
 # Movement across the re-attach that counts as the servo snapping back.
 _SNAP_TOLERANCE = math.radians(2.0)
-# Disagreement between the controller's planned angles and the real ones that
-# says its setpoint no longer describes the arm.
-_SETPOINT_TOLERANCE = math.radians(2.0)
-
 _MONITOR_PERIOD = 0.1  # s between readings while the arm is hand-guided
 _LOGGED_STATUS_PERIOD = 1.0  # s between status lines when stdout isn't a terminal
 _ATTACH_SETTLE = 0.3  # s to let each joint take hold before reading it back
@@ -408,6 +404,13 @@ def relock(arm, servos, q_hand, before):
     that got here, while the student turned the physical joints somewhere else.
     If re-enabling resumes that setpoint the arm snaps back through the arc in
     between, so the movement across the attach is measured, not assumed.
+
+    Measured, and not asked about: there is no way to read the controller's
+    commanded angles back and compare them with the real ones. Both spellings
+    of `get_servo_angle` — `is_real=True` and `is_real=False` — end up at the
+    same `GET_JOINT_POS` register (`uxbus_cmd.py:630-634`), so both return the
+    measured position and their difference is always exactly zero. The arm
+    moving, or not moving, across the re-attach is the only evidence there is.
     """
     for servo in servos:
         code = arm.arm.set_servo_attach(servo_id=servo)
@@ -435,26 +438,6 @@ def relock(arm, servos, q_hand, before):
         arm.clear_errors()
 
     return moved <= _SNAP_TOLERANCE
-
-
-def setpoint_matches_arm(arm):
-    """Whether the controller's planned angles still describe the real arm.
-
-    Two different reads of the same joints: `is_real=False` is what the
-    controller has planned, `is_real=True` what the encoders say. After a
-    hand-guided session they can disagree, and commanding a move from a
-    position the controller doesn't believe it is in is how an arm lunges.
-    """
-    planned_code, planned = arm.arm.get_servo_angle(is_radian=True)
-    real_code, actual = arm.arm.get_servo_angle(is_radian=True, is_real=True)
-    if planned_code != 0 or real_code != 0:
-        print(f"[goto] couldn't compare planned and real angles (codes "
-              f"{planned_code}, {real_code}); skipping that check.")
-        return True
-
-    gap = float(np.max(np.abs(np.asarray(planned[:7]) - np.asarray(actual[:7]))))
-    print(f"[goto] planned vs real angles differ by {math.degrees(gap):.2f} deg")
-    return gap <= _SETPOINT_TOLERANCE
 
 
 def guided_hold(arm, real):
@@ -514,10 +497,7 @@ def guided_hold(arm, real):
     if failure is not None:
         print(f"[goto] {failure}")
         return False, q_hand
-    # Both checks run, and both report: knowing the arm snapped back is not a
-    # reason to stop asking whether the controller's setpoint still fits it.
-    matched = setpoint_matches_arm(arm)
-    return steady and matched, q_hand
+    return steady, q_hand
 
 
 # ----------------------------------------------------------------------
