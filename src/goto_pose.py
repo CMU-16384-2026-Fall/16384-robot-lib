@@ -90,8 +90,10 @@ _SETTLE_GRACE = 15.0  # s added to a move's travel time before the wait gives up
 # How far a locked joint may sit from +-90 and still leave the free three
 # vertical enough to release. 3 degrees tilts a 426 mm forearm by 22 mm.
 _PLANAR_TOLERANCE = math.radians(3.0)
-# Movement across the re-attach that counts as the servo snapping back.
+# Movement across the re-attach worth naming a joint over.
 _SNAP_TOLERANCE = math.radians(2.0)
+# How long to let the arm settle after re-locking before reading its pose.
+_RELOCK_SETTLE = 5.0  # s
 _MONITOR_PERIOD = 0.1  # s between readings while the arm is hand-guided
 _LOGGED_STATUS_PERIOD = 1.0  # s between status lines when stdout isn't a terminal
 _ATTACH_SETTLE = 0.3  # s to let each joint take hold before reading it back
@@ -397,32 +399,83 @@ def monitor(arm, real):
             next_tick = time.perf_counter()
 
 
-def relock(arm, servos, q_hand, before):
-    """Put the brakes back on. True if the arm didn't move doing it.
+def describe_movement(q_now, q_hand, goal):
+    """Say what the arm did as the brakes went back on.
+
+    Reported rather than refused. The controller resuming its own setpoint is
+    something it does, not something this script can talk it out of, and
+    stopping the run over it strands the arm reaching out over the bench —
+    which is the pose we least want it left in. What matters is that the arm
+    has stopped and we know where it is, which is what phase 3 checks for
+    itself before it commands anything.
+    """
+    delta = q_now - q_hand
+    worst = float(np.max(np.abs(delta)))
+    movers = np.flatnonzero(np.abs(delta) > _SNAP_TOLERANCE)
+    if not movers.size:
+        print(f"[goto] steady across the re-attach (worst joint "
+              f"{math.degrees(worst):.2f} deg)")
+        return
+
+    named = ", ".join(
+        f"joint{i + 1} {math.degrees(delta[i]):+.2f}" for i in movers
+    )
+    print(f"[goto] the arm moved as the joints re-locked: {named} deg")
+
+    # If every joint that moved ended up closer to the pose phase 1 commanded,
+    # the controller went back to its own setpoint rather than drifting.
+    if np.all(np.abs(q_now - goal)[movers] < np.abs(q_hand - goal)[movers]):
+        print("[goto] it went back toward the pose phase 1 commanded — the "
+              "controller\n       resumed its setpoint when the servos "
+              "re-armed.")
+
+
+def relock(arm, servos, q_hand, before, goal):
+    """Put the brakes back on, and say what the arm did as they took hold.
 
     The controller has been holding a setpoint for these joints since the move
     that got here, while the student turned the physical joints somewhere else.
-    If re-enabling resumes that setpoint the arm snaps back through the arc in
-    between, so the movement across the attach is measured, not assumed.
+    Re-arming the servos can make it act on that setpoint, and on real hardware
+    it does: the arm swings back toward the phase-1 pose as the brakes take
+    hold. Dropping the motion queue first (below) is what can be done about it;
+    the rest is measured on the way past and reported, not refused.
 
-    Measured, and not asked about: there is no way to read the controller's
-    commanded angles back and compare them with the real ones. Both spellings
-    of `get_servo_angle` — `is_real=True` and `is_real=False` — end up at the
-    same `GET_JOINT_POS` register (`uxbus_cmd.py:630-634`), so both return the
-    measured position and their difference is always exactly zero. The arm
-    moving, or not moving, across the re-attach is the only evidence there is.
+    Measured, because it cannot be asked about: there is no readback of the
+    controller's commanded angles to compare against the real ones. Both
+    spellings of `get_servo_angle` — `is_real=True` and `is_real=False` — end
+    up at the same `GET_JOINT_POS` register (`uxbus_cmd.py:630-634`), so both
+    return the measured position and their difference is always exactly zero.
+    What the arm does across the re-attach is the only evidence there is.
     """
+    # Drop whatever is still in the controller's motion queue before re-arming
+    # the servos. `set_servo_attach` ends with `set_state(0)`, which puts the
+    # controller back into motion state — and if phase 1's trajectory is still
+    # live there, that is the cue for it to resume and drive the arm back to
+    # the pose it was commanded to, out from under the student's hands.
+    print("[goto] stand clear — re-locking, and the arm may move.")
+    try:
+        arm.stop(wait=True, timeout=_RELOCK_SETTLE)
+    except Exception as err:  # never let tidying up be what breaks the exit
+        print(f"[goto] couldn't clear the motion queue ({err}); re-locking anyway.")
+
+    ok = True
     for servo in servos:
         code = arm.arm.set_servo_attach(servo_id=servo)
         if code != 0:
+            ok = False
             print(f"[goto] set_servo_attach(servo_id={servo}) failed with code "
                   f"{code} — joint{servo} may still be free.")
         else:
             print(f"[goto] joint{servo} re-locked")
         time.sleep(_ATTACH_SETTLE)
 
-    moved = float(np.max(np.abs(arm.joint_values - q_hand)))
-    print(f"[goto] moved {math.degrees(moved):.2f} deg across the re-attach")
+    # Whatever the re-enable set off, let it finish before reading a position:
+    # a pose sampled mid-swing describes nowhere the arm actually is.
+    if not arm.wait_for_motion(timeout=_RELOCK_SETTLE):
+        print(f"[goto] the arm was still moving {_RELOCK_SETTLE:.0f}s after "
+              "re-locking; hands off it?")
+
+    describe_movement(arm.joint_values, q_hand, goal)
 
     brakes, enables = brake_states(arm)
     show_states("after re-locking", brakes, enables)
@@ -437,11 +490,15 @@ def relock(arm, servos, q_hand, before):
               "hand-guided; clearing it.")
         arm.clear_errors()
 
-    return moved <= _SNAP_TOLERANCE
+    return ok
 
 
-def guided_hold(arm, real):
-    """Phase 2. Returns (ok, pose the student left the arm in)."""
+def guided_hold(arm, real, goal):
+    """Phase 2. Returns (ok, pose the arm is left in).
+
+    `goal` is only used to describe which way the arm moved when the joints
+    re-lock; nothing here commands a move.
+    """
     q = arm.joint_values
     offenders = out_of_plane(q)
     if offenders:
@@ -459,6 +516,8 @@ def guided_hold(arm, real):
     print("[goto] about to release joint1, joint4 and joint7. Joints 2, 3, 5 "
           "and 6 stay\n       powered, so the arm can turn about z but cannot "
           "leave its plane.")
+    print("[goto] let go before you press ctrl-c: the arm can swing back toward "
+          "this pose\n       as the joints re-lock.")
     if not real:
         print("[goto] (simulated: MuJoCo has no joint brakes, so nothing is "
               "actually released)")
@@ -492,12 +551,12 @@ def guided_hold(arm, real):
     finally:
         q_hand = arm.joint_values
         print(f"[goto] left at {degrees(q_hand)} deg")
-        steady = relock(arm, released, q_hand, before) if released else True
+        ok = relock(arm, released, q_hand, before, goal) if released else True
 
     if failure is not None:
         print(f"[goto] {failure}")
         return False, q_hand
-    return steady, q_hand
+    return ok, q_hand
 
 
 # ----------------------------------------------------------------------
@@ -556,10 +615,11 @@ def main(argv=None):
             return 1
 
         # ---- phase 2 -------------------------------------------------
-        ok, q_hand = guided_hold(arm, args.real)
+        ok, q_hand = guided_hold(arm, args.real, goal)
         if not ok:
-            print("[goto] stopping here rather than commanding a move. The arm "
-                  "is where it\n       is; re-run this script to reset it.")
+            print("[goto] a joint could not be released or re-locked, so the "
+                  "arm is not in a\n       state to be driven. Leaving it as "
+                  "it is; check it before re-running.")
             return 1
 
         # ---- phase 3 -------------------------------------------------
