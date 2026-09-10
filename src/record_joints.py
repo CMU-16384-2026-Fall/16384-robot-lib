@@ -10,10 +10,16 @@ assignment.
 
 That is why this opens its own connection rather than borrowing the library's
 `RealXArm7`: that class's constructor calls `motion_enable(True)` and puts the
-controller into position mode, which would re-lock the very joints the guided
-hold just released. A bare `XArmAPI` is passive — `connect()` sends the protocol
-identifier, a debug flag and a timeout, then opens the report socket, and
-nothing else — so a second process can watch the arm without touching it.
+controller into position mode, which would cut across the velocity commands the
+guided hold is streaming. A bare `XArmAPI` is passive — `connect()` sends the
+protocol identifier, a debug flag and a timeout, and nothing else — so a second
+process can watch the arm without touching it.
+
+One thing will defeat it, and it is not this script's doing: `goto_pose.py
+--brakes` holds the arm by taking the joints' brakes off, and the controller
+does not report a joint whose brake is off. Recording then writes one repeated
+pose however far the arm is moved. Plain `--guided` keeps every servo energised
+for exactly that reason.
 
 Each sample is a live `get_servo_angle` round trip, not a read of the SDK's
 report cache. That distinction is the whole difference between a recording and
@@ -33,8 +39,8 @@ units — **seconds and radians**, not degrees:
 
     t,joint1,joint4,joint7
 
-Those are the three joints the guided hold releases, the ones a student can
-actually turn; the other four are clamped at the pose that makes the arm
+Those are the three joints the guided hold makes compliant, the ones a student
+can actually turn; the other four are held at the pose that makes the arm
 planar and would only write four constant columns. Pass `--all-joints` to
 record all seven anyway.
 
@@ -60,7 +66,7 @@ import numpy as np
 from goto_pose import FREE_SERVOS, controller_ip
 
 # The joints worth recording, as the controller numbers them: exactly the ones
-# `goto_pose.py --guided` releases, so the two scripts cannot disagree about
+# `goto_pose.py --guided` frees, so the two scripts cannot disagree about
 # which joints are the free ones.
 DEFAULT_JOINTS = FREE_SERVOS
 ALL_JOINTS = tuple(range(1, 8))
@@ -102,7 +108,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--all-joints", action="store_true",
         help="record all seven joints instead of just the three the guided hold "
-        f"releases ({', '.join(f'joint{n}' for n in DEFAULT_JOINTS)})",
+        f"frees ({', '.join(f'joint{n}' for n in DEFAULT_JOINTS)})",
     )
     parser.add_argument(
         "--out",
@@ -318,9 +324,9 @@ def report(path, rows, fresh, started, asked, joints, low, high):
               "the same information.")
 
     # How far each joint actually travelled. A column that never moved is the
-    # thing to know about: it says the joint was not released, was not turned,
-    # or is not being reported — and which of those it is, is a question for
-    # the arm rather than for this file.
+    # thing to know about: it says the joint was not freed, was not turned, or
+    # is not being reported — and which of those it is, is a question for the
+    # arm rather than for this file.
     travel = np.degrees(high - low)
     print("[rec] travel: " + "  ".join(
         f"joint{n} {t:.2f}" for n, t in zip(joints, travel)
@@ -330,8 +336,9 @@ def report(path, rows, fresh, started, asked, joints, low, high):
         names = ", ".join(f"joint{n}" for n in still)
         subject, verb = ("it", "was") if len(still) == 1 else ("they", "were")
         print(f"[rec] {names} never moved while the others did. If {subject} "
-              f"{verb} released\n      and turned by hand, the controller is "
-              "not reporting that joint.")
+              f"{verb} pushed\n      hard enough to give, check the arm isn't "
+              "being held by --brakes, which\n      stops the controller "
+              "reporting that joint at all.")
     return 0
 
 
