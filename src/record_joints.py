@@ -15,9 +15,14 @@ hold just released. A bare `XArmAPI` is passive — `connect()` sends the protoc
 identifier, a debug flag and a timeout, then opens the report socket, and
 nothing else — so a second process can watch the arm without touching it.
 
-It listens on report port 30003 (`report_type='real'`), which carries joint
-angles far more often than the rich report on 30002 that `RealXArm7` itself
-uses. The two connections read different sockets and never compete.
+Each sample is a live `get_servo_angle` round trip, not a read of the SDK's
+report cache. That distinction is the whole difference between a recording and
+a flat line: `XArmAPI.angles` re-queries the arm only when `enable_report` is
+False (`x3/base.py:639-642`) — with reporting on it hands back `self._angles`,
+which nothing but the report socket ever writes. If that stream doesn't
+deliver, the property keeps returning the last value it ever saw, with no error
+and no way to tell from the outside, and every row of the file is identical. A
+round trip costs a millisecond or two and cannot go stale.
 
 A hardware run here loads only the xarm SDK — no mujoco, no pinocchio — because
 the one thing it borrows from `goto_pose.py` (the `ip.txt` lookup) sits above
@@ -111,31 +116,47 @@ def parse_args(argv=None):
     return args
 
 
+def find_ip(given):
+    """An address if one is to be had, without insisting on it."""
+    if given:
+        return given
+    for path in (Path.cwd() / "ip.txt", Path(__file__).resolve().parent / "ip.txt"):
+        if path.exists() and path.read_text().strip():
+            return path.read_text().strip()
+    return None
+
+
 def default_path():
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return Path("recordings") / f"joints-{stamp}.csv"
 
 
 class RealSource:
-    """A read-only view of the arm's joint angles, on its own connection."""
+    """A read-only view of the arm's joint angles, on its own connection.
+
+    `enable_report=False` so no report socket is opened at all: nothing here
+    wants the stream, and not opening it is one less thing sharing the arm with
+    whichever process is actually holding it.
+    """
 
     def __init__(self, ip):
         from xarm.wrapper import XArmAPI
 
-        # is_radian so the `angles` property comes back in the library's units;
-        # report_type='real' for port 30003, the fast one.
-        self.api = XArmAPI(ip, is_radian=True, report_type="real")
+        # is_radian so angles come back in the library's units.
+        self.api = XArmAPI(ip, is_radian=True, enable_report=False)
         if not self.api.connected:
             self.api.connect()
+        self._warned = False
 
-        # One round-trip read, both to prove the link works and to seed the
-        # cached angles before the first report lands. This is a query, not a
-        # command — it changes nothing on the controller.
+        # Read until the controller answers, both to prove the link works and
+        # to have a first value in hand. A query, not a command — it changes
+        # nothing on the controller.
         deadline = time.monotonic() + _REPORT_TIMEOUT
         while True:
-            code, _ = self.api.get_servo_angle(is_radian=True)
+            code, angles = self.api.get_servo_angle(is_radian=True)
             if code == 0:
-                break
+                self._last = np.asarray(angles[:7], dtype=float)
+                return
             if time.monotonic() >= deadline:
                 raise SystemExit(
                     f"no reading from the controller within {_REPORT_TIMEOUT}s "
@@ -144,7 +165,17 @@ class RealSource:
             time.sleep(0.05)
 
     def read(self):
-        return np.asarray(self.api.angles[:7], dtype=float)
+        code, angles = self.api.get_servo_angle(is_radian=True)
+        if code != 0:
+            # Hold the last good reading rather than writing a zero row, and
+            # say so once instead of once per sample.
+            if not self._warned:
+                self._warned = True
+                print(f"\n[rec] get_servo_angle returned {code}; holding the "
+                      "last reading. Check the arm.")
+            return self._last
+        self._last = np.asarray(angles[:7], dtype=float)
+        return self._last
 
     def close(self):
         self.api.disconnect()
@@ -166,11 +197,21 @@ class SimSource:
 
 
 def open_source(args):
-    if args.real:
+    """The arm to read, real or simulated.
+
+    With neither `--real` nor `--sim`, this picks the way the library's own
+    `Robot` does (`xarm7_lib/robot.py:12`): the real arm when there is an
+    address to use, the simulation otherwise. Either way it says which, because
+    a recording of the simulation looks exactly like a recording of a real arm
+    that never moved — a file full of one repeated pose.
+    """
+    real = args.real or (not args.sim and find_ip(args.ip) is not None)
+    if real:
         ip = controller_ip(args.ip, prefix="rec")
         print(f"[rec] connecting to {ip}, read-only")
         return RealSource(ip)
-    print("[rec] recording the simulation; it will sit still")
+    print("[rec] recording the SIMULATION, which will sit perfectly still. "
+          "Pass --real\n      to record the arm (it needs --ip or an ip.txt).")
     return SimSource()
 
 
@@ -195,10 +236,13 @@ def main(argv=None):
         with open(path, "w", newline="") as handle:
             writer = csv.writer(handle)
             writer.writerow(["t"] + [f"joint{n}" for n in joints])
-            print(f"[rec] recording {', '.join(f'joint{n}' for n in joints)} — "
-                  "absolute angles, in radians")
-
-            print(f"[rec] writing {path} at {args.rate:g} Hz; ctrl-c to stop.")
+            first = source.read()[columns]
+            print("[rec] arm is at " + "  ".join(
+                f"joint{n}={math.degrees(v):.2f}" for n, v in zip(joints, first)
+            ) + " deg")
+            print(f"[rec] writing {path} at {args.rate:g} Hz — "
+                  f"{', '.join(f'joint{n}' for n in joints)}, absolute angles "
+                  "in radians.\n      ctrl-c to stop.")
             # In place on a terminal, one line at a time into a file — the same
             # split `goto_pose.py`'s monitor makes.
             live = sys.stdout.isatty()
