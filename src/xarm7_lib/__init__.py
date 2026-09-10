@@ -7,6 +7,13 @@ script runs against either. The backends are also importable directly as
 """
 
 from .api import RobotInterface
+from .free_drive import (
+    FREE_JOINTS,
+    HOME_POSE,
+    LOCKED_TOLERANCE,
+    Trajectory,
+    free_mask,
+)
 from .robot import Robot
 from .safety import (
     DEFAULT_BOX,
@@ -23,13 +30,18 @@ __version__ = "0.1.0"
 __all__ = [
     "DEFAULT_BOX",
     "DEFAULT_MARGIN",
+    "FREE_JOINTS",
+    "HOME_POSE",
+    "LOCKED_TOLERANCE",
     "RealXArm7",
     "Robot",
     "RobotInterface",
     "SafetyError",
     "SafetyGuard",
     "SimulatedXArm7",
+    "Trajectory",
     "Violation",
     "XArmError",
     "__version__",
+    "free_mask",
 ]

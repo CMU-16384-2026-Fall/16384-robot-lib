@@ -1,6 +1,7 @@
 import os
 
 from .api import RobotInterface
+from .free_drive import FREE_JOINTS
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN
 from .xarm7_mujoco import SimulatedXArm7
 from .xarm7_real import RealXArm7
@@ -46,6 +47,20 @@ class Robot(RobotInterface):
 
     def check_safety(self, joints):
         return self.robot.check_safety(joints)
+
+    def free_drive(self, free=FREE_JOINTS, duration=30.0, **options):
+        """Hand-guide the arm and record where it went.
+
+        Real arm only, and deliberately so: there is nothing to push in
+        simulation. See `RealXArm7.free_drive` for the options.
+        """
+        if not hasattr(self.robot, "free_drive"):
+            raise NotImplementedError(
+                "free drive needs the real arm — there is nothing to push in "
+                "simulation. Set ROBOT_IP and construct Robot() without sim=True."
+            )
+        return self.robot.free_drive(free, duration, **options)
+
 
 if __name__ == '__main__':
     import numpy as np
