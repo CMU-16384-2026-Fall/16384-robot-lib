@@ -3,7 +3,8 @@
     python goto_pose.py --check            # say what would happen, move nothing
     python goto_pose.py                    # the move, in meshcat
     python goto_pose.py --real             # the move, on the real arm
-    python goto_pose.py --real --guided    # move, hand it to a student, reset it
+    python goto_pose.py --real --guided               # capture on each enter
+    python goto_pose.py --real --guided --capture 1  # capture once a second
 
 Simulation is the default; hardware needs `--real`.
 
@@ -40,32 +41,43 @@ joint4 pushed 10 degrees off its setpoint by the links it is resting on.
 `--guided` adds two more phases to the run:
 
     1. drive to the planar pose;
-    2. make joints 1, 4 and 7 compliant, so the arm can be swung by hand about
-       z while 2, 3, 5 and 6 stay rigid and hold the plane;
-    3. stiffen up again and drive back to the pose phase 1 reached.
+    2. take the brakes off joints 1, 4 and 7 so the arm can be swung by hand
+       about z, while 2, 3, 5 and 6 stay powered and hold the plane, capturing
+       waypoints as you go;
+    3. re-lock those three and drive back to the pose phase 1 reached.
 
-Phase 2 does teach mode's job for three joints instead of seven. Every servo
-stays energised and the arm stays in the controller's own velocity mode: joints
-2, 3, 5 and 6 are commanded zero speed and hold the plane with full torque,
-while 1, 4 and 7 are driven at a speed proportional to how hard they are being
-pushed, which is what makes them feel free.
+Phase 2 is UFACTORY's own per-joint unlock — the lock icons beside the joint
+sliders in Studio — through `set_servo_detach(servo_id=n)`. The arm never
+leaves position mode and nothing emulates a stiffness: joints 2, 3, 5 and 6
+hold with their full servo torque because nothing has asked them not to.
 
-It is done that way rather than with the controller's own free drive because of
-two hard limits, both measured on the arm rather than assumed. `set_mode(2)`,
-UFACTORY's teach mode, frees all seven joints at once and cannot hold a plane;
-and `set_servo_detach`, the per-joint brake release behind Studio's lock icons,
-stops the controller reporting that joint at all — `probe_feedback.py` turned a
-released joint 96 degrees by hand and watched it read as perfectly still the
-whole way, through both the report stream and a live query, until the servo
-re-armed. Nothing can record a motion it cannot see, so `--guided` keeps the
-servos on. `--brakes` still offers the release for anyone who wants the feel of
-a genuinely free joint and does not need to record it.
+The catch, measured rather than assumed, is that **a released joint is not
+reported at all**. `probe_feedback.py` turned one 96 degrees by hand and watched
+it read as perfectly still the whole way — through the report stream and a live
+query alike — until the servo re-armed, whereupon the reading jumped straight
+to the truth. So there is no continuous trace to record: the angles are only
+knowable while the joints are held. `--capture` works with that rather than
+against it, locking the three joints for a fraction of a second to read them
+and letting go again, either when you press enter or on a fixed interval.
 
-What teach mode compensates and this does not is gravity, and in this pose that
-costs nothing: the axes of joints 1, 4 and 7 are vertical, and gravity has no
-moment about a vertical axis, so only friction resists a push. Joint 1 is
-vertical always; 4 and 7 are vertical only while 2, 3, 5 and 6 sit at +-90, so
-phase 2 checks that before it makes anything compliant.
+Doing it the other way round — leaving the servos on and making three joints
+compliant in software — was tried and does not work. There is no joint-torque
+interface to use (`set_servot` is gone from the SDK), so the only lever is
+velocity commanded into the very servo being compensated, sampled over TCP at a
+fraction of the controller's own rate. The arm pushes back and then latches an
+error. Teach mode manages it because the compensation runs inside the servo
+loop, on identified joint friction (`iden_joint_friction`), the payload
+(`set_tcp_load`) and the mounting (`set_gravity_direction`) — none of which is
+reachable per joint.
+
+Releasing 1, 4 and 7 is only safe *in this pose*. Their axes are vertical here,
+and gravity exerts no moment about a vertical axis, so a released joint swings
+instead of falling. Joint 1 is vertical always; 4 and 7 are vertical only while
+2, 3, 5 and 6 sit at +-90, so phase 2 checks that before releasing anything.
+
+Waypoints are written as seconds and radians, matching `record_joints.py`:
+
+    t,joint1,joint4,joint7
 
 So this script checks before it commands, and prints what it found either way.
 `--force` turns the library's guard off for whoever is sure the model is wrong
@@ -77,9 +89,11 @@ is written; everything below the CLI is radians, like the rest of the library.
 """
 
 import argparse
+import csv
 import math
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -105,17 +119,16 @@ _PLANAR_TOLERANCE = math.radians(3.0)
 _SNAP_TOLERANCE = math.radians(2.0)
 # How long to let the arm settle after re-locking before reading its pose.
 _RELOCK_SETTLE = 5.0  # s
-# The compliance loop that stands in for teach mode on the free joints.
-_GUIDE_RATE = 50.0  # Hz
-_GUIDE_GAIN = 0.25  # rad/s of joint speed per N*m of push
-_GUIDE_MAX_SPEED = 0.3  # rad/s, however hard it is shoved
-_GUIDE_DEADBAND_FLOOR = 0.15  # N*m below which nothing counts as a push
-_GUIDE_NOISE_MARGIN = 3.0  # deadband is at least this many times the tare noise
-_TARE_SECONDS = 1.0  # s of stillness to measure what "not pushed" reads as
-
-_MONITOR_PERIOD = 0.1  # s between readings while the arm is hand-guided
-_LOGGED_STATUS_PERIOD = 1.0  # s between status lines when stdout isn't a terminal
 _ATTACH_SETTLE = 0.3  # s to let each joint take hold before reading it back
+
+# Capturing a waypoint means locking the joints, reading them, and letting go
+# again. The reading only catches up once the servos are back on, so the wait
+# is until it stops changing rather than a fixed sleep.
+_CAPTURE_TIMEOUT = 1.0  # s to give the reading to settle before taking it anyway
+_CAPTURE_POLL = 0.02  # s between reads while waiting for it
+_CAPTURE_STABLE = math.radians(0.05)  # two reads this close count as settled
+_CAPTURE_MIN = 0.1  # s, the fastest automatic capture allowed
+_CAPTURE_MAX = 5.0  # s, the slowest
 
 
 def parse_args(argv=None):
@@ -154,22 +167,16 @@ def parse_args(argv=None):
         "then stiffen up again and return to the zero pose",
     )
     parser.add_argument(
-        "--brakes", action="store_true",
-        help="hold the arm by taking the brakes off joints 1, 4 and 7 instead "
-        "of making them compliant. They spin completely freely, but the "
-        "controller reports nothing about a joint whose brake is off, so the "
-        "pose freezes and record_joints.py has nothing to record.",
+        "--capture", default="manual",
+        help="when to record a waypoint during the hold: \"manual\" to capture "
+        f"each time you press enter, or an interval in seconds between "
+        f"{_CAPTURE_MIN:g} and {_CAPTURE_MAX:g} to capture automatically "
+        "(default: %(default)s)",
     )
     parser.add_argument(
-        "--guide-gain", type=float, default=_GUIDE_GAIN,
-        help="how fast a compliant joint gives when pushed, rad/s per N*m "
-        "(default: %(default)s). Negate it if the arm pulls away from your "
-        "hand instead of following it.",
-    )
-    parser.add_argument(
-        "--guide-max-speed", type=float, default=_GUIDE_MAX_SPEED,
-        help="fastest a compliant joint will move however hard it is pushed, "
-        "rad/s (default: %(default)s)",
+        "--out",
+        help="where to write the captured waypoints "
+        "(default: recordings/waypoints-<timestamp>.csv)",
     )
     parser.add_argument(
         "--check", action="store_true",
@@ -191,7 +198,29 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.real and args.sim:
         raise SystemExit("--real and --sim are opposites; pass one or neither.")
+    args.capture = capture_from(args.capture)
     return args
+
+
+def capture_from(text):
+    """"manual", or an interval in seconds.
+
+    The range is a real limit, not a formality: every automatic capture locks
+    and releases three brakes, so a short interval means cycling them
+    thousands of times in a session.
+    """
+    if text.strip().lower() in ("manual", "enter"):
+        return "manual"
+    try:
+        interval = float(text)
+    except ValueError:
+        raise SystemExit(f"--capture wants \"manual\" or a number, got {text!r}")
+    if not _CAPTURE_MIN <= interval <= _CAPTURE_MAX:
+        raise SystemExit(
+            f"--capture interval must be between {_CAPTURE_MIN:g} and "
+            f"{_CAPTURE_MAX:g} seconds, got {interval:g}"
+        )
+    return interval
 
 
 def target_from(text):
@@ -217,6 +246,11 @@ def controller_ip(given, prefix="goto"):
                 print(f"[{prefix}] using {ip} from {path}")
                 return ip
     raise SystemExit("no controller address: pass --ip or put one in ip.txt.")
+
+
+def default_capture_path():
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return Path("recordings") / f"waypoints-{stamp}.csv"
 
 
 def degrees(q):
@@ -383,67 +417,6 @@ def release_joints(arm, servos):
     return released, None
 
 
-def monitor(arm, real):
-    """Print what the hand-guided arm is doing, until ctrl-c.
-
-    Nothing is guarding the arm here — the library's guard only runs inside a
-    motion command, and this phase issues none — so the safety check is a
-    running commentary rather than a limit. It is worth having anyway: the arm
-    can be walked into itself by hand, and the student should hear about it.
-    """
-    print("[goto] swing the arm by hand; ctrl-c here to re-lock it.")
-    if real:
-        # Measured on the arm: a detached joint's angle is not reported at all,
-        # so `joint_values` is stuck at the pose it held when the brakes came
-        # off. Printing it every tick would be showing a number that cannot
-        # change, and checking it against the safety guard would be worse — a
-        # frozen pose always looks legal, however far the arm has been walked
-        # into itself. Neither is worth doing, so neither is done.
-        return monitor_released(arm)
-    # On a terminal the status line rewrites itself in place; piped to a file it
-    # has to be one line per sample, so it is slowed right down instead.
-    live = sys.stdout.isatty()
-    status_period = _MONITOR_PERIOD if live else _LOGGED_STATUS_PERIOD
-
-    spoken = "nothing said yet"
-    next_tick = time.perf_counter()
-    next_status = next_tick
-    while True:
-        q = arm.joint_values
-        line = "  ".join(
-            f"joint{i + 1}={math.degrees(q[i]):7.2f}" for i in (0, 3, 6)
-        )
-        if real:
-            flange = arm.arm.position
-            if flange is not None and len(flange) >= 3:
-                line += (f"   flange=({flange[0]:6.1f},{flange[1]:6.1f},"
-                         f"{flange[2]:6.1f}) mm")
-
-        violation = arm.check_safety(q)
-        said = None if violation is None else str(violation)
-        if said != spoken:
-            if said is not None:
-                print(f"\n[goto] warning: {said}")
-            elif spoken != "nothing said yet":
-                print("\n[goto] back inside the safe envelope")
-            spoken = said
-
-        now = time.perf_counter()
-        if now >= next_status:
-            next_status = now + status_period
-            if live:
-                print(f"\r[goto] {line}   ", end="", flush=True)
-            else:
-                print(f"[goto] {line}", flush=True)
-
-        next_tick += _MONITOR_PERIOD
-        remaining = next_tick - time.perf_counter()
-        if remaining > 0:
-            time.sleep(remaining)
-        else:  # fell behind; don't try to catch up on a display loop
-            next_tick = time.perf_counter()
-
-
 def describe_catch_up(q_locked, q_frozen):
     """Say how far the arm was actually turned while its brakes were off.
 
@@ -473,129 +446,6 @@ def describe_catch_up(q_locked, q_frozen):
     print("[goto] (the readout catches up here — a released joint's angle is "
           "not reported\n       while its brake is off, so this is the whole "
           "hand motion at once.)")
-
-
-def tare(arm, seconds=_TARE_SECONDS):
-    """What the joints read with nobody touching them.
-
-    Returns (baseline, noise, rate): the mean torque per joint, its peak-to-peak
-    spread, and how often the reading actually changed. The spread sets the
-    deadband — a push has to be bigger than what the arm reports while standing
-    perfectly still — and the rate is worth knowing because the whole loop can
-    only respond as often as the torques do.
-    """
-    samples, fresh = [], 0
-    deadline = time.perf_counter() + seconds
-    while time.perf_counter() < deadline:
-        tau = arm.joint_torques
-        if samples and not np.array_equal(tau, samples[-1]):
-            fresh += 1
-        samples.append(tau)
-        time.sleep(1.0 / _GUIDE_RATE)
-
-    samples = np.asarray(samples)
-    return samples.mean(axis=0), np.ptp(samples, axis=0), fresh / seconds
-
-
-def compliant_hold(arm, gain, max_speed, rate):
-    """Teach mode's job, done for three joints instead of seven.
-
-    Every servo stays energised — nothing is detached — so the controller keeps
-    reporting where the arm is, which is the whole reason for doing it this way
-    rather than taking the brakes off. Joints 2, 3, 5 and 6 are commanded zero
-    velocity and hold the plane with their full torque. Joints 1, 4 and 7 are
-    driven at a speed proportional to how hard they are being pushed, which is
-    what makes them feel free.
-
-    What teach mode compensates and this does not is gravity, and here that
-    costs nothing: the axes of joints 1, 4 and 7 are vertical in this pose, and
-    gravity has no moment about a vertical axis. The only thing resisting a
-    push is friction, which is a constant, which is what the tare measures.
-
-    The velocity command carries a `duration` a few ticks long, so if this loop
-    stops for any reason the controller zeroes the arm by itself rather than
-    holding the last speed it was given.
-    """
-    from xarm7_lib.safety import SafetyError
-
-    print(f"[goto] measuring what the joints read at rest ({_TARE_SECONDS:.0f}s"
-          " — hands off)...")
-    baseline, noise, torque_rate = tare(arm)
-    deadband = np.maximum(_GUIDE_NOISE_MARGIN * noise, _GUIDE_DEADBAND_FLOOR)
-    print("[goto] rest torque " + "  ".join(
-        f"joint{n}={baseline[i]:+.2f}" for n, i in zip(FREE_SERVOS, FREE_INDICES)
-    ) + " N*m")
-    print("[goto] push harder than " + "  ".join(
-        f"{deadband[i]:.2f}" for i in FREE_INDICES
-    ) + f" N*m to move it; torques update at {torque_rate:.0f} Hz")
-    if torque_rate < 10.0:
-        print("[goto] that is slow enough to feel laggy — the arm will respond "
-              "in steps.")
-
-    watchdog = 3.0 / rate
-    period = 1.0 / rate
-    live = sys.stdout.isatty()
-    print("[goto] push the arm around; ctrl-c here to stop.")
-
-    next_tick = time.perf_counter()
-    next_status = next_tick
-    while True:
-        excess = arm.joint_torques - baseline
-        # Subtract the deadband rather than gating on it, so the joint eases in
-        # from a standstill instead of jumping to speed the moment you lean on
-        # it.
-        excess = np.sign(excess) * np.maximum(np.abs(excess) - deadband, 0.0)
-
-        speeds = np.zeros(arm.nv)
-        speeds[list(FREE_INDICES)] = np.clip(
-            gain * excess[list(FREE_INDICES)], -max_speed, max_speed
-        )
-        try:
-            arm.set_velocity(speeds, duration=watchdog, wait=False)
-        except SafetyError as err:
-            arm.stop()
-            print(f"\n[goto] stopped at the safety boundary: {err}")
-            return
-
-        now = time.perf_counter()
-        if now >= next_status:
-            next_status = now + (_MONITOR_PERIOD if live else 1.0)
-            q = arm.joint_values
-            line = "[goto] " + "  ".join(
-                f"joint{n}={math.degrees(q[i]):7.2f}({speeds[i]:+.2f})"
-                for n, i in zip(FREE_SERVOS, FREE_INDICES)
-            ) + " deg(rad/s)"
-            if live:
-                print(f"\r{line}   ", end="", flush=True)
-            else:
-                print(line, flush=True)
-
-        next_tick += period
-        remaining = next_tick - time.perf_counter()
-        if remaining > 0:
-            time.sleep(remaining)
-        else:
-            next_tick = time.perf_counter()
-
-
-def monitor_released(arm):
-    """Wait out the hold, saying only what is actually known.
-
-    Which is: how long it has been going. The joint angles are not being
-    reported while the brakes are off, so there is nothing else to say until
-    they go back on.
-    """
-    started = time.perf_counter()
-    live = sys.stdout.isatty()
-    while True:
-        elapsed = time.perf_counter() - started
-        line = (f"[goto] released, {elapsed:5.0f}s — angles are not reported "
-                "while the brakes are off")
-        if live:
-            print(f"\r{line}   ", end="", flush=True)
-        elif int(elapsed) % 10 == 0:
-            print(line, flush=True)
-        time.sleep(_MONITOR_PERIOD if live else 1.0)
 
 
 def relock(arm, servos, q_hand, before):
@@ -655,7 +505,77 @@ def relock(arm, servos, q_hand, before):
     return ok
 
 
-def guided_hold(arm, real, brakes, gain, max_speed):
+def settled_reading(arm):
+    """The arm's pose, once the readout has caught up with it.
+
+    Called straight after the brakes go back on, when the reported angles are
+    still the ones the joints held when they were released. Polling until two
+    reads agree gets the true pose as soon as the report delivers it, instead
+    of guessing at a sleep long enough to cover it.
+    """
+    deadline = time.perf_counter() + _CAPTURE_TIMEOUT
+    previous = arm.joint_values
+    while time.perf_counter() < deadline:
+        time.sleep(_CAPTURE_POLL)
+        current = arm.joint_values
+        if np.max(np.abs(current - previous)) <= _CAPTURE_STABLE:
+            return current
+        previous = current
+    return previous  # took too long to settle; the last read is the best we have
+
+
+def capture_pose(arm, real, servos):
+    """One waypoint: lock the free joints, read them, let them go again.
+
+    The locking is not ceremony. A joint with its brake off is not reported at
+    all, so the only moment its angle can be known is while it is held — which
+    is why this is a capture rather than a sample of something continuous.
+    """
+    if not real:
+        return arm.joint_values  # nothing is released in simulation
+
+    for servo in servos:
+        arm.arm.set_servo_attach(servo_id=servo)
+    pose = settled_reading(arm)
+    for servo in servos:
+        arm.arm.set_servo_detach(servo_id=servo)
+    return pose
+
+
+def capture_loop(arm, real, servos, capture, writer, started):
+    """Take waypoints until ctrl-c, writing each one as it is taken."""
+    if capture == "manual":
+        print("[goto] pose the arm, then press enter to capture it. "
+              "ctrl-c when you're done.")
+    else:
+        print(f"[goto] capturing every {capture:g}s — pose the arm and hold "
+              "still between\n       captures. ctrl-c when you're done.")
+
+    taken = 0
+    while True:
+        if capture == "manual":
+            try:
+                input(f"[goto] enter to capture #{taken + 1} ")
+            except EOFError:  # nobody left at the terminal to press it
+                print()
+                return
+        else:
+            time.sleep(capture)
+
+        pose = capture_pose(arm, real, servos)
+        elapsed = time.perf_counter() - started
+        writer.writerow(
+            [f"{elapsed:.4f}"] + [f"{pose[i]:.6f}" for i in FREE_INDICES]
+        )
+        taken += 1
+        shown = "  ".join(
+            f"joint{n}={math.degrees(pose[i]):7.2f}"
+            for n, i in zip(FREE_SERVOS, FREE_INDICES)
+        )
+        print(f"[goto] #{taken:3d} at {elapsed:6.1f}s   {shown} deg")
+
+
+def guided_hold(arm, real, capture, out):
     """Phase 2. Returns (ok, pose the arm is left in)."""
     q = arm.joint_values
     offenders = out_of_plane(q)
@@ -671,66 +591,53 @@ def guided_hold(arm, real, brakes, gain, max_speed):
         )
         return False, q
 
-    if not brakes:
-        print("[goto] joint1, joint4 and joint7 are about to go compliant: "
-              "pushed, they give;\n       let go and they stop. Joints 2, 3, 5 "
-              "and 6 hold the plane with full\n       servo torque. Every "
-              "joint stays powered, so the angles keep reporting\n       and "
-              "record_joints.py can follow along.")
-        if not wait_for_enter("[goto] stand clear, then press enter to begin. "):
-            return False, q
-        try:
-            compliant_hold(arm, gain, max_speed, _GUIDE_RATE)
-        except KeyboardInterrupt:
-            print()  # the status line is unterminated
-        finally:
-            arm.stop()
-        q_hand = arm.joint_values
-        print(f"[goto] left at {degrees(q_hand)} deg")
-        return True, q_hand
-
     print("[goto] about to release joint1, joint4 and joint7. Joints 2, 3, 5 "
           "and 6 stay\n       powered, so the arm can turn about z but cannot "
           "leave its plane.")
-    print("[goto] while the brakes are off the controller stops reporting these "
-          "joints,\n       so their angles freeze on screen however far you "
-          "turn them, and\n       nothing can record the motion. The real pose "
-          "is read back the moment\n       they re-lock.")
+    print("[goto] a released joint isn't reported at all, so the angles freeze "
+          "while you\n       move it. Each capture locks the three joints for "
+          "a moment to read them\n       properly, then lets go again.")
+    if capture != "manual":
+        print(f"[goto] every capture cycles three brakes, and at {capture:g}s "
+              "that adds up over a\n       session — use the slowest interval "
+              "that suits you.")
     if not real:
         print("[goto] (simulated: MuJoCo has no joint brakes, so nothing is "
-              "actually released)")
+              "released and every\n       capture reads the same still pose)")
 
     if not wait_for_enter("[goto] stand clear, then press enter to release. "):
         return False, q
 
-    if not real:
-        try:
-            monitor(arm, real)
-        except KeyboardInterrupt:
-            print()  # the status line is unterminated
-        q_hand = arm.joint_values
-        print(f"[goto] left at {degrees(q_hand)} deg")
-        return True, q_hand
+    out.parent.mkdir(parents=True, exist_ok=True)
+    before = brake_states(arm) if real else (None, None)
+    if real:
+        show_states("before releasing", *before)
 
-    before = brake_states(arm)
-    show_states("before releasing", *before)
-
-    # Everything from here to the `finally` runs with joints off their brakes,
-    # so every way out of it goes through the re-attach — a failure part-way
-    # through the release included, since the joints before it are already free.
     released, failure = [], None
-    try:
-        released, failure = release_joints(arm, FREE_SERVOS)
-        if failure is None:
-            show_states("after releasing", *brake_states(arm))
-            monitor(arm, real)
-    except KeyboardInterrupt:
-        print()  # the status line is unterminated
-    finally:
-        q_hand = arm.joint_values
-        print(f"[goto] left at {degrees(q_hand)} deg")
-        ok = relock(arm, released, q_hand, before) if released else True
+    taken = 0
+    with open(out, "w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["t"] + [f"joint{n}" for n in FREE_SERVOS])
 
+        # Past this point joints are off their brakes, so every way out goes
+        # through the re-attach — a failure part-way through the release
+        # included, since the joints before it are already free.
+        try:
+            if real:
+                released, failure = release_joints(arm, FREE_SERVOS)
+                if failure is None:
+                    show_states("after releasing", *brake_states(arm))
+            if failure is None:
+                started = time.perf_counter()
+                capture_loop(arm, real, FREE_SERVOS, capture, writer, started)
+        except KeyboardInterrupt:
+            print()
+        finally:
+            q_hand = arm.joint_values
+            print(f"[goto] left at {degrees(q_hand)} deg")
+            ok = relock(arm, released, q_hand, before) if released else True
+
+    print(f"[goto] waypoints written to {out}")
     if failure is not None:
         print(f"[goto] {failure}")
         return False, q_hand
@@ -793,8 +700,8 @@ def main(argv=None):
             return 1
 
         # ---- phase 2 -------------------------------------------------
-        ok, q_hand = guided_hold(arm, args.real, args.brakes, args.guide_gain,
-                                 args.guide_max_speed)
+        out = Path(args.out) if args.out else default_capture_path()
+        ok, q_hand = guided_hold(arm, args.real, args.capture, out)
         if not ok:
             print("[goto] a joint could not be released or re-locked, so the "
                   "arm is not in a\n       state to be driven. Leaving it as "
