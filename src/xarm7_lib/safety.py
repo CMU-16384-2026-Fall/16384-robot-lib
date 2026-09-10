@@ -48,7 +48,14 @@ import pinocchio as pin
 # shoulder sweeps back to x = -204 mm in ordinary poses and the arm stands over
 # a metre tall, so a box drawn only around the reachable *workspace* would
 # exclude the arm holding still at home. z = 0 is the mounting surface.
-DEFAULT_BOX = ((-0.10, 0.70), (-0.45, 0.45), (0.00, 0.80))
+#
+# x_min is -500 mm rather than something snug behind the base because the arm
+# genuinely uses that room: tilting the shoulder forward swings the elbow and
+# forearm back past the column, and at -100 mm the guard refused ordinary poses
+# for leaning the wrong way rather than for going anywhere dangerous. Nothing
+# is mounted behind the arm; the limits that matter there are x_max in front of
+# it and z below it.
+DEFAULT_BOX = ((-0.50, 0.70), (-0.45, 0.45), (0.00, 0.80))
 
 # 10 mm of clearance, with room to spare: the home pose, where some link pairs
 # legitimately sit close together, only starts reading as a collision at 30 mm.
