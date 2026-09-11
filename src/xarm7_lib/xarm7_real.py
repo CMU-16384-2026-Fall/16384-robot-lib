@@ -838,6 +838,7 @@ class RealXArm7(RobotInterface):
         recover_speed=RECOVER_SPEED,
         teach_sensitivity=None,
         confirm=None,
+        on_sample=None,
         verbose=True,
     ):
         """Let a person push the arm by hand, and record where they took it.
@@ -883,6 +884,11 @@ class RealXArm7(RobotInterface):
                 to be put back, and must not return until it is safe for the arm
                 to move. Return True to carry on, False to end the run. Defaults
                 to a terminal prompt.
+            on_sample: called as `on_sample(t, q)` after every recorded tick,
+                for live plotting or a caller's own stop condition. Return
+                something truthy to end the run. It runs inside the watch loop,
+                so it must return quickly — time spent in it is time nothing is
+                watching the locked joints, and past `STALL_ABORT` the run ends.
             verbose: print the banner and the running warnings.
 
         Returns:
@@ -955,7 +961,7 @@ class RealXArm7(RobotInterface):
             reason = self._free_drive_loop(
                 mask=mask, duration=duration, period=period, tolerance=tolerance,
                 recover_speed=recover_speed, q_latched=q_latched, confirm=confirm,
-                verbose=verbose, run=run,
+                on_sample=on_sample, verbose=verbose, run=run,
             )
         except KeyboardInterrupt:
             # Deliberately swallowed rather than re-raised: Ctrl-C is how a run
@@ -1014,7 +1020,8 @@ class RealXArm7(RobotInterface):
         )
 
     def _free_drive_loop(self, *, mask, duration, period, tolerance,
-                         recover_speed, q_latched, confirm, verbose, run):
+                         recover_speed, q_latched, confirm, on_sample,
+                         verbose, run):
         """Sample the arm and watch the locked joints. Returns why it ended."""
         warn_at = tolerance * LOCKED_WARN_FRACTION
         started = time.monotonic()
@@ -1053,6 +1060,8 @@ class RealXArm7(RobotInterface):
             run["t"].append(now - started)
             run["q"].append(q)
             run["qd"].append(self.joint_velocities)
+            if on_sample is not None and on_sample(now - started, q.copy()):
+                return "stopped by the caller"
 
             drift = np.abs(q - q_latched)
             drift[mask] = 0.0
