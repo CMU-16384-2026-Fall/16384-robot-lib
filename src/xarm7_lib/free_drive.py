@@ -27,6 +27,11 @@ gravity compensation with its own identified model of itself.
 
 Nothing here needs a robot — the constants you tune, the mask arithmetic, the
 trajectory the loop hands back — so it can be read and changed without one.
+
+Running this module (`python -m xarm7_lib.free_drive`) does none of it. That is
+the plain drag-teach underneath: mode 2, nothing watched, nothing recorded and
+the guard off, for checking the link to the arm and for pushing one back inside
+the safety box after it has been parked outside it.
 """
 
 import dataclasses
@@ -243,43 +248,74 @@ class Trajectory:
 
 if __name__ == "__main__":
     import argparse
+    import os
 
-    from .xarm7_real import RealXArm7
+    from .xarm7_real import MODE_POSITION, MODE_TEACH, RealXArm7
 
     parser = argparse.ArgumentParser(
-        description="Run one hand-guided session from the lab's home pose."
+        prog="python -m xarm7_lib.free_drive",
+        description=(
+            "Release every joint so the arm can be pushed by hand, then lock "
+            "it wherever you left it. Nothing is watched, nothing is recorded "
+            "and the guard is off — which is what makes this the way to move "
+            "an arm that started somewhere the guard would not allow. For a "
+            "run that holds some joints and records the result, call "
+            "`Robot.free_drive` from your own script."
+        )
     )
-    parser.add_argument("ip", help="controller address, e.g. 192.168.1.185")
-    parser.add_argument("-d", "--duration", type=float, default=30.0, help="seconds")
     parser.add_argument(
-        "--tolerance",
-        type=float,
-        default=LOCKED_TOLERANCE,
-        help="rad a locked joint may drift before the run puts it back",
+        "ip",
+        nargs="?",
+        default=os.environ.get("ROBOT_IP", "").strip(),
+        help="controller address, e.g. 192.168.1.185. Defaults to $ROBOT_IP.",
     )
-    parser.add_argument("-o", "--save", help="write the recording to this .npz")
     parser.add_argument("-y", "--yes", action="store_true", help="don't ask first")
     args = parser.parse_args()
+    if not args.ip:
+        parser.error("no controller address: pass one, or set ROBOT_IP")
 
     np.set_printoptions(precision=3, suppress=True)
 
-    if not args.yes:
-        print(
-            "This moves the arm to the home pose, then releases every joint so "
-            "you can push it by hand.\nClear the workspace and keep the e-stop "
-            "within reach."
-        )
-        if input("continue? [y/N] ").strip().lower() not in ("y", "yes"):
-            raise SystemExit(0)
+    def show(arm, when):
+        q = arm.joint_values
+        print(f"  joints {when}  {np.degrees(q)} deg")
+        return q
 
-    with RealXArm7(args.ip) as arm:
-        print("moving to the home pose")
-        arm.set_joint_targets(HOME_POSE, speed=0.4)
+    # `guard=False` is the whole point: the guard refuses to let the arm start
+    # from a pose it would not allow, and an arm parked out of the box is
+    # exactly what someone reaches for this to fix. It also skips loading the
+    # collision meshes, so this connects in about a second — which is what
+    # makes it a decent test of whether anything can talk to the arm at all.
+    with RealXArm7(args.ip, guard=False) as arm:
+        print(f"connected to {args.ip}")
+        show(arm, "now ")
 
-        traj = arm.free_drive(duration=args.duration, tolerance=args.tolerance)
-        print(traj)
-        print(f"  q first = {traj.q[0]}" if len(traj) else "  nothing recorded")
-        print(f"  q last  = {traj.q[-1]}" if len(traj) else "")
-        if args.save:
-            traj.save(args.save)
-            print(f"  written to {args.save}")
+        if not args.yes:
+            print(
+                "\nEvery joint is about to be released. The controller holds "
+                "the arm up against\ngravity, but nothing else is watching it: "
+                "it will go wherever you push it,\nincluding into itself or out "
+                "of the safety box. Keep the e-stop within reach."
+            )
+            if input("continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                raise SystemExit(0)
+
+        arm._ensure_mode(MODE_TEACH)
+        print("\nthe arm is free — push it where you want it")
+        try:
+            input("press Enter to lock it there (Ctrl-C does the same): ")
+        except EOFError:
+            # Nothing on stdin to wait for, so there was never a chance to push
+            # the arm. Still a complete round trip: connected, released, locked.
+            print("(nothing on stdin to wait for)")
+        except KeyboardInterrupt:
+            print()
+
+        # Explicit rather than left to `close()`, which would do the same on the
+        # way out: it locks the arm before the pose below is read, so what gets
+        # printed is where the arm is holding, not where a hand still on it had
+        # it a moment earlier.
+        arm._ensure_mode(MODE_POSITION)
+        print("locked.")
+        q = show(arm, "left")
+        print(f"  as radians   {q.tolist()}")

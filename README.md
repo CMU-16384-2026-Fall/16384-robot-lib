@@ -61,11 +61,22 @@ traj.t     # (N,)   seconds from the start
 traj.save("run.npz")
 ```
 
-Or from a terminal, which moves to the home pose for you:
+## Pushing the arm around from a terminal
 
 ```
-python -m xarm7_lib.free_drive $ROBOT_IP -d 30 -o run.npz
+python -m xarm7_lib.free_drive
 ```
+
+Releases every joint, waits for you to push the arm where you want it, and
+locks it there when you press Enter. It reads `$ROBOT_IP`, or takes an address
+as its argument.
+
+This is not `free_drive` above: nothing is watched, nothing is recorded, and
+the safety guard is off. That last part is the point of it — the guard refuses
+to start a run from a pose it would not allow, so if the arm is parked out of
+the safety box this is what gets it back in. It is also the quickest check that
+your machine can talk to the controller at all: it connects, prints the joint
+angles, and doesn't move the arm anywhere on its own.
 
 ## What "locked" means here
 
