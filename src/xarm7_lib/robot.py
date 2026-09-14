@@ -1,6 +1,7 @@
 import os
 
 from .api import RobotInterface
+from .free_drive import FREE_JOINTS
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN
 from .xarm7_mujoco import SimulatedXArm7
 from .xarm7_real import RealXArm7
@@ -47,30 +48,62 @@ class Robot(RobotInterface):
     def check_safety(self, joints):
         return self.robot.check_safety(joints)
 
+    def close(self):
+        """Release the backend: the connection, or the simulation and viewer.
+
+        The real arm is left stopped with its motors still holding — see
+        `RealXArm7.close` for why it is not switched off.
+        """
+        return self.robot.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def free_drive(self, free=FREE_JOINTS, duration=30.0, **options):
+        """Hand-guide the arm and record where it went.
+
+        Real arm only, and deliberately so: there is nothing to push in
+        simulation. See `RealXArm7.free_drive` for the options.
+        """
+        if not hasattr(self.robot, "free_drive"):
+            raise NotImplementedError(
+                "free drive needs the real arm — there is nothing to push in "
+                "simulation. Set ROBOT_IP and construct Robot() without sim=True."
+            )
+        return self.robot.free_drive(free, duration, **options)
+
+
 if __name__ == '__main__':
     import numpy as np
     import time
 
-    robot = Robot()
-    robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0], wait=True)
+    # `with` closes the backend on the way out — the connection for the real
+    # arm, the simulation thread and viewer for the sim — including when the
+    # loop below is interrupted.
+    with Robot() as robot:
+        robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0], wait=True)
 
-    t = 0
-    try:
-        while True:
-            joints = [
-                .1 * np.sin(t),
-                .1 * (np.cos(t) - 1),
-                -.1 * np.sin(t),
-                .1 * (1 - np.cos(t)),
-                .1 * np.sin(t),
-                .1 * np.sin(t),
-                .1 * np.sin(t),
-            ]
-            robot.servo_joints(joints)
+        t = 0
+        try:
+            while True:
+                joints = [
+                    .1 * np.sin(t),
+                    .1 * (np.cos(t) - 1),
+                    -.1 * np.sin(t),
+                    .1 * (1 - np.cos(t)),
+                    .1 * np.sin(t),
+                    .1 * np.sin(t),
+                    .1 * np.sin(t),
+                ]
+                robot.servo_joints(joints)
 
-            time.sleep(0.05)
-            t += 0.05
-    except KeyboardInterrupt:
-        # The sleep above is the caller's, not the arm's, so the interrupt
-        # lands here rather than inside a motion call.
-        robot.stop()
+                time.sleep(0.05)
+                t += 0.05
+        except KeyboardInterrupt:
+            # The sleep above is the caller's, not the arm's, so the interrupt
+            # lands here rather than inside a motion call.
+            robot.stop()
