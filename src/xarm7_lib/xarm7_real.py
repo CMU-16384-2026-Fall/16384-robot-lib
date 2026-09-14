@@ -163,7 +163,9 @@ class RealXArm7(RobotInterface):
     safety_box : ((x_min, x_max), (y_min, y_max), (z_min, z_max)) in metres,
         which the whole arm must stay inside. None allows it anywhere it can
         reach; self-collision is still refused.
-    safety_margin : clearance in metres at which the check trips.
+    safety_margin : clearance in metres between link pairs, at which the
+        self-collision check trips. The box is not margined — its faces stop
+        the arm where they are drawn.
     guard : refuse commands that would self-collide or leave the box. With this
         off you are left with the controller's own detection, which does not
         cover servo or velocity commands.
@@ -919,10 +921,11 @@ class RealXArm7(RobotInterface):
         dropped for position control, which stiffens the arm where it stands,
         and after a hands-off prompt the arm steps back to the last
         configuration the guard allowed — a few milliseconds of the hand's
-        movement undone. The guard trips at its margin, so that is a step back
-        from the boundary, not out of a collision, and it leaves the arm
-        somewhere later commands can still move from. `reason` says what was
-        hit; everything recorded up to it is returned as usual.
+        movement undone, which is all the further past the line it can have got
+        at the sampling rate. That matters for more than tidiness: a guarded
+        command checks the whole path from where the arm *is*, so an arm left
+        outside the box would refuse every move afterwards. `reason` says what
+        was hit; everything recorded up to it is returned as usual.
         """
         mask = free_mask(free, self.nq)
         duration = float(duration)
@@ -1191,13 +1194,12 @@ class RealXArm7(RobotInterface):
                             verbose):
         """Stop the run at the boundary and step the arm back inside it.
 
-        The guard trips at its margin rather than at contact, so this runs with
-        the arm still short of whatever it was about to hit, and the retreat is
-        the last tick's push undone — a few milliseconds of hand movement at the
-        sampling rate. That path is not checked: it starts where the guard says
-        the arm may not be, so `check_path` would refuse the move for the very
-        reason it is being made. What makes it safe is that the arm has just
-        come along it.
+        The retreat is the last tick's push undone — a few milliseconds of hand
+        movement at the sampling rate, so the arm is a millimetre or two past a
+        box face, and a link pair is still the margin short of touching. That
+        path is not checked: it starts where the guard says the arm may not be,
+        so `check_path` would refuse the move for the very reason it is being
+        made. What makes it safe is that the arm has just come along it.
 
         Returns why the run is over. A violation always ends it: teaching would
         resume one tick from the boundary and trip again immediately.

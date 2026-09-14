@@ -117,7 +117,9 @@ class SimulatedXArm7(RobotInterface):
     safety_box : ((x_min, x_max), (y_min, y_max), (z_min, z_max)) in metres,
         which the whole arm must stay inside. None allows the arm anywhere it
         can reach.
-    safety_margin : clearance in metres at which the guard trips.
+    safety_margin : clearance in metres between link pairs, at which the
+        self-collision check trips. The box is not margined — its faces stop
+        the arm where they are drawn.
     guard : check every setpoint for self-collision and box violations. Turning
         this off lets the arm drive into itself, which the real one won't do.
     gripper : keep the MJCF's gripper. Off by default, matching the bare flange
@@ -183,7 +185,10 @@ class SimulatedXArm7(RobotInterface):
         self._warned_at = -np.inf
         # A joint turning by dq sweeps the far end of the arm through about
         # `_REACH * dq`, so this is the setpoint travel that spends
-        # `_GUARD_TRAVEL` of the clearance margin.
+        # `_GUARD_TRAVEL` of the clearance margin. Only the link pairs have
+        # that margin to spend: a box face is checked where it is drawn, so
+        # between two checks the reference can cross one by this much before
+        # it is rolled back to the last setpoint that was inside.
         self._guard_step = (
             _GUARD_TRAVEL * safety_margin / _REACH if guard else np.inf
         )

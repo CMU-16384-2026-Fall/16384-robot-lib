@@ -35,6 +35,14 @@ The safety box is carried in the same collision problem as six half-spaces, one
 per face, each oriented so that the solid half is the *outside*. Leaving the box
 is then just another collision, found by the same query and reported the same
 way, and the offending face names itself.
+
+The margin is the one thing the two kinds of pair don't share. A link pair wants
+one: the meshes are hulls of a simplified model, they are checked at samples
+along a path rather than continuously, and two links arriving at contact is a
+collision either way. A face is not something the arm can hit — it is where the
+box was asked to be — so it is checked at the plane itself, and the box then
+means the same thing to `check`, to `box_clearances` and to whatever a viewer
+draws from `box`.
 """
 
 import os
@@ -50,8 +58,10 @@ import pinocchio as pin
 # exclude the arm holding still at home. z = 0 is the mounting surface.
 DEFAULT_BOX = ((-0.10, 0.70), (-0.45, 0.45), (0.00, 0.80))
 
-# 10 mm of clearance, with room to spare: the home pose, where some link pairs
-# legitimately sit close together, only starts reading as a collision at 30 mm.
+# 10 mm of clearance between link pairs, with room to spare: the home pose,
+# where link2 and link4 legitimately sit close together at the elbow, only
+# starts reading as a collision at 70 mm. This is not applied to the safety
+# box — see the module docstring for why the two want different things.
 DEFAULT_MARGIN = 0.010
 
 _DESCRIPTION = "xarm7_description"
@@ -109,7 +119,9 @@ class SafetyGuard:
     box : ((x_min, x_max), (y_min, y_max), (z_min, z_max)) in metres, in the
         robot's base frame; every part of the arm but the base must stay inside
         it. None turns the box off and leaves only self-collision checking.
-    margin : clearance in metres. The check trips this far before contact.
+    margin : clearance in metres between link pairs; the check trips this far
+        before two links touch. It does not apply to the box, whose faces trip
+        where they are drawn.
 
     Building one loads and convexifies the meshes, which takes a moment; the
     checks themselves are tens of microseconds, so share a guard rather than
@@ -168,8 +180,15 @@ class SafetyGuard:
     @margin.setter
     def margin(self, value):
         self._margin = float(value)
-        for request in self._geom_data.collisionRequests:
-            request.security_margin = self._margin
+        walls = set(self._wall_pairs)
+        for index, request in enumerate(self._geom_data.collisionRequests):
+            # The margin is a clearance between things that can hit each other,
+            # which is what the link pairs are. A box face is a boundary rather
+            # than an obstacle — there is nothing on the far side of one to keep
+            # clear of — so a margin there would only move the wall inwards by
+            # that much while `box` and `box_clearances` went on reporting the
+            # face where it was asked for.
+            request.security_margin = 0.0 if index in walls else self._margin
 
     @property
     def box(self):
