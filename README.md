@@ -28,6 +28,16 @@ robot = Robot()
 robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0])
 ```
 
+`with` releases the backend when you are done — the connection for the real
+arm, the simulation thread and viewer for the sim — including when the block
+is interrupted or raises:
+```python
+with Robot() as robot:
+    robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0])
+```
+The real arm is left stopped with its motors still holding: switching them off
+would let it fall under its own weight.
+
 # Free drive
 
 Push the arm around by hand with only some of the joints meant to move, and

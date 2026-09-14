@@ -1032,14 +1032,7 @@ class RealXArm7(RobotInterface):
             else teach_sensitivity
         )
         print(
-            f"[xarm7] free drive (joint teaching mode)\n"
-            f"  free      {free}  ({', '.join(self.joint_names[i] for i in free)})\n"
-            f"  watched   {locked}, put back past "
-            f"{np.degrees(tolerance):.1f} deg of drift\n"
-            f"  sampling  {rate:.0f} Hz   teach sensitivity {sensitivity}"
-            f"{'' if teach_sensitivity is None else ' (restored afterwards)'}\n"
-            "  every joint is released, so the watched ones are free until the "
-            "drift is\n  noticed. Push the free joints; Ctrl-C to stop early."
+            f"[xarm7] free drive (joint teaching mode)"
         )
 
     def _free_drive_loop(self, *, mask, duration, period, tolerance,

@@ -48,6 +48,21 @@ class Robot(RobotInterface):
     def check_safety(self, joints):
         return self.robot.check_safety(joints)
 
+    def close(self):
+        """Release the backend: the connection, or the simulation and viewer.
+
+        The real arm is left stopped with its motors still holding — see
+        `RealXArm7.close` for why it is not switched off.
+        """
+        return self.robot.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
     def free_drive(self, free=FREE_JOINTS, duration=30.0, **options):
         """Hand-guide the arm and record where it went.
 
@@ -66,26 +81,29 @@ if __name__ == '__main__':
     import numpy as np
     import time
 
-    robot = Robot()
-    robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0], wait=True)
+    # `with` closes the backend on the way out — the connection for the real
+    # arm, the simulation thread and viewer for the sim — including when the
+    # loop below is interrupted.
+    with Robot() as robot:
+        robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0], wait=True)
 
-    t = 0
-    try:
-        while True:
-            joints = [
-                .1 * np.sin(t),
-                .1 * (np.cos(t) - 1),
-                -.1 * np.sin(t),
-                .1 * (1 - np.cos(t)),
-                .1 * np.sin(t),
-                .1 * np.sin(t),
-                .1 * np.sin(t),
-            ]
-            robot.servo_joints(joints)
+        t = 0
+        try:
+            while True:
+                joints = [
+                    .1 * np.sin(t),
+                    .1 * (np.cos(t) - 1),
+                    -.1 * np.sin(t),
+                    .1 * (1 - np.cos(t)),
+                    .1 * np.sin(t),
+                    .1 * np.sin(t),
+                    .1 * np.sin(t),
+                ]
+                robot.servo_joints(joints)
 
-            time.sleep(0.05)
-            t += 0.05
-    except KeyboardInterrupt:
-        # The sleep above is the caller's, not the arm's, so the interrupt
-        # lands here rather than inside a motion call.
-        robot.stop()
+                time.sleep(0.05)
+                t += 0.05
+        except KeyboardInterrupt:
+            # The sleep above is the caller's, not the arm's, so the interrupt
+            # lands here rather than inside a motion call.
+            robot.stop()
