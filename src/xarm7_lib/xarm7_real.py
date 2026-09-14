@@ -21,7 +21,9 @@ motion modes, and the work is in switching between them cleanly:
 
 `free_drive` adds a fourth: mode 2, joint teaching, in which the controller
 gravity-compensates the arm and lets a person push it around. Nothing is
-commanded in that mode — see `free_drive.py` for what it does instead.
+commanded in that mode, so there is nothing to check before sending: the guard
+is run against what the arm reports instead, and a sample it rejects ends the
+run and steps the arm back. See `free_drive.py` for the rest of what it does.
 
 A mode change is only accepted while the arm is stopped, so `_ensure_mode`
 first cancels whatever is running — zero velocities in mode 4, a state-4 abort
@@ -310,6 +312,16 @@ class RealXArm7(RobotInterface):
         # The controller time-synchronizes the joints, so the whole move is the
         # straight line from here to there — check all of it, not just the end.
         self._check_safe_path(self.joint_values, goal)
+        return self._move_joints(goal, speed, wait=wait, timeout=timeout)
+
+    def _move_joints(self, goal, speed=None, wait=True, timeout=None):
+        """`set_joint_targets` with the checks already done.
+
+        Split out for free drive's retreat, which is the one move in the library
+        that starts somewhere the guard would refuse: the arm is already past
+        the boundary by then, and `check_path` would reject the way back out for
+        exactly the reason it is being made.
+        """
         speed = DEFAULT_SPEED if speed is None else float(speed)
         if speed <= 0.0:
             raise ValueError("speed must be positive")
@@ -889,7 +901,8 @@ class RealXArm7(RobotInterface):
                 something truthy to end the run. It runs inside the watch loop,
                 so it must return quickly — time spent in it is time nothing is
                 watching the locked joints, and past `STALL_ABORT` the run ends.
-            verbose: print the banner and the running warnings.
+            verbose: print the banner and the running warnings. The guard is
+                checked either way — it ends the run rather than reporting it.
 
         Returns:
             A `Trajectory` with `t`, `q` and `qd` sampled once per tick, plus
@@ -899,10 +912,17 @@ class RealXArm7(RobotInterface):
         Raises ValueError for a malformed `free`, and `SafetyError` if the arm is
         somewhere the guard won't allow before the run even starts.
 
-        The guard cannot refuse anything during the run — the person's hand is
-        not a command — so where the free joints go is theirs to get right, and
-        a self-collision or a step outside the safety box is warned about rather
-        than prevented.
+        The guard cannot *refuse* anything during the run — the person's hand
+        is not a command — so a self-collision or a step outside the safety box
+        is caught after the fact rather than before it. What it can do is stop:
+        a sample the guard rejects ends the run there and then. Teaching mode is
+        dropped for position control, which stiffens the arm where it stands,
+        and after a hands-off prompt the arm steps back to the last
+        configuration the guard allowed — a few milliseconds of the hand's
+        movement undone. The guard trips at its margin, so that is a step back
+        from the boundary, not out of a collision, and it leaves the arm
+        somewhere later commands can still move from. `reason` says what was
+        hit; everything recorded up to it is returned as usual.
         """
         mask = free_mask(free, self.nq)
         duration = float(duration)
@@ -1030,6 +1050,10 @@ class RealXArm7(RobotInterface):
         last_tick = None
         resumed_at = -np.inf  # the first trip is nobody's repeat
         repeats = 0
+        # `free_drive` refuses to start from a pose the guard rejects, so the
+        # latched configuration is a known-good place to retreat to until a
+        # sample replaces it.
+        q_safe = q_latched
 
         while True:
             now = time.monotonic()
@@ -1062,6 +1086,19 @@ class RealXArm7(RobotInterface):
             run["qd"].append(self.joint_velocities)
             if on_sample is not None and on_sample(now - started, q.copy()):
                 return "stopped by the caller"
+
+            # Checked whether or not anyone is watching the terminal: this is
+            # the one thing in the run that ends it rather than reporting it.
+            violation = None if self._guard is None else self._guard.check(q)
+            if violation is not None:
+                if verbose:
+                    print(f"[xarm7] unsafe pose: {violation}")
+                return self._free_drive_retreat(
+                    violation=violation, q_safe=q_safe,
+                    recover_speed=recover_speed, confirm=confirm,
+                    verbose=verbose,
+                )
+            q_safe = q
 
             drift = np.abs(q - q_latched)
             drift[mask] = 0.0
@@ -1098,21 +1135,13 @@ class RealXArm7(RobotInterface):
                 next_tick = resumed_at + period
                 continue
 
-            if verbose:
-                if drift[worst] > warn_at:
-                    self._free_drive_warn(
-                        run,
-                        f"{self.joint_names[worst]} is locked and has been "
-                        f"pushed {np.degrees(drift[worst]):.1f} deg off it — "
-                        "ease off, or the run will stop to put it back",
-                    )
-                violation = None if self._guard is None else self._guard.check(q)
-                if violation is not None:
-                    # Nothing here can refuse it. Every other mode checks a
-                    # configuration before committing to it, but in free drive
-                    # there is no command to refuse — a hand went somewhere, and
-                    # all this can do is say so.
-                    self._free_drive_warn(run, f"unsafe pose: {violation}")
+            if verbose and drift[worst] > warn_at:
+                self._free_drive_warn(
+                    run,
+                    f"{self.joint_names[worst]} is locked and has been "
+                    f"pushed {np.degrees(drift[worst]):.1f} deg off it — "
+                    "ease off, or the run will stop to put it back",
+                )
 
             next_tick += period
             sleep = next_tick - time.monotonic()
@@ -1157,6 +1186,50 @@ class RealXArm7(RobotInterface):
             print(f"[xarm7] {name} is back on its lock; free drive resuming\n")
         self._ensure_mode(MODE_TEACH)
         return None
+
+    def _free_drive_retreat(self, *, violation, q_safe, recover_speed, confirm,
+                            verbose):
+        """Stop the run at the boundary and step the arm back inside it.
+
+        The guard trips at its margin rather than at contact, so this runs with
+        the arm still short of whatever it was about to hit, and the retreat is
+        the last tick's push undone — a few milliseconds of hand movement at the
+        sampling rate. That path is not checked: it starts where the guard says
+        the arm may not be, so `check_path` would refuse the move for the very
+        reason it is being made. What makes it safe is that the arm has just
+        come along it.
+
+        Returns why the run is over. A violation always ends it: teaching would
+        resume one tick from the boundary and trip again immediately.
+        """
+        # Position control first, as in `_free_drive_recover`: it stiffens the
+        # arm where it stands, which is what stops the hand carrying it any
+        # further while anyone is being asked anything.
+        self._ensure_mode(MODE_POSITION)
+        reason = f"unsafe pose: {violation}"
+        if not confirm(
+            "\n[xarm7] the arm has reached the edge of what the guard allows:"
+            f"\n        {violation}"
+            "\n        Free drive has stopped and the arm is holding still."
+            "\n        TAKE YOUR HANDS OFF THE ROBOT — it is about to move on "
+            "its own to step back inside."
+        ):
+            # Left where it stopped, which is a pose every guarded command will
+            # refuse, so say so rather than leave it to be discovered.
+            return (
+                f"{reason}; the step back inside was declined, so the arm is "
+                "left outside the guard and later commands will be refused"
+            )
+
+        try:
+            reached = self._move_joints(q_safe, speed=recover_speed)
+        except (ValueError, XArmError) as err:
+            return f"{reason}; the arm could not be stepped back inside: {err}"
+        if not reached:
+            return f"{reason}; the move back inside did not finish"
+        if verbose:
+            print("[xarm7] the arm is back inside the guard")
+        return reason
 
     def _free_drive_warn(self, run, what):
         """Print at most once every `WARN_PERIOD`, so a hand held against the
