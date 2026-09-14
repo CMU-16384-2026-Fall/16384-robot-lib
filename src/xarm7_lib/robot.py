@@ -7,15 +7,16 @@ from .xarm7_mujoco import SimulatedXArm7
 from .xarm7_real import RealXArm7
 
 class Robot(RobotInterface):
+    """The arm, real when ROBOT_IP is set and simulated otherwise."""
     def __init__(self, sim=False, safety_box=DEFAULT_BOX,
-                 safety_margin=DEFAULT_MARGIN, guard=True):
+                 safety_margin=DEFAULT_MARGIN, guard=True, q0=None):
         super().__init__()
         safety = dict(safety_box=safety_box, safety_margin=safety_margin, guard=guard)
         ip = os.environ.get('ROBOT_IP', '').strip()
         if ip and not sim:
             self.robot = RealXArm7(ip, **safety)
         else:
-            self.robot = SimulatedXArm7(visualize=True, **safety)
+            self.robot = SimulatedXArm7(visualize=True, q0=q0, **safety)
 
     @property
     def joint_values(self):
