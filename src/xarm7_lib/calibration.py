@@ -157,7 +157,7 @@ def _extrinsics(conf, resolution):
     # The right eye sits at +x from the left, so these come out negative.
     # `rectify` checks the result, because this is the one convention in the
     # file that is easy to get backwards.
-    translation = np.array([-baseline, -value("TY"), -value("TZ")]) / 1000.0
+    translation = np.array([[-baseline], [-value("TY")], [-value("TZ")]]) / 1000.0
     return rotation, translation
 
 
