@@ -12,6 +12,7 @@ dependencies = [
     "meshcat",
     "mujoco",
     "numpy",
+    "opencv-python",
     # provides both the `pinocchio` and `coal` modules used by safety.py
     "pin>=4.1",
     "robot_descriptions",
