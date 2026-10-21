@@ -5,13 +5,12 @@ environment variable is set and the MuJoCo simulation otherwise, so the same
 script runs against either. The backends are also importable directly as
 `RealXArm7` and `SimulatedXArm7`.
 
-`ZedCapture` and `StereoCalibration` cover the ZED stereo camera, both without
-the ZED SDK so that they work on a machine with no NVIDIA GPU.
+`ZedCapture` and `StereoCalibration` cover the ZED stereo camera
 """
 
 from .api import RobotInterface
 from .calibration import RESOLUTIONS, CalibrationError, StereoCalibration
-from .camera import CameraError, ZedCapture
+from .camera import CameraError, ZedCapture, ZedDevice, devices, register_serial
 from .free_drive import (
     FREE_JOINTS,
     HOME_POSE,
@@ -52,6 +51,9 @@ __all__ = [
     "Violation",
     "XArmError",
     "ZedCapture",
+    "ZedDevice",
     "__version__",
+    "devices",
     "free_mask",
+    "register_serial",
 ]
