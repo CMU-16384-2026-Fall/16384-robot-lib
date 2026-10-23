@@ -1,15 +1,21 @@
 # zed_oc_shim
 
 A C entry point onto [zed-open-capture](https://github.com/stereolabs/zed-open-capture)
-for the three things OpenCV cannot reach on a ZED: the **serial number**, the
-**exposure** and the **gain**. They go through vendor-specific USB requests
-rather than standard V4L2 controls, so no amount of `cv2.CAP_PROP_*` will get
-at them.
+for everything OpenCV cannot do with a ZED: the **serial number**, the
+**exposure**, the **gain**, and — as it turned out — the **frames**.
 
-Capture itself works without this -- that is plain OpenCV. What needs the shim
-is exposure and gain, and the serial number, which is what selects a camera's
-calibration. So without it you get frames but no calibration unless you pass
-`serial=` by hand.
+The first three go through vendor-specific USB requests rather than standard
+V4L2 controls, so no amount of `cv2.CAP_PROP_*` reaches them. Frames are here
+for a different reason: OpenCV's V4L2 path returned torn frames from this
+camera, bands of misaligned YUYV, where `ffmpeg` reading the same `/dev/video*`
+was clean. Telling the kernel to discard the torn frames instead of passing
+them through (`uvcvideo nodrop=0`) then cost half the frame rate, which showed
+how often it was happening. So capture moved to the implementation Stereolabs
+wrote for this camera.
+
+`ZedOpenCapture` is the result and is the one to use; `ZedCapture`, the OpenCV
+one, is kept for comparison. Without the shim built you get neither frames nor
+calibration, since the serial number is what selects a calibration.
 
 ## Building
 
@@ -50,12 +56,19 @@ shim built -- that line alone confirms it is linked and working. Then
 python -m xarm7_lib.zed_probe --exposure 20
 ```
 
-## The one thing hardware has to confirm
+## One handle does both
 
-The shim opens the camera, applies settings and closes it again, leaving the
-stream to OpenCV, because only one owner can stream a V4L2 device at a time.
-That assumes the camera keeps its exposure and gain registers across a close
-and reopen. If it does not, the settings will appear to take and then be gone
-by the time frames arrive — `--exposure 1` should give an obviously dark image,
-so the test is quick. The fallback is to let zed-open-capture own the capture
-as well, which is a larger change than this directory.
+Because the same handle streams and controls, exposure and gain change without
+stopping the stream — `ZedOpenCapture.set_exposure` takes effect on the next
+frame. That also retires the question the earlier design turned on, of whether
+a setting survives the camera being closed and reopened: nothing is reopened.
+
+## If the frame rate is low
+
+`uvcvideo`'s `nodrop` parameter decides whether incomplete frames reach
+userspace. With `nodrop=1` they do, and OpenCV rendered them as bands; with
+`nodrop=0` they are discarded, and the frame rate falls by however often they
+occur. zed-open-capture may well cope with partial frames itself — which is the
+likely reason something set `nodrop=1` on this machine in the first place — so
+if the native path also runs slow, `nodrop=1` is worth retrying **with this
+backend**, where the banding it caused under OpenCV may not appear.

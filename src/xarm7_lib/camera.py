@@ -139,7 +139,7 @@ def devices():
     if not _SYSFS_V4L.is_dir():
         raise CameraError(
             f"{_SYSFS_V4L} does not exist, so the kernel has registered no "
-            "video device. Tryg unpluggin and replugging the camera."
+            "video device. Try unplugging and replugging the camera."
         )
     found = []
     for entry in sorted(_SYSFS_V4L.iterdir(), key=lambda path: path.name):
@@ -257,6 +257,20 @@ def find_device(serial=None):
     )
 
 
+def _calibration_for(serial, resolution):
+    """This camera's calibration, or why it cannot be found."""
+    if serial is None:
+        raise CameraError(
+            "this camera's serial number could not be read, so its "
+            "calibration cannot be looked up. The camera only gives it up "
+            "through the zed-open-capture shim, so either that is not built "
+            "(see native/README.md) or something was streaming the camera "
+            "when it was asked. Passing serial= skips the question -- it is "
+            "printed on the label on the camera's back panel."
+        )
+    return StereoCalibration.from_serial(serial, resolution)
+
+
 class ZedCapture:
     """A ZED stereo camera, read through OpenCV.
 
@@ -334,6 +348,14 @@ class ZedCapture:
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, 2 * width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
         self._capture.set(cv2.CAP_PROP_FPS, requested_fps)
+
+        # The shallowest queue the driver will give. A deep one means every
+        # read hands back a frame the camera captured several frames ago, so a
+        # loop that cannot quite keep up ends up looking steadily further into
+        # the past rather than dropping frames and staying current. Not every
+        # backend honours it, and a refusal is not worth reporting.
+        self._capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
         self._check_mode(2 * width, height)
 
     def _check_mode(self, width, height):
@@ -364,17 +386,7 @@ class ZedCapture:
     def calibration(self):
         """This camera's factory calibration at the current resolution."""
         if self._calibration is None:
-            if self.serial is None:
-                raise CameraError(
-                    "this camera's serial number could not be read, so its "
-                    "calibration cannot be looked up. The camera only gives it "
-                    "up through the zed-open-capture shim, so either that is "
-                    "not built (see native/README.md) or something was "
-                    "streaming the camera when it was asked. Passing serial= "
-                    "skips the question -- it is printed on the label on the "
-                    "camera's back panel."
-                )
-            self._calibration = StereoCalibration.from_serial(self.serial, self.resolution)
+            self._calibration = _calibration_for(self.serial, self.resolution)
         return self._calibration
 
     def read_raw(self):
@@ -419,3 +431,124 @@ class ZedCapture:
     def __repr__(self):
         serial = f"SN{self.serial}" if self.serial else "unknown serial"
         return f"<ZedCapture {serial} {self.resolution} {self.size[0]}x{self.size[1]}>"
+
+
+class ZedOpenCapture:
+    """A ZED read through zed-open-capture rather than OpenCV.
+
+    Interchangeable with `ZedCapture` -- the same `read`, the same
+    `calibration`, the same `with` block -- and the one to prefer. OpenCV's
+    V4L2 path handed back torn frames from this camera, bands of misaligned
+    YUYV, where ffmpeg reading the same device was clean; telling the kernel to
+    discard the torn ones rather than pass them through then cost half the
+    frame rate. This goes through the implementation Stereolabs wrote for the
+    camera instead, so it needs the native shim built -- see native/README.md.
+
+    One handle streams and controls at once, so `set_exposure` and `set_gain`
+    take effect without stopping the stream, which `ZedCapture` cannot do.
+
+    Args:
+        resolution: One of "2K", "FHD", "HD", "VGA", as a per-eye size.
+        device: A `/dev/video*` path or an index; found automatically when
+            omitted.
+        serial: Which camera to open. Read from the camera itself otherwise.
+        fps: Frame rate. Defaults to the mode's maximum.
+        exposure: Applied once the stream is up, and changeable after.
+        gain: The same.
+    """
+
+    def __init__(self, resolution="HD", device=None, serial=None, fps=None,
+                 exposure=None, gain=None):
+        if resolution not in RESOLUTIONS:
+            raise CameraError(
+                f"unknown resolution {resolution!r}, expected one of "
+                f"{', '.join(RESOLUTIONS)}"
+            )
+        width, height = RESOLUTIONS[resolution]
+        self.resolution = resolution
+        self.size = (width, height)
+        self.fps = DEFAULT_FPS[resolution] if fps is None else fps
+        self.pixel_format = "YUYV"  # what the camera sends, before conversion
+        self.timestamp = 0  # of the last frame, nanoseconds
+        self.repeated = 0  # frames handed back twice, i.e. read faster than sent
+        self._calibration = None
+        self._last_frame_id = None
+
+        if device is None:
+            found = _sole_device() if serial is None else find_device(serial)[0]
+            device, self.port = found.path, found.port
+        else:
+            self.port = ""
+        self.device = device
+
+        self._session = zed_controls.ZedControls(device, resolution, self.fps)
+        self.serial = str(serial) if serial is not None else self._session.serial
+        if exposure is not None:
+            self._session.set_exposure(exposure)
+        if gain is not None:
+            self._session.set_gain(gain)
+        self.exposure = self._session.exposure()
+        self.gain = self._session.gain()
+
+    @property
+    def calibration(self):
+        """This camera's factory calibration at the current resolution."""
+        if self._calibration is None:
+            self._calibration = _calibration_for(self.serial, self.resolution)
+        return self._calibration
+
+    def set_exposure(self, value):
+        """Change exposure on both sensors, with the stream still running."""
+        self._session.set_exposure(value)
+        self.exposure = self._session.exposure()
+        return self.exposure
+
+    def set_gain(self, value):
+        """Change gain on both sensors, with the stream still running."""
+        self._session.set_gain(value)
+        self.gain = self._session.gain()
+        return self.gain
+
+    def read_raw(self):
+        """One frame as it arrives: both eyes side by side, converted to BGR."""
+        frame, frame_id, timestamp = self._session.frame()
+        if frame_id == self._last_frame_id:
+            self.repeated += 1
+        self._last_frame_id = frame_id
+        self.timestamp = timestamp
+
+        expected = (self.size[1], 2 * self.size[0])
+        if frame.shape[:2] != expected:
+            raise CameraError(
+                f"the camera sent {frame.shape[1]}x{frame.shape[0]} where "
+                f"{self.resolution} should be {expected[1]}x{expected[0]}"
+            )
+        # The conversion also copies the frame out of the session's reused
+        # buffer, which the next grab overwrites.
+        return cv2.cvtColor(frame, cv2.COLOR_YUV2BGR_YUYV)
+
+    def read(self):
+        """Grab one frame and return it as `(left, right)`."""
+        left, right = np.split(self.read_raw(), 2, axis=1)
+        return np.ascontiguousarray(left), np.ascontiguousarray(right)
+
+    def read_rectified(self):
+        """Grab one frame and return the two eyes rectified."""
+        return self.calibration.rectify_images(*self.read())
+
+    def close(self):
+        """Stop streaming and release the camera."""
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+        return False
+
+    def __repr__(self):
+        serial = f"SN{self.serial}" if self.serial else "unknown serial"
+        return f"<ZedOpenCapture {serial} {self.resolution} {self.size[0]}x{self.size[1]}>"

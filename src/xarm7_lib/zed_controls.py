@@ -7,17 +7,15 @@ controls, and does not publish the serial in its USB descriptor at all -- so
 `camera.py` can do everything except these. `zed-open-capture` can make them,
 and this is the ctypes binding onto a small C entry point over it.
 
-Capture is deliberately not part of this. A V4L2 device can only be streamed by
-one owner at a time, and `camera.py` already streams it through OpenCV, so the
-camera is opened here, set, and closed again, leaving the stream alone. **That
-ordering is the thing to know**: settings go on before `ZedCapture` opens the
-device, and a `ZedControls` block must be closed before it does.
+Frames come from here too, and that was not the original plan. OpenCV's V4L2
+path returned torn frames from this camera -- bands of misaligned YUYV -- where
+ffmpeg reading the same device was clean, and once the kernel was told to drop
+the torn ones instead of passing them through, half the frame rate went with
+them. So capture moved to the implementation Stereolabs wrote for this camera.
 
-Which rests on one assumption that only hardware can settle -- that the camera
-keeps its exposure and gain registers across a close and reopen. If it turns
-out not to, the settings will appear to take and then be gone by the time
-frames arrive, and the fallback is to let zed-open-capture own the capture as
-well. `native/README.md` has a one-command test for it.
+One handle streams and controls at once, which is simpler than what came
+before: exposure now takes effect without stopping the stream, and the question
+of whether a setting survives a close and reopen does not arise.
 
 The exposure a value means depends on the frame rate, because the library maps
 it onto raw sensor registers whose range shrinks as the rate rises. So a
@@ -34,6 +32,8 @@ import os
 import pathlib
 import re
 
+import numpy as np
+
 # The shim's resolution codes are zed-open-capture's RESOLUTION enum in
 # declaration order, keyed by the names the rest of the library uses.
 _RESOLUTION_CODE = {"2K": 0, "FHD": 1, "HD": 2, "VGA": 3}
@@ -41,6 +41,10 @@ _RESOLUTION_CODE = {"2K": 0, "FHD": 1, "HD": 2, "VGA": 3}
 # Matching its CAM_SENS_POS.
 LEFT = 0
 RIGHT = 1
+
+# Long enough that a dropped frame does not look like a dead camera, short
+# enough that a dead camera does not look like a slow one.
+FRAME_TIMEOUT_MS = 200
 
 LIBRARY_NAME = "libzed_oc_shim.so"
 SHIM_ENV = "ZED_OC_SHIM"
@@ -86,6 +90,19 @@ def _signatures(library):
     for name in ("zed_oc_set_exposure", "zed_oc_set_gain"):
         getattr(library, name).argtypes = [handle, ctypes.c_int, ctypes.c_int]
         getattr(library, name).restype = ctypes.c_int
+
+    library.zed_oc_frame.argtypes = [
+        handle,
+        ctypes.POINTER(ctypes.c_ubyte),  # where to copy the frame
+        ctypes.c_int,  # how many bytes that will hold
+        ctypes.POINTER(ctypes.c_int),  # width, both eyes together
+        ctypes.POINTER(ctypes.c_int),  # height
+        ctypes.POINTER(ctypes.c_int),  # channels, 2 for YUV 4:2:2
+        ctypes.POINTER(ctypes.c_ulonglong),  # frame id
+        ctypes.POINTER(ctypes.c_ulonglong),  # timestamp, nanoseconds
+        ctypes.c_int,  # timeout
+    ]
+    library.zed_oc_frame.restype = ctypes.c_int
     return library
 
 
@@ -156,6 +173,7 @@ class ZedControls:
                 f"{', '.join(_RESOLUTION_CODE)}"
             )
         self._library = load_shim()
+        self._buffer = None
         self._handle = self._library.zed_oc_open(
             _RESOLUTION_CODE[resolution], int(fps), _device_id(device), int(verbose)
         )
@@ -179,6 +197,62 @@ class ZedControls:
         if serial <= 0:
             raise ControlsError(f"the camera returned no serial number ({serial})")
         return str(serial)
+
+    def frame(self, timeout_ms=FRAME_TIMEOUT_MS):
+        """The newest frame, as `(array, frame_id, timestamp_ns)`.
+
+        The array is raw YUV 4:2:2 shaped `(height, width, channels)` with both
+        eyes side by side; `camera.ZedOpenCapture` is what turns it into two
+        BGR images. It is a view of a buffer this session reuses, so the next
+        call overwrites it -- copy or convert before asking for another.
+
+        `frame_id` increases once per frame the camera produced, so the same
+        value twice means this was asked faster than the camera delivers rather
+        than that the scene stood still.
+        """
+        self._check()
+        width, height, channels = (ctypes.c_int() for _ in range(3))
+        frame_id, timestamp = ctypes.c_ulonglong(), ctypes.c_ulonglong()
+
+        for _ in range(2):
+            capacity = 0 if self._buffer is None else self._buffer.size
+            pointer = (
+                None
+                if self._buffer is None
+                else self._buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte))
+            )
+            status = self._library.zed_oc_frame(
+                self._handle,
+                pointer,
+                capacity,
+                ctypes.byref(width),
+                ctypes.byref(height),
+                ctypes.byref(channels),
+                ctypes.byref(frame_id),
+                ctypes.byref(timestamp),
+                int(timeout_ms),
+            )
+            if status == 0:
+                break
+            if status == -3:
+                # The first call has no buffer yet, and the shim answers with
+                # the size it wanted; allocate that and ask again.
+                self._buffer = np.empty(
+                    width.value * height.value * channels.value, dtype=np.uint8
+                )
+                continue
+            if status == -2:
+                raise ControlsError(
+                    f"no frame within {timeout_ms} ms -- the camera may have "
+                    "stopped streaming"
+                )
+            raise ControlsError(f"frame grab failed with status {status}")
+        else:
+            raise ControlsError("the camera kept asking for a larger buffer")
+
+        shape = (height.value, width.value, channels.value)
+        size = shape[0] * shape[1] * shape[2]
+        return self._buffer[:size].reshape(shape), frame_id.value, timestamp.value
 
     def exposure(self, side=LEFT):
         """The current exposure of one sensor."""

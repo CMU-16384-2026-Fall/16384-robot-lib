@@ -1,16 +1,19 @@
-// A C entry point onto the three things zed-open-capture can do that OpenCV
-// cannot: read the camera's serial number, and set its exposure and gain.
-// Those go through vendor-specific USB requests rather than standard V4L2
-// controls, which is why OpenCV cannot reach them and this file exists.
+// A C entry point onto zed-open-capture: the camera's serial number, its
+// exposure and gain, and its frames.
 //
-// Capturing frames is deliberately not here. A V4L2 device can only be
-// streamed by one owner at a time, and camera.py already streams it through
-// OpenCV, so this library is opened around that rather than replacing it --
-// see zed_controls.py for the ordering that requires.
+// The first three go through vendor-specific USB requests rather than standard
+// V4L2 controls, which is why OpenCV cannot reach them. Frames are here for a
+// different reason: OpenCV's V4L2 path was handing back torn frames from this
+// camera where ffmpeg reading the same device was clean, so capture moved to
+// the implementation Stereolabs wrote for it. One handle streams and controls
+// at once, which also means exposure can change without stopping the stream.
 
 #include <videocapture.hpp>
 
+#include <cstring>
+
 using sl_oc::video::CAM_SENS_POS;
+using sl_oc::video::Frame;
 using sl_oc::video::FPS;
 using sl_oc::video::RESOLUTION;
 using sl_oc::video::VideoCapture;
@@ -72,6 +75,39 @@ void zed_oc_close(void *handle) {
 int zed_oc_serial(void *handle) {
     if (handle == nullptr) return -1;
     return as_capture(handle)->getSerialNumber();
+}
+
+// Copies the newest frame out as raw YUV 4:2:2, both eyes side by side.
+// Returns 0 on success, -1 for a dead handle, -2 when no frame arrived inside
+// the timeout, and -3 when `out` is too small -- in which case the size
+// fields are still filled in, so a caller can size its buffer and retry.
+//
+// The copy is immediate and deliberate: getLastFrame hands back a reference
+// to the capture thread's own frame, which it is free to overwrite.
+int zed_oc_frame(void *handle, unsigned char *out, int capacity, int *width,
+                 int *height, int *channels, unsigned long long *frame_id,
+                 unsigned long long *timestamp, int timeout_ms) {
+    if (handle == nullptr) return -1;
+
+    const Frame &frame = as_capture(handle)->getLastFrame(timeout_ms);
+    if (frame.data == nullptr || frame.width == 0 || frame.height == 0) return -2;
+
+    if (width != nullptr) *width = frame.width;
+    if (height != nullptr) *height = frame.height;
+    if (channels != nullptr) *channels = frame.channels;
+    // frame_id lets the caller tell a genuinely new frame from the same one
+    // handed back twice, which is what "last frame" means when it is asked
+    // for faster than the camera produces.
+    if (frame_id != nullptr) *frame_id = frame.frame_id;
+    if (timestamp != nullptr) *timestamp = frame.timestamp;
+
+    const int needed =
+        static_cast<int>(frame.width) * static_cast<int>(frame.height) *
+        static_cast<int>(frame.channels);
+    if (out == nullptr || capacity < needed) return -3;
+
+    std::memcpy(out, frame.data, static_cast<size_t>(needed));
+    return 0;
 }
 
 int zed_oc_get_exposure(void *handle, int side) {
