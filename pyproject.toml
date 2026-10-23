@@ -12,13 +12,17 @@ dependencies = [
     "meshcat",
     "mujoco",
     "numpy",
-    "opencv-python",
     # provides both the `pinocchio` and `coal` modules used by safety.py
     "pin>=4.1",
     "robot_descriptions",
     "xacrodoc",
     "xarm-python-sdk",
 ]
+
+# Only camera.py and calibration.py need OpenCV, and only machines with a ZED
+# attached need those. Everything the simulator does works without it.
+[project.optional-dependencies]
+camera = ["opencv-python"]
 
 [project.urls]
 Homepage = "https://github.com/tooflesswulf/16384-prototype-lib"

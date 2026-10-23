@@ -15,7 +15,16 @@ conda env update -f environment.yml
 
 ## Camera install
 
-Follow the instructions in `native/` to install zed-open-capture and build the shim.
+OpenCV is an optional extra, so a machine that only runs the simulator does not
+need it:
+
+```bash
+pip install -e ".[camera]"
+```
+
+Then follow the instructions in `native/` to install zed-open-capture and build
+the shim. Both are needed on a machine with a ZED attached; neither is needed
+for the simulator.
 
 # Testing
 ```python

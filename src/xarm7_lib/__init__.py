@@ -5,13 +5,13 @@ environment variable is set and the MuJoCo simulation otherwise, so the same
 script runs against either. The backends are also importable directly as
 `RealXArm7` and `SimulatedXArm7`.
 
-`ZedCapture` and `StereoCalibration` cover the ZED stereo camera
+`ZedCapture` and `StereoCalibration` cover the ZED stereo camera, imported on
+first use so that the simulator needs neither OpenCV nor the native shim.
 """
 
+import importlib
+
 from .api import RobotInterface
-from .calibration import RESOLUTIONS, CalibrationError, StereoCalibration
-from .camera import CameraError, ZedCapture, ZedDevice, devices, query_serial
-from .zed_controls import ControlsError, ZedControls
 from .free_drive import (
     FREE_JOINTS,
     HOME_POSE,
@@ -31,6 +31,43 @@ from .xarm7_mujoco import SimulatedXArm7
 from .xarm7_real import RealXArm7, XArmError
 
 __version__ = "0.1.0"
+
+# Imported on first use, so `import xarm7_lib` costs nothing on a machine that
+# only runs the simulator: no OpenCV, no native shim. Python routes a name
+# missing from the module through `__getattr__` below.
+_CAMERA_EXPORTS = {
+    "CalibrationError": "calibration",
+    "RESOLUTIONS": "calibration",
+    "StereoCalibration": "calibration",
+    "CameraError": "camera",
+    "ZedCapture": "camera",
+    "ZedDevice": "camera",
+    "devices": "camera",
+    "query_serial": "camera",
+    "ControlsError": "zed_controls",
+    "ZedControls": "zed_controls",
+}
+
+
+def __getattr__(name):
+    module = _CAMERA_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    try:
+        imported = importlib.import_module(f".{module}", __name__)
+    except ImportError as error:
+        raise ImportError(
+            f"{name} is part of the camera support, whose dependencies are an "
+            "optional extra: install them with `pip install -e \'.[camera]\'`. "
+            f"The simulator does not need them. ({error})"
+        ) from error
+    value = getattr(imported, name)
+    globals()[name] = value  # so this only happens once per name
+    return value
+
+
+def __dir__():
+    return sorted(__all__)
 
 __all__ = [
     "CalibrationError",
