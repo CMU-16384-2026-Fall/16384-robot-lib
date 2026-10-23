@@ -52,6 +52,7 @@ import sys
 import cv2
 import numpy as np
 
+from . import zed_controls
 from .calibration import RESOLUTIONS, StereoCalibration
 
 # What each mode runs at unless asked otherwise. These are the camera's maxima
@@ -193,6 +194,16 @@ def resolve_serial(device):
     return _serial_map().get(device.port) or None
 
 
+def query_serial(device=None):
+    """Ask a camera its own serial number, which needs the zed-open-capture shim.
+
+    The camera does not publish its serial over USB, so this is the only way to
+    get it without being told -- `resolve_serial` covers what works with no
+    native code. Nothing may be streaming the camera at the time.
+    """
+    return zed_controls.read_serial(device)
+
+
 def register_serial(serial, device=None):
     """Record a camera's serial number against the port it is plugged into.
 
@@ -300,9 +311,14 @@ class ZedCapture:
         serial: Which camera to open, and what its calibration is looked up
             by. Resolved from the machine when omitted -- see `resolve_serial`.
         fps: Frame rate. Defaults to the mode's maximum.
+        exposure: Exposure to apply before streaming starts. Needs the
+            zed-open-capture shim, since this is not a V4L2 control -- see
+            `zed_controls`. Left as the camera had it when None.
+        gain: Gain, on the same terms as exposure.
     """
 
-    def __init__(self, resolution="HD", device=None, serial=None, fps=None):
+    def __init__(self, resolution="HD", device=None, serial=None, fps=None,
+                 exposure=None, gain=None):
         if resolution not in RESOLUTIONS:
             raise CameraError(
                 f"unknown resolution {resolution!r}, expected one of "
@@ -324,6 +340,21 @@ class ZedCapture:
             self.port = ""
             self.serial = self.serial or os.environ.get(SERIAL_ENV, "").strip() or None
         self.device = device
+        requested_fps = DEFAULT_FPS[resolution] if fps is None else fps
+
+        # Exposure and gain are not V4L2 controls on this camera, so they go
+        # through zed-open-capture -- which opens the device, and so has to be
+        # finished with it before the stream below starts. `zed_controls` has
+        # the ordering and the one assumption it rests on.
+        self.exposure = self.gain = None
+        if exposure is not None or gain is not None:
+            self.exposure, self.gain = zed_controls.apply(
+                device,
+                resolution=resolution,
+                fps=requested_fps,
+                exposure=exposure,
+                gain=gain,
+            )
 
         # Naming the backend matters: left to choose, OpenCV may pick
         # GStreamer, which handles these properties differently or ignores them.
@@ -338,7 +369,7 @@ class ZedCapture:
         self._capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*_FOURCC))
         self._capture.set(cv2.CAP_PROP_FRAME_WIDTH, 2 * width)
         self._capture.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-        self._capture.set(cv2.CAP_PROP_FPS, DEFAULT_FPS[resolution] if fps is None else fps)
+        self._capture.set(cv2.CAP_PROP_FPS, requested_fps)
         self._check_mode(2 * width, height)
 
     def _check_mode(self, width, height):

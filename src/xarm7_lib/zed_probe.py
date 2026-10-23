@@ -30,9 +30,11 @@ from .camera import (
     CameraError,
     ZedCapture,
     devices,
+    query_serial,
     register_serial,
     resolve_serial,
 )
+from .zed_controls import ControlsError, available
 
 
 def _report_devices():
@@ -45,10 +47,12 @@ def _report_devices():
         print(f"    usb serial  {device.usb_serial or '(not published, as expected)'}")
         print(f"    serial      {serial or 'unknown'}")
     if not any(resolve_serial(device) for device in attached):
+        how = "--register auto" if available() else "--register <serial>"
         print(
             f"\n  No serial resolved. Set {SERIAL_ENV}, or run this with\n"
-            f"  --register <serial> to record it in {SERIAL_MAP}."
+            f"  {how} to record it in {SERIAL_MAP}."
         )
+    print(f"\nnative shim: {'available' if available() else 'not built (see native/README.md)'}")
     print()
     return attached
 
@@ -60,23 +64,33 @@ def main(argv=None):
     parser.add_argument(
         "--register",
         metavar="SERIAL",
-        help="record this serial against the attached camera's port, then exit",
+        help='record this serial against the attached camera\'s port, then exit; '
+        '"auto" asks the camera itself, which needs the native shim',
     )
+    parser.add_argument("--exposure", type=int, help="exposure to apply (needs the shim)")
+    parser.add_argument("--gain", type=int, help="gain to apply (needs the shim)")
     parser.add_argument(
         "--out", default="/tmp", help="directory for the two eye images (default /tmp)"
     )
     args = parser.parse_args(argv)
 
     if args.register:
-        device = register_serial(args.register)
-        print(f"recorded serial {args.register} for {device.path} (port {device.port})")
+        serial = query_serial() if args.register == "auto" else args.register
+        if args.register == "auto":
+            print(f"the camera says its serial is {serial}")
+        device = register_serial(serial)
+        print(f"recorded serial {serial} for {device.path} (port {device.port})")
         print(f"written to {SERIAL_MAP}")
         return 0
 
     _report_devices()
 
-    with ZedCapture(args.resolution, serial=args.serial) as camera:
+    with ZedCapture(
+        args.resolution, serial=args.serial, exposure=args.exposure, gain=args.gain
+    ) as camera:
         print(f"opened    {camera.device}")
+        if camera.exposure is not None:
+            print(f"exposure  {camera.exposure} (gain {camera.gain}) as the camera reports it")
         print(f"serial    {camera.serial or 'unknown'}")
         print(f"mode      {camera.resolution}, {camera.size[0]}x{camera.size[1]} per eye")
         print(f"format    {camera.pixel_format} at {camera.fps:g} fps")
@@ -114,6 +128,6 @@ def main(argv=None):
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except (CameraError, CalibrationError) as error:
+    except (CameraError, CalibrationError, ControlsError) as error:
         print(f"error: {error}", file=sys.stderr)
         sys.exit(1)
