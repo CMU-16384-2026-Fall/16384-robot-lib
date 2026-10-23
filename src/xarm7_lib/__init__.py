@@ -10,14 +10,7 @@ script runs against either. The backends are also importable directly as
 
 from .api import RobotInterface
 from .calibration import RESOLUTIONS, CalibrationError, StereoCalibration
-from .camera import (
-    CameraError,
-    ZedCapture,
-    ZedDevice,
-    devices,
-    query_serial,
-    register_serial,
-)
+from .camera import CameraError, ZedCapture, ZedDevice, devices, query_serial
 from .zed_controls import ControlsError, ZedControls
 from .free_drive import (
     FREE_JOINTS,
@@ -66,5 +59,4 @@ __all__ = [
     "devices",
     "free_mask",
     "query_serial",
-    "register_serial",
 ]

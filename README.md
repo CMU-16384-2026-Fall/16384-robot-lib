@@ -13,6 +13,10 @@ conda activate 16384
 conda env update -f environment.yml
 ```
 
+## Camera install
+
+Follow the instructions in `native/` to install zed-open-capture and build the shim.
+
 # Testing
 ```python
 from xarm7_lib import RealXArm7

@@ -1,12 +1,12 @@
-"""Check that a ZED is being captured properly, and record which camera it is.
+"""Check that a ZED is being captured properly.
 
-    python -m xarm7_lib.zed_probe                      # what is attached, and how
-    python -m xarm7_lib.zed_probe --register 19668636  # name the attached camera
+    python -m xarm7_lib.zed_probe                   # what is attached, and how
     python -m xarm7_lib.zed_probe --resolution VGA
+    python -m xarm7_lib.zed_probe --exposure 10     # needs the native shim
 
 The probe exists because the two things that go wrong with this camera are both
 silent. A mode the driver quietly substituted shows up as frames that look out
-of focus, and a camera whose serial nothing knows shows up as a missing
+of focus, and a camera that cannot be asked its serial shows up as a missing
 calibration -- so this prints what was actually negotiated, and writes the two
 eyes out to be looked at at 1:1 rather than scaled into a window.
 
@@ -24,16 +24,7 @@ import sys
 import cv2
 
 from .calibration import CalibrationError
-from .camera import (
-    SERIAL_ENV,
-    SERIAL_MAP,
-    CameraError,
-    ZedCapture,
-    devices,
-    query_serial,
-    register_serial,
-    resolve_serial,
-)
+from .camera import CameraError, ZedCapture, devices, resolve_serial
 from .zed_controls import ControlsError, available
 
 
@@ -47,10 +38,10 @@ def _report_devices():
         print(f"    usb serial  {device.usb_serial or '(not published, as expected)'}")
         print(f"    serial      {serial or 'unknown'}")
     if not any(resolve_serial(device) for device in attached):
-        how = "--register auto" if available() else "--register <serial>"
         print(
-            f"\n  No serial resolved. Set {SERIAL_ENV}, or run this with\n"
-            f"  {how} to record it in {SERIAL_MAP}."
+            "\n  No serial read back. The camera only gives it up through the\n"
+            "  zed-open-capture shim, so either that is not built or something\n"
+            "  else is streaming the camera. --serial skips the question."
         )
     print(f"\nnative shim: {'available' if available() else 'not built (see native/README.md)'}")
     print()
@@ -61,27 +52,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--resolution", default="HD", help="2K, FHD, HD or VGA (default HD)")
     parser.add_argument("--serial", help="which camera to open, if several are attached")
-    parser.add_argument(
-        "--register",
-        metavar="SERIAL",
-        help='record this serial against the attached camera\'s port, then exit; '
-        '"auto" asks the camera itself, which needs the native shim',
-    )
     parser.add_argument("--exposure", type=int, help="exposure to apply (needs the shim)")
     parser.add_argument("--gain", type=int, help="gain to apply (needs the shim)")
     parser.add_argument(
         "--out", default="/tmp", help="directory for the two eye images (default /tmp)"
     )
     args = parser.parse_args(argv)
-
-    if args.register:
-        serial = query_serial() if args.register == "auto" else args.register
-        if args.register == "auto":
-            print(f"the camera says its serial is {serial}")
-        device = register_serial(serial)
-        print(f"recorded serial {serial} for {device.path} (port {device.port})")
-        print(f"written to {SERIAL_MAP}")
-        return 0
 
     _report_devices()
 

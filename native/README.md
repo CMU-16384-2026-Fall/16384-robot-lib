@@ -6,9 +6,10 @@ for the three things OpenCV cannot reach on a ZED: the **serial number**, the
 rather than standard V4L2 controls, so no amount of `cv2.CAP_PROP_*` will get
 at them.
 
-Everything else in `xarm7_lib` works without this. Capture and calibration need
-only OpenCV; without the shim you lose exposure control and have to register
-each camera's serial by hand.
+Capture itself works without this -- that is plain OpenCV. What needs the shim
+is exposure and gain, and the serial number, which is what selects a camera's
+calibration. So without it you get frames but no calibration unless you pass
+`serial=` by hand.
 
 ## Building
 
@@ -39,10 +40,11 @@ without being told. Set `ZED_OC_SHIM` to its path to put it somewhere else.
 With a camera attached and nothing else streaming it:
 
 ```bash
-python -m xarm7_lib.zed_probe --register auto
+python -m xarm7_lib.zed_probe
 ```
 
-which asks the camera its serial number and records it. Then
+The serial it prints is read from the camera itself, which only works with the
+shim built -- that line alone confirms it is linked and working. Then
 
 ```bash
 python -m xarm7_lib.zed_probe --exposure 20

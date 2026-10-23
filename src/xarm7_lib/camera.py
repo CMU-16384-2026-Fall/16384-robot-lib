@@ -22,14 +22,13 @@ always this rather than the optics. So the mode is set in the order the V4L2
 backend wants (pixel format first, then size, then rate), then read back and
 checked, and a mismatch raises instead of being left to show up as blur.
 
-The camera does not say which camera it is. Its serial number is held in a
-camera register that the SDK reads over a vendor-specific UVC request, and it
-is not published in the USB descriptor, so udev has nothing to name the device
-after. With one camera that does not matter; with several identical ones on a
-bench it means the device name cannot tell them apart. Since the serial is what
-selects a calibration, `register_serial` records it against the physical USB
-port instead, once per machine. See `resolve_serial` for the order things are
-tried in.
+The camera will not say which camera it is over USB. Its serial number lives
+in a camera register reached by a vendor-specific request, not in the USB
+descriptor, so udev has nothing to name the device after and several identical
+cameras on a bench look alike. The serial is what selects a calibration, so it
+is read from the camera itself through the zed-open-capture shim -- see
+`resolve_serial`. That means the shim is needed for a camera to find its own
+calibration, though `serial=` still overrides it for a machine without one.
 
 Two further traps are not this module's to fix, but are worth knowing about:
 
@@ -44,8 +43,6 @@ Two further traps are not this module's to fix, but are worth knowing about:
 """
 
 import dataclasses
-import json
-import os
 import pathlib
 import sys
 
@@ -72,17 +69,10 @@ _SYSFS_V4L = pathlib.Path("/sys/class/video4linux")
 _BY_PATH = pathlib.Path("/dev/v4l/by-path")
 _CAPTURE_INDEX = "0"
 
-# Where `register_serial` records which camera is on which port.
-SERIAL_MAP = (
-    pathlib.Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
-    / "xarm7_lib"
-    / "zed_serials.json"
-)
-
-# Checked before that map, so a machine with one camera, or a one-off run with
-# a borrowed one, needs no registration at all. Named to sit alongside the
-# ROBOT_IP the arm already reads.
-SERIAL_ENV = "ZED_SERIAL"
+# Asking a camera its serial means opening it, which only works while nothing
+# is streaming it, so each answer is kept for the life of the process. Without
+# this a second ZedCapture would have to interrupt the first to identify it.
+_SERIAL_CACHE = {}
 
 
 class CameraError(RuntimeError):
@@ -168,75 +158,46 @@ def devices():
     return found
 
 
-def _serial_map():
-    try:
-        mapping = json.loads(SERIAL_MAP.read_text())
-    except OSError:
-        return {}
-    except ValueError as error:
-        raise CameraError(f"{SERIAL_MAP} is not valid JSON: {error}") from error
-    return {str(port): str(serial) for port, serial in mapping.items()}
+def resolve_serial(device, refresh=False):
+    """Which camera is on this node, or None if it could not be asked.
 
+    Prefers the USB descriptor on the off chance a camera publishes one, and
+    otherwise asks the camera through the shim. Answers are cached per port, so
+    a camera is opened once to identify it and later calls are free.
 
-def resolve_serial(device):
-    """Work out which camera is on this node, or None if nothing here knows.
+    Returns None rather than raising when the camera cannot be asked -- the
+    shim is not built, or something is streaming it -- so that discovery still
+    works and only the calibration lookup complains. `query_serial` is the
+    version that reports why.
 
-    Tried in order: the USB descriptor, the `ZED_SERIAL` environment variable,
-    then the port-to-serial map that `register_serial` writes. The environment
-    comes before the map so a one-off run can override a registration without
-    editing anything.
+    Args:
+        device: The `ZedDevice` to identify.
+        refresh: Ask again rather than trusting the cache.
     """
     if device.usb_serial:
         return device.usb_serial
-    from_environment = os.environ.get(SERIAL_ENV, "").strip()
-    if from_environment:
-        return from_environment
-    return _serial_map().get(device.port) or None
+
+    key = device.port or device.node
+    if refresh:
+        _SERIAL_CACHE.pop(key, None)
+    elif key in _SERIAL_CACHE:
+        return _SERIAL_CACHE[key]
+
+    try:
+        serial = zed_controls.read_serial(device)
+    except zed_controls.ControlsError:
+        return None
+    _SERIAL_CACHE[key] = serial
+    return serial
 
 
 def query_serial(device=None):
-    """Ask a camera its own serial number, which needs the zed-open-capture shim.
+    """Ask a camera its own serial number, raising if it cannot be asked.
 
-    The camera does not publish its serial over USB, so this is the only way to
-    get it without being told -- `resolve_serial` covers what works with no
-    native code. Nothing may be streaming the camera at the time.
+    What `resolve_serial` does without the cache and without swallowing the
+    reason it failed. Nothing may be streaming the camera at the time.
     """
     return zed_controls.read_serial(device)
-
-
-def register_serial(serial, device=None):
-    """Record a camera's serial number against the port it is plugged into.
-
-    Needed because the camera will not say -- see the module docstring. Done
-    once per camera per machine, with that camera the only one attached:
-
-        register_serial(19668636)
-
-    after which `ZedCapture()` finds its calibration on its own. Moving the
-    camera to a different port means registering it again, which is the price
-    of the port being the only thing that distinguishes identical cameras. The
-    serial is printed on the label on the camera's back panel.
-
-    Args:
-        serial: The camera's serial number.
-        device: Which attached camera to record it for. Defaults to the only
-            one attached.
-
-    Returns:
-        The `ZedDevice` the serial was recorded against.
-    """
-    device = _sole_device() if device is None else device
-    if not device.port:
-        raise CameraError(
-            f"{device.path} has no link under {_BY_PATH}, so there is no stable "
-            f"key to record a serial against -- set {SERIAL_ENV} or pass "
-            "serial= at the call site instead"
-        )
-    mapping = _serial_map()
-    mapping[device.port] = str(serial)
-    SERIAL_MAP.parent.mkdir(parents=True, exist_ok=True)
-    SERIAL_MAP.write_text(json.dumps(mapping, indent=2, sort_keys=True) + "\n")
-    return device
 
 
 def _sole_device(attached=None):
@@ -286,14 +247,13 @@ def find_device(serial=None):
             or "none"
         )
         raise CameraError(
-            f"no attached ZED resolves to serial {serial} (attached: {listed}). "
-            f"Record it with register_serial({serial}) while that camera is the "
-            "only one plugged in."
+            f"no attached ZED answers to serial {serial} (attached: {listed}). "
+            "A camera reads as unknown when the shim is not built or something "
+            "else is streaming it."
         )
     raise CameraError(
-        f"serial {serial} resolves to {len(matches)} of the attached cameras. "
-        f"If {SERIAL_ENV} is set it applies to all of them, which only makes "
-        f"sense with one attached; otherwise {SERIAL_MAP} needs correcting."
+        f"serial {serial} matched {len(matches)} of the attached cameras, which "
+        "should be impossible -- two cameras cannot share a serial number."
     )
 
 
@@ -335,10 +295,14 @@ class ZedCapture:
             device, self.port = found.path, found.port
             self.serial = self.serial or resolved
         else:
-            # An explicitly named node skips discovery, so there is no port to
-            # look a serial up by; the environment is the only source left.
+            # An explicitly named node skips discovery, so ask the camera
+            # directly -- while it is still free, before the stream below.
             self.port = ""
-            self.serial = self.serial or os.environ.get(SERIAL_ENV, "").strip() or None
+            if self.serial is None:
+                try:
+                    self.serial = zed_controls.read_serial(device)
+                except zed_controls.ControlsError:
+                    self.serial = None
         self.device = device
         requested_fps = DEFAULT_FPS[resolution] if fps is None else fps
 
@@ -402,12 +366,13 @@ class ZedCapture:
         if self._calibration is None:
             if self.serial is None:
                 raise CameraError(
-                    "this camera's serial number is not known, so its "
-                    "calibration cannot be looked up. The camera does not "
-                    "publish it over USB, so tell this machine once with "
-                    f"register_serial(<serial>), or set {SERIAL_ENV}, or pass "
-                    "serial= here. It is printed on the label on the camera's "
-                    "back panel."
+                    "this camera's serial number could not be read, so its "
+                    "calibration cannot be looked up. The camera only gives it "
+                    "up through the zed-open-capture shim, so either that is "
+                    "not built (see native/README.md) or something was "
+                    "streaming the camera when it was asked. Passing serial= "
+                    "skips the question -- it is printed on the label on the "
+                    "camera's back panel."
                 )
             self._calibration = StereoCalibration.from_serial(self.serial, self.resolution)
         return self._calibration
