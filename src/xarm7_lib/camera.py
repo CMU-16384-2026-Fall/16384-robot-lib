@@ -138,8 +138,8 @@ def devices():
     """Every ZED capture node on this machine, as a list of `ZedDevice`."""
     if not _SYSFS_V4L.is_dir():
         raise CameraError(
-            f"{_SYSFS_V4L} does not exist, so cameras cannot be enumerated "
-            "here. That is expected off Linux -- pass device= instead."
+            f"{_SYSFS_V4L} does not exist, so the kernel has registered no "
+            "video device. Tryg unpluggin and replugging the camera."
         )
     found = []
     for entry in sorted(_SYSFS_V4L.iterdir(), key=lambda path: path.name):

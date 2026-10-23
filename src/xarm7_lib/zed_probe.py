@@ -28,6 +28,11 @@ from .camera import CameraError, ZedCapture, devices, resolve_serial
 from .zed_controls import ControlsError, available
 
 
+def _device_argument(value):
+    """A `/dev/video*` path, or a bare index like the one cv2 would take."""
+    return int(value) if value.isdigit() else value
+
+
 def _report_devices():
     attached = devices()
     print(f"{len(attached)} ZED capture node(s) attached:")
@@ -52,6 +57,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--resolution", default="HD", help="2K, FHD, HD or VGA (default HD)")
     parser.add_argument("--serial", help="which camera to open, if several are attached")
+    parser.add_argument(
+        "--device",
+        type=_device_argument,
+        help="open this node (a /dev/video* path or an index) instead of "
+        "searching for one, for when enumeration is not available",
+    )
     parser.add_argument("--exposure", type=int, help="exposure to apply (needs the shim)")
     parser.add_argument("--gain", type=int, help="gain to apply (needs the shim)")
     parser.add_argument(
@@ -59,10 +70,19 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
 
-    _report_devices()
+    if args.device is None:
+        _report_devices()
+    else:
+        # Enumeration is what fails on a machine with no v4l2, so naming the
+        # node has to skip it rather than report it first.
+        print(f"opening {args.device} as given, without searching\n")
 
     with ZedCapture(
-        args.resolution, serial=args.serial, exposure=args.exposure, gain=args.gain
+        args.resolution,
+        device=args.device,
+        serial=args.serial,
+        exposure=args.exposure,
+        gain=args.gain,
     ) as camera:
         print(f"opened    {camera.device}")
         if camera.exposure is not None:
