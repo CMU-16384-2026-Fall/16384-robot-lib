@@ -24,7 +24,7 @@ import sys
 import cv2
 
 from .calibration import CalibrationError
-from .camera import CameraError, ZedCapture, devices, resolve_serial
+from .camera import CameraError, ZedOpenCapture, devices, resolve_serial
 from .zed_controls import ControlsError, available
 
 
@@ -77,7 +77,7 @@ def main(argv=None):
         # node has to skip it rather than report it first.
         print(f"opening {args.device} as given, without searching\n")
 
-    with ZedCapture(
+    with ZedOpenCapture(
         args.resolution,
         device=args.device,
         serial=args.serial,

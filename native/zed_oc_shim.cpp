@@ -1,12 +1,9 @@
 // A C entry point onto zed-open-capture: the camera's serial number, its
 // exposure and gain, and its frames.
 //
-// The first three go through vendor-specific USB requests rather than standard
-// V4L2 controls, which is why OpenCV cannot reach them. Frames are here for a
-// different reason: OpenCV's V4L2 path was handing back torn frames from this
-// camera where ffmpeg reading the same device was clean, so capture moved to
-// the implementation Stereolabs wrote for it. One handle streams and controls
-// at once, which also means exposure can change without stopping the stream.
+// Serial, exposure and gain go through vendor-specific USB requests rather
+// than standard V4L2 controls. One handle streams and controls at once, so
+// exposure can change without stopping the stream.
 
 #include <videocapture.hpp>
 

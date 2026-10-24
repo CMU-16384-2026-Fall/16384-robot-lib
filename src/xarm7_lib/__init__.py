@@ -5,7 +5,7 @@ environment variable is set and the MuJoCo simulation otherwise, so the same
 script runs against either. The backends are also importable directly as
 `RealXArm7` and `SimulatedXArm7`.
 
-`ZedCapture` and `StereoCalibration` cover the ZED stereo camera, imported on
+`ZedOpenCapture` and `StereoCalibration` cover the ZED stereo camera, imported on
 first use so that the simulator needs neither OpenCV nor the native shim.
 """
 
@@ -40,7 +40,6 @@ _CAMERA_EXPORTS = {
     "RESOLUTIONS": "calibration",
     "StereoCalibration": "calibration",
     "CameraError": "camera",
-    "ZedCapture": "camera",
     "ZedOpenCapture": "camera",
     "ZedDevice": "camera",
     "devices": "camera",
@@ -90,7 +89,6 @@ __all__ = [
     "Trajectory",
     "Violation",
     "XArmError",
-    "ZedCapture",
     "ZedControls",
     "ZedDevice",
     "ZedOpenCapture",

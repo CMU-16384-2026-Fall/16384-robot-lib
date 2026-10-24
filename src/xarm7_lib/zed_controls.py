@@ -1,21 +1,13 @@
-"""Exposure, gain and the serial number, through zed-open-capture.
+"""Frames, exposure, gain and the serial number, through zed-open-capture.
 
-Three things on a ZED are reachable only through vendor-specific USB requests:
-the exposure, the gain, and the serial number. OpenCV cannot make those
-requests -- the camera does not publish exposure and gain as standard V4L2
-controls, and does not publish the serial in its USB descriptor at all -- so
-`camera.py` can do everything except these. `zed-open-capture` can make them,
-and this is the ctypes binding onto a small C entry point over it.
+The exposure, the gain and the serial number are reachable only through
+vendor-specific USB requests: the camera does not publish exposure and gain as
+standard V4L2 controls, and does not publish the serial in its USB descriptor
+at all. Frames come from here too, so one handle streams and controls at once
+and exposure takes effect without stopping the stream.
 
-Frames come from here too, and that was not the original plan. OpenCV's V4L2
-path returned torn frames from this camera -- bands of misaligned YUYV -- where
-ffmpeg reading the same device was clean, and once the kernel was told to drop
-the torn ones instead of passing them through, half the frame rate went with
-them. So capture moved to the implementation Stereolabs wrote for this camera.
-
-One handle streams and controls at once, which is simpler than what came
-before: exposure now takes effect without stopping the stream, and the question
-of whether a setting survives a close and reopen does not arise.
+This is the ctypes binding onto a small C entry point over the library; see
+`native/`.
 
 The exposure a value means depends on the frame rate, because the library maps
 it onto raw sensor registers whose range shrinks as the rate rises. So a
@@ -23,8 +15,8 @@ control session has to be opened at the same resolution and rate the camera
 will then stream at, and `resolution` and `fps` are required here rather than
 defaulted for that reason.
 
-Nothing else in the library needs this module. Without the shim built, capture
-and calibration work as before and only these three things are missing.
+Without the shim built there is no capture and no calibration, since the
+serial number is what selects one.
 """
 
 import ctypes
@@ -149,13 +141,15 @@ def _device_id(device):
 
 
 class ZedControls:
-    """A control session on one camera, for as long as nothing else streams it.
+    """A session on one camera: its frames, its exposure, its gain, its serial.
 
-    Opens the camera, so it must be closed before `ZedCapture` opens the same
-    device -- use it as a context manager and the ordering looks after itself:
+    Holds the camera open, so only one of these can exist per camera at a
+    time. `camera.ZedOpenCapture` wraps one and is what most code should use;
+    this is the layer underneath.
 
-        with ZedControls(device, "HD", 60) as controls:
-            controls.set_exposure(20)
+        with ZedControls(device, "HD", 60) as session:
+            session.set_exposure(20)
+            frame, frame_id, timestamp = session.frame()
 
     Args:
         device: A `ZedDevice`, a "videoN" name, or a node number. The library
@@ -180,9 +174,9 @@ class ZedControls:
         if not self._handle:
             raise ControlsError(
                 f"zed-open-capture could not open {device if device is not None else 'a camera'} "
-                f"at {resolution}/{fps}. The usual cause is that something else "
-                "has it open -- a ZedCapture in this process, or another "
-                "program streaming it."
+                f"at {resolution}/{fps}. The usual cause is that something "
+                "else has it open -- another session in this process, or "
+                "another program streaming it."
             )
 
     def _check(self):
@@ -324,18 +318,3 @@ def read_serial(device=None):
     """
     with ZedControls(device, resolution="VGA", fps=100) as controls:
         return controls.serial
-
-
-def apply(device=None, resolution="HD", fps=60, exposure=None, gain=None):
-    """Set exposure and/or gain on a camera, then let go of it.
-
-    What `ZedCapture` calls before opening its stream. Returns what the camera
-    reports afterwards as `(exposure, gain)`, which is not always what was
-    asked for.
-    """
-    with ZedControls(device, resolution=resolution, fps=fps) as controls:
-        if exposure is not None:
-            controls.set_exposure(exposure)
-        if gain is not None:
-            controls.set_gain(gain)
-        return controls.exposure(), controls.gain()
