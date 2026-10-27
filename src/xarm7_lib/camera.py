@@ -328,8 +328,12 @@ class ZedOpenCapture:
         self.gain = self._session.gain()
         return self.gain
 
-    def control(self, name):
-        """One camera colour control by name; see `zed_controls.CONTROLS`."""
+    def control(self, name=None):
+        """One colour control by name, or all of them as a dict for no name.
+
+        See `zed_controls.CONTROLS` for the names and their ranges, and
+        `profile` for the wider dict that also carries exposure and gain.
+        """
         return self._session.control(name)
 
     def set_control(self, name, value):

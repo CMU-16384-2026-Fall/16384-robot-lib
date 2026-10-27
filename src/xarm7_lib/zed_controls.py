@@ -338,9 +338,16 @@ class ZedControls:
             return self.set_control("auto_white_balance", 1)
         return self.set_control("white_balance", value)
 
-    def control(self, name):
-        """One ISP control by name; see `CONTROLS` for what there is."""
+    def control(self, name=None):
+        """One control by name, or all of them as a dict when given nothing.
+
+        The dict covers exactly what `set_control` accepts, which is
+        `CONTROLS`; `profile` is the wider one that also carries exposure and
+        gain.
+        """
         self._check()
+        if name is None:
+            return {key: self.control(key) for key in CONTROLS}
         code = _control_code(name)
         value = self._library.zed_oc_get_control(self._handle, code)
         if value == -2:
@@ -384,7 +391,7 @@ class ZedControls:
         """
         self._check()
         settings = {"exposure": self.exposure(), "gain": self.gain()}
-        settings.update({name: self.control(name) for name in CONTROLS})
+        settings.update(self.control())
         return settings
 
     def apply(self, settings, strict=True):
