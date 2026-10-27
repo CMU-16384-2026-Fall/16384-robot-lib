@@ -91,6 +91,23 @@ def main(argv=None):
         print(f"mode      {camera.resolution}, {camera.size[0]}x{camera.size[1]} per eye")
         print(f"format    {camera.pixel_format} at {camera.fps:g} fps")
 
+        # Worth printing even though nothing here changes it: automatic white
+        # balance is the reason two days' footage can differ with everything
+        # else held the same, and it is invisible in the images themselves.
+        try:
+            settings = camera.profile()
+        except ControlsError as error:
+            print(f"colour    unavailable: {error}")
+        else:
+            print("colour    " + "  ".join(
+                f"{name} {settings[name]}" for name in sorted(settings)
+            ))
+            auto = [name for name in ("aec_agc", "auto_white_balance")
+                    if settings.get(name)]
+            if auto:
+                print(f"          {' and '.join(auto)} ON -- the colour will "
+                      "drift between runs; pin it with a saved profile")
+
         left, right = camera.read()
         out = pathlib.Path(args.out)
         out.mkdir(parents=True, exist_ok=True)

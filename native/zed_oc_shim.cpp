@@ -1,9 +1,17 @@
 // A C entry point onto zed-open-capture: the camera's serial number, its
-// exposure and gain, and its frames.
+// frames, and the controls that decide what a frame looks like.
 //
 // Serial, exposure and gain go through vendor-specific USB requests rather
 // than standard V4L2 controls. One handle streams and controls at once, so
 // exposure can change without stopping the stream.
+//
+// Exposure and gain keep their own entry points because they are per-sensor
+// and so need an argument the table has no room for. Everything else is one
+// setting for the whole camera -- white balance, automatic white balance,
+// automatic exposure and gain, brightness, contrast, hue, saturation,
+// sharpness, gamma -- and goes through a single numbered get/set/reset trio
+// rather than thirty near-identical functions. Adding a control is then a
+// line in this table and a line in the Python one, with no new symbol.
 
 #include <videocapture.hpp>
 
@@ -44,6 +52,20 @@ FPS fps_of(int rate) {
         default: return FPS::FPS_100;
     }
 }
+
+// Keep in step with CONTROLS in xarm7_lib/zed_controls.py; the Python side
+// passes these numbers.
+enum Control {
+    CONTROL_BRIGHTNESS = 0,
+    CONTROL_CONTRAST = 1,
+    CONTROL_HUE = 2,
+    CONTROL_SATURATION = 3,
+    CONTROL_SHARPNESS = 4,
+    CONTROL_GAMMA = 5,
+    CONTROL_WHITE_BALANCE = 6,
+    CONTROL_AUTO_WHITE_BALANCE = 7,
+    CONTROL_AEC_AGC = 8,
+};
 
 }  // namespace
 
@@ -131,26 +153,65 @@ int zed_oc_set_gain(void *handle, int side, int value) {
     return 0;
 }
 
-int zed_oc_get_auto(void *handle) {
+// The whole-camera ISP controls, by the numbers in `Control`. -1 is a dead
+// handle and -2 a control this shim does not know, which is how the Python
+// side finds out it is talking to a shim built before the control existed.
+int zed_oc_get_control(void *handle, int control) {
     if (handle == nullptr) return -1;
-    return as_capture(handle)->getAECAGC() ? 1 : 0;
+    VideoCapture *capture = as_capture(handle);
+    switch (control) {
+        case CONTROL_BRIGHTNESS: return capture->getBrightness();
+        case CONTROL_CONTRAST: return capture->getContrast();
+        case CONTROL_HUE: return capture->getHue();
+        case CONTROL_SATURATION: return capture->getSaturation();
+        case CONTROL_SHARPNESS: return capture->getSharpness();
+        case CONTROL_GAMMA: return capture->getGamma();
+        case CONTROL_WHITE_BALANCE: return capture->getWhiteBalance();
+        case CONTROL_AUTO_WHITE_BALANCE: return capture->getAutoWhiteBalance() ? 1 : 0;
+        case CONTROL_AEC_AGC: return capture->getAECAGC() ? 1 : 0;
+        default: return -2;
+    }
 }
 
-int zed_oc_set_auto(void *handle, int active) {
+int zed_oc_set_control(void *handle, int control, int value) {
     if (handle == nullptr) return -1;
-    return as_capture(handle)->setAECAGC(active != 0);
+    VideoCapture *capture = as_capture(handle);
+    switch (control) {
+        case CONTROL_BRIGHTNESS: capture->setBrightness(value); return 0;
+        case CONTROL_CONTRAST: capture->setContrast(value); return 0;
+        case CONTROL_HUE: capture->setHue(value); return 0;
+        case CONTROL_SATURATION: capture->setSaturation(value); return 0;
+        case CONTROL_SHARPNESS: capture->setSharpness(value); return 0;
+        case CONTROL_GAMMA: capture->setGamma(value); return 0;
+        case CONTROL_WHITE_BALANCE: capture->setWhiteBalance(value); return 0;
+        case CONTROL_AUTO_WHITE_BALANCE:
+            capture->setAutoWhiteBalance(value != 0);
+            return 0;
+        case CONTROL_AEC_AGC: capture->setAECAGC(value != 0); return 0;
+        default: return -2;
+    }
 }
 
-int zed_oc_set_auto_white_balance(void *handle, int active) {
+// Back to the library's own default. White balance has no reset of its own in
+// the library; handing it back to automatic is what undoing a fixed one
+// means, so both white balance entries do that.
+int zed_oc_reset_control(void *handle, int control) {
     if (handle == nullptr) return -1;
-    as_capture(handle)->setAutoWhiteBalance(active != 0);
-    return 0;
-}
-
-int zed_oc_set_white_balance(void *handle, int value) {
-    if (handle == nullptr) return -1;
-    as_capture(handle)->setWhiteBalance(value);
-    return 0;
+    VideoCapture *capture = as_capture(handle);
+    switch (control) {
+        case CONTROL_BRIGHTNESS: capture->resetBrightness(); return 0;
+        case CONTROL_CONTRAST: capture->resetContrast(); return 0;
+        case CONTROL_HUE: capture->resetHue(); return 0;
+        case CONTROL_SATURATION: capture->resetSaturation(); return 0;
+        case CONTROL_SHARPNESS: capture->resetSharpness(); return 0;
+        case CONTROL_GAMMA: capture->resetGamma(); return 0;
+        case CONTROL_WHITE_BALANCE:
+        case CONTROL_AUTO_WHITE_BALANCE:
+            capture->resetAutoWhiteBalance();
+            return 0;
+        case CONTROL_AEC_AGC: capture->resetAECAGC(); return 0;
+        default: return -2;
+    }
 }
 
 }  // extern "C"

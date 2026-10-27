@@ -1,4 +1,4 @@
-"""Frames, exposure, gain and the serial number, through zed-open-capture.
+"""Frames, exposure, gain, colour and the serial number, through zed-open-capture.
 
 The exposure, the gain and the serial number are reachable only through
 vendor-specific USB requests: the camera does not publish exposure and gain as
@@ -14,6 +14,14 @@ it onto raw sensor registers whose range shrinks as the rate rises. So a
 control session has to be opened at the same resolution and rate the camera
 will then stream at, and `resolution` and `fps` are required here rather than
 defaulted for that reason.
+
+Colour is the other half of this. The camera's ISP runs automatic white
+balance by default, so the same scene comes out a different colour on
+different days -- and the two eyes do not track each other exactly while it
+is on, which puts a bias between them that no amount of care downstream can
+undo. `CONTROLS` covers the settings that decide this, `profile` reads them
+all back, and `apply` puts a saved one on again, so a session can be
+reproduced rather than remembered.
 
 Without the shim built there is no capture and no calibration, since the
 serial number is what selects one.
@@ -33,6 +41,37 @@ _RESOLUTION_CODE = {"2K": 0, "FHD": 1, "HD": 2, "VGA": 3}
 # Matching its CAM_SENS_POS.
 LEFT = 0
 RIGHT = 1
+
+# The whole-camera ISP controls, as `name: (code, low, high)`. The codes are
+# the shim's `Control` enum and have to stay in step with it; the ranges are
+# the ones zed-open-capture documents on its setters, and the camera clamps to
+# them anyway -- they are here to fail loudly on an obvious mistake rather
+# than to silently accept it.
+#
+# The last two are flags rather than levels, but they are read and written
+# exactly like the rest, so they live here too: `auto_white_balance` hands
+# colour back to the camera and `aec_agc` hands it exposure and gain, which
+# between them are what make one day's footage differ from another's.
+CONTROLS = {
+    "brightness": (0, 0, 8),
+    "contrast": (1, 0, 8),
+    "hue": (2, 0, 11),
+    "saturation": (3, 0, 8),
+    "sharpness": (4, 0, 8),
+    "gamma": (5, 1, 9),
+    "white_balance": (6, 2800, 6500),
+    "auto_white_balance": (7, 0, 1),
+    "aec_agc": (8, 0, 1),
+}
+
+# The two that hand a setting back to the camera. They go on last in `apply`,
+# because writing a value switches the matching one off as a side effect.
+AUTO_CONTROLS = ("auto_white_balance", "aec_agc")
+
+# Everything `profile` records. Exposure and gain are not in CONTROLS because
+# they are per-sensor, but they belong in a profile: a fixed colour with a
+# drifting exposure is still not reproducible.
+PROFILE_KEYS = ("exposure", "gain") + tuple(CONTROLS)
 
 # Long enough that a dropped frame does not look like a dead camera, short
 # enough that a dead camera does not look like a slow one.
@@ -72,14 +111,13 @@ def _signatures(library):
     library.zed_oc_open.restype = handle
     library.zed_oc_close.argtypes = [handle]
     library.zed_oc_close.restype = None
-    for name in ("zed_oc_serial", "zed_oc_get_auto"):
-        getattr(library, name).argtypes = [handle]
-        getattr(library, name).restype = ctypes.c_int
-    for name in ("zed_oc_get_exposure", "zed_oc_get_gain", "zed_oc_set_auto",
-                 "zed_oc_set_auto_white_balance", "zed_oc_set_white_balance"):
+    library.zed_oc_serial.argtypes = [handle]
+    library.zed_oc_serial.restype = ctypes.c_int
+    for name in ("zed_oc_get_exposure", "zed_oc_get_gain",
+                 "zed_oc_get_control", "zed_oc_reset_control"):
         getattr(library, name).argtypes = [handle, ctypes.c_int]
         getattr(library, name).restype = ctypes.c_int
-    for name in ("zed_oc_set_exposure", "zed_oc_set_gain"):
+    for name in ("zed_oc_set_exposure", "zed_oc_set_gain", "zed_oc_set_control"):
         getattr(library, name).argtypes = [handle, ctypes.c_int, ctypes.c_int]
         getattr(library, name).restype = ctypes.c_int
 
@@ -125,6 +163,19 @@ def available():
     except ControlsError:
         return False
     return True
+
+
+def _control_range(name):
+    try:
+        return CONTROLS[name]
+    except KeyError:
+        raise ControlsError(
+            f"unknown control {name!r}, expected one of {', '.join(CONTROLS)}"
+        ) from None
+
+
+def _control_code(name):
+    return _control_range(name)[0]
 
 
 def _device_id(device):
@@ -276,24 +327,98 @@ class ZedControls:
         for sensor in (LEFT, RIGHT) if side is None else (side,):
             self._library.zed_oc_set_gain(self._handle, sensor, int(value))
 
-    @property
-    def auto_exposure(self):
-        """Whether the camera is running automatic exposure and gain."""
-        self._check()
-        return bool(self._library.zed_oc_get_auto(self._handle))
-
-    @auto_exposure.setter
-    def auto_exposure(self, active):
-        self._check()
-        self._library.zed_oc_set_auto(self._handle, 1 if active else 0)
-
     def set_white_balance(self, value=None):
-        """Set white balance, or hand it back to the camera when given None."""
-        self._check()
+        """Fix white balance in kelvin, or hand it back to the camera for None.
+
+        A convenience over the table for the one pairing that is always
+        wanted together: a value only means anything once the camera has
+        stopped choosing its own.
+        """
         if value is None:
-            self._library.zed_oc_set_auto_white_balance(self._handle, 1)
-        else:
-            self._library.zed_oc_set_white_balance(self._handle, int(value))
+            return self.set_control("auto_white_balance", 1)
+        return self.set_control("white_balance", value)
+
+    def control(self, name):
+        """One ISP control by name; see `CONTROLS` for what there is."""
+        self._check()
+        code = _control_code(name)
+        value = self._library.zed_oc_get_control(self._handle, code)
+        if value == -2:
+            raise ControlsError(f"the shim does not know the control {name!r}")
+        return value
+
+    def set_control(self, name, value):
+        """Set one ISP control by name, and return what the camera then reports.
+
+        The value comes back read rather than assumed, because the camera
+        clamps and quantises -- white balance in particular moves in steps of
+        a hundred kelvin or so, and a profile written from these readings is
+        one that will reapply exactly.
+        """
+        self._check()
+        code, low, high = _control_range(name)
+        value = int(value)
+        if not low <= value <= high:
+            raise ControlsError(
+                f"{name} must be between {low} and {high}, not {value}"
+            )
+        if self._library.zed_oc_set_control(self._handle, code, value) == -2:
+            raise ControlsError(f"the shim does not know the control {name!r}")
+        return self.control(name)
+
+    def reset_control(self, name):
+        """Put one ISP control back to the library's default."""
+        self._check()
+        code = _control_code(name)
+        if self._library.zed_oc_reset_control(self._handle, code) == -2:
+            raise ControlsError(f"the shim does not know the control {name!r}")
+        return self.control(name)
+
+    def profile(self):
+        """Everything that decides what a frame looks like, as a plain dict.
+
+        Write it out at the end of a session and `apply` it at the start of
+        the next one and the two are comparable. Without that the camera
+        starts on automatic white balance and the colour depends on whatever
+        it happened to settle on, which is not a property of the scene.
+        """
+        self._check()
+        settings = {"exposure": self.exposure(), "gain": self.gain()}
+        settings.update({name: self.control(name) for name in CONTROLS})
+        return settings
+
+    def apply(self, settings, strict=True):
+        """Put a profile back on, and return what the camera actually took.
+
+        The manual values go on first and the two automatic modes last, which
+        is the only order that round-trips. Writing an exposure or a white
+        balance switches the matching automatic mode off as a side effect --
+        that is the camera's behaviour, not this wrapper's -- so setting the
+        modes first would leave them off whatever the profile asked for, and
+        a profile saved with automatic white balance on would come back with
+        it off. Doing it this way, a profile that wants automatic gets it, and
+        one that wants fixed values has already switched automatic off by
+        setting them, so the last pass only confirms what is already true.
+        """
+        self._check()
+        unknown = set(settings) - set(PROFILE_KEYS)
+        if unknown and strict:
+            raise ControlsError(
+                f"not camera settings: {', '.join(sorted(unknown))}. "
+                f"Known ones are {', '.join(PROFILE_KEYS)}"
+            )
+
+        if "exposure" in settings:
+            self.set_exposure(settings["exposure"])
+        if "gain" in settings:
+            self.set_gain(settings["gain"])
+        for name in CONTROLS:
+            if name not in AUTO_CONTROLS and name in settings:
+                self.set_control(name, settings[name])
+        for name in AUTO_CONTROLS:
+            if name in settings:
+                self.set_control(name, settings[name])
+        return self.profile()
 
     def close(self):
         """Release the camera, which has to happen before anything streams it."""

@@ -265,10 +265,15 @@ class ZedOpenCapture:
         fps: Frame rate. Defaults to the mode's maximum.
         exposure: Applied once the stream is up, and changeable after.
         gain: The same.
+        controls: Camera settings to apply once it is open, as a dict -- see
+            `zed_controls.PROFILE_KEYS`. Worth passing: the camera starts on
+            automatic white balance, so without it the colour of a frame
+            depends on what the ISP settled on that day, and the two eyes do
+            not settle identically. `profile()` writes one of these out.
     """
 
     def __init__(self, resolution="HD", device=None, serial=None, fps=None,
-                 exposure=None, gain=None):
+                 exposure=None, gain=None, controls=None):
         if resolution not in RESOLUTIONS:
             raise CameraError(
                 f"unknown resolution {resolution!r}, expected one of "
@@ -297,6 +302,10 @@ class ZedOpenCapture:
             self._session.set_exposure(exposure)
         if gain is not None:
             self._session.set_gain(gain)
+        # After exposure and gain, so a profile holding its own values of
+        # them wins over the arguments rather than the other way round.
+        if controls:
+            self._session.apply(controls)
         self.exposure = self._session.exposure()
         self.gain = self._session.gain()
 
@@ -318,6 +327,29 @@ class ZedOpenCapture:
         self._session.set_gain(value)
         self.gain = self._session.gain()
         return self.gain
+
+    def control(self, name):
+        """One camera colour control by name; see `zed_controls.CONTROLS`."""
+        return self._session.control(name)
+
+    def set_control(self, name, value):
+        """Set one, with the stream still running, and read back what took."""
+        return self._session.set_control(name, value)
+
+    def profile(self):
+        """Every setting that decides what a frame looks like, as a dict.
+
+        Save it and hand it back as `controls=` next time to get the same
+        colours; see `zed_controls.ZedControls.profile`.
+        """
+        return self._session.profile()
+
+    def apply_profile(self, settings):
+        """Put a saved profile on, and return what the camera actually took."""
+        taken = self._session.apply(settings)
+        self.exposure = self._session.exposure()
+        self.gain = self._session.gain()
+        return taken
 
     def read_raw(self):
         """One frame as it arrives: both eyes side by side, converted to BGR."""
