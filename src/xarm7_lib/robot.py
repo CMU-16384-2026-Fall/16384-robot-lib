@@ -2,6 +2,7 @@ import os
 
 from .api import RobotInterface
 from .free_drive import FREE_JOINTS
+from .gripper import GRIPPER_CLOSED
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN
 from .xarm7_mujoco import SimulatedXArm7
 from .xarm7_real import RealXArm7
@@ -9,14 +10,17 @@ from .xarm7_real import RealXArm7
 class Robot(RobotInterface):
     """The arm, real when ROBOT_IP is set and simulated otherwise."""
     def __init__(self, sim=False, safety_box=DEFAULT_BOX,
-                 safety_margin=DEFAULT_MARGIN, guard=True, q0=None):
+                 safety_margin=DEFAULT_MARGIN, guard=True, q0=None,
+                 gripper=True):
         super().__init__()
         safety = dict(safety_box=safety_box, safety_margin=safety_margin, guard=guard)
         ip = os.environ.get('ROBOT_IP', '').strip()
         if ip and not sim:
-            self.robot = RealXArm7(ip, **safety)
+            self.robot = RealXArm7(ip, gripper=gripper, **safety)
         else:
-            self.robot = SimulatedXArm7(visualize=True, q0=q0, **safety)
+            self.robot = SimulatedXArm7(
+                visualize=True, q0=q0, gripper=gripper, **safety
+            )
 
     @property
     def joint_values(self):
@@ -42,6 +46,13 @@ class Robot(RobotInterface):
 
     def servo_joints(self, joints, velocities=None):
         return self.robot.servo_joints(joints, velocities=velocities)
+
+    @property
+    def gripper_opening(self):
+        return self.robot.gripper_opening
+
+    def grip(self, opening=GRIPPER_CLOSED, speed=None, wait=True, timeout=None):
+        return self.robot.grip(opening, speed=speed, wait=wait, timeout=timeout)
 
     def stop(self, wait=True, timeout=None):
         return self.robot.stop(wait=wait, timeout=timeout)
@@ -87,6 +98,9 @@ if __name__ == '__main__':
     # loop below is interrupted.
     with Robot() as robot:
         robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0], wait=True)
+
+        robot.grip(1.0)  # jaws open
+        robot.grip(0.0)  # and shut again
 
         t = 0
         try:

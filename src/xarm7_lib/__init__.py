@@ -4,6 +4,9 @@
 environment variable is set and the MuJoCo simulation otherwise, so the same
 script runs against either. The backends are also importable directly as
 `RealXArm7` and `SimulatedXArm7`.
+
+Both carry the xArm Gripper on the flange, driven with `grip` — see
+`gripper.py`, including what the safety guard does not know about it.
 """
 
 from .api import RobotInterface
@@ -13,6 +16,11 @@ from .free_drive import (
     LOCKED_TOLERANCE,
     Trajectory,
     free_mask,
+)
+from .gripper import (
+    GRIPPER_CLOSED,
+    GRIPPER_OPEN,
+    GRIPPER_STROKE,
 )
 from .robot import Robot
 from .safety import (
@@ -31,6 +39,9 @@ __all__ = [
     "DEFAULT_BOX",
     "DEFAULT_MARGIN",
     "FREE_JOINTS",
+    "GRIPPER_CLOSED",
+    "GRIPPER_OPEN",
+    "GRIPPER_STROKE",
     "HOME_POSE",
     "LOCKED_TOLERANCE",
     "RealXArm7",

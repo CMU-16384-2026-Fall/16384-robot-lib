@@ -53,6 +53,12 @@ refused with `SafetyError` rather than started and stopped part-way. The
 simulator, by contrast, runs such a command and halts at the boundary — so
 anything it merely warns about is something this class will reject outright.
 
+The gripper on the flange is a separate device again: the controller drives it
+over its own modbus link, outside the motion modes entirely, so `grip` doesn't
+touch the arm's mode, doesn't supersede the running command, and doesn't wait
+for it. It is set up lazily — mode and enable go out with the first grip — so
+an arm with nothing bolted on still connects.
+
 The controller has its own self-collision detection, which is switched on here
 as a backstop. It only covers planned moves in mode 0 though: the setpoints in
 mode 1 and the velocities in mode 4 aren't planned, so for those the check on
@@ -85,6 +91,12 @@ from .free_drive import (
     free_mask,
     hands_off_prompt,
 )
+from .gripper import (
+    GRIPPER_CLOSED,
+    RAW_TRAVEL,
+    raw_position,
+    raw_speed,
+)
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyError, SafetyGuard
 
 ARM_JOINTS = tuple(f"joint{i}" for i in range(1, 8))
@@ -115,9 +127,12 @@ _STATE_PAUSED = 3  # ... and has been paused part-way through it
 
 _WAIT_FINISH_TIMEOUT = 100  # APIState.WAIT_FINISH_TIMEOUT
 _STOPPED = -9  # APIState.EMERGENCY_STOP: the move was cancelled mid-flight
+_GRIPPER_FAULT = 102  # APIState.END_EFFECTOR_HAS_FAULT
+_GRIPPER_NOT_ENABLED = 103  # APIState.END_EFFECTOR_NOT_ENABLED
 _DURATION_FIRMWARE = (1, 8, 0)  # vc_set_joint_velocity honours `duration` from here
 
 _TOOL_NONE = 0  # set_collision_tool_model: bare flange
+_TOOL_XARM_GRIPPER = 1  # ... and with the xArm Gripper on it
 # How far ahead an open-ended velocity command is checked. It runs until it is
 # replaced, so there is no natural end to check up to; this is far enough that
 # anything closer is the caller aiming at a wall.
@@ -169,6 +184,11 @@ class RealXArm7(RobotInterface):
     guard : refuse commands that would self-collide or leave the box. With this
         off you are left with the controller's own detection, which does not
         cover servo or velocity commands.
+    gripper : there is an xArm Gripper on the flange. On means `grip` works and
+        the controller's own collision detection is told to include the
+        gripper; off means `grip` raises and the flange is modelled bare. The
+        gripper itself is only talked to when it is first used, so this costs
+        nothing on an arm that never grips.
     controller_boundary : also hand the box to the controller as its reduced-mode
         TCP boundary. Off by default: it constrains only the tool where the box
         here constrains the whole arm, and switching reduced mode on also caps
@@ -176,7 +196,10 @@ class RealXArm7(RobotInterface):
         box.
 
     The arm is left energized and holding position on `close()`; dropping the
-    motors would let it fall.
+    motors would let it fall, and the gripper is left holding whatever it has
+    for the same reason.
+
+    The safety guard knows nothing about the gripper — see `gripper.py`.
     """
 
     def __init__(
@@ -191,6 +214,7 @@ class RealXArm7(RobotInterface):
         safety_box=DEFAULT_BOX,
         safety_margin=DEFAULT_MARGIN,
         guard=True,
+        gripper=True,
         controller_boundary=False,
     ):
         super().__init__()
@@ -219,6 +243,9 @@ class RealXArm7(RobotInterface):
         self._timer = None
         self._mode = None
         self._acc = None if acceleration is None else float(acceleration)
+        self._has_gripper = bool(gripper)
+        self._gripper_ready = False  # set up on first use, not on connect
+        self._auto_clear_errors = bool(clear_errors)
 
         self._wait_for_report(timeout)
 
@@ -449,6 +476,78 @@ class RealXArm7(RobotInterface):
             code = self.arm.set_servo_angle_j(target.tolist(), is_radian=True)
         self._check(code, "set_servo_angle_j")
 
+    @property
+    def gripper_opening(self):
+        """How far open the gripper is, 0.0 shut to 1.0 wide open.
+
+        A live modbus round trip to the gripper, like `joint_efforts` and
+        unlike the joint readings: the gripper is not in the arm's report
+        stream, so there is nothing cached here to read. Poll it sparingly.
+        """
+        self._require_gripper()
+        with self._lock:
+            code, pulses = self.arm.get_gripper_position()
+        self._check(code, "get_gripper_position")
+        if pulses is None:
+            raise XArmError("gripper reported no position")
+        return float(np.clip(pulses / RAW_TRAVEL, 0.0, 1.0))
+
+    def grip(self, opening=GRIPPER_CLOSED, speed=None, wait=True, timeout=None):
+        """Open or close the gripper, 0.0 shut to 1.0 wide open.
+
+        The gripper is its own device on its own link, so this is the one
+        command here that leaves the arm alone: it doesn't change the arm's
+        mode, doesn't supersede the command the arm is running, and doesn't
+        wait for it — the jaws can close while the arm is still moving, which
+        is what makes grasping on the fly possible. Nothing is checked against
+        the safety guard either, because the guard's model has no gripper in
+        it (see `gripper.py`).
+
+        The gripper is put into position mode and energized on the first grip,
+        not on connect, and a fault it is latching is cleared then too if the
+        arm was constructed with `clear_errors=True`.
+
+        `speed` is a fraction of the gripper's full speed; `timeout` defaults
+        to the SDK's own 10 s. A keyboard interrupt out of the wait leaves the
+        jaws doing as they were told — the gripper's protocol has nothing that
+        cancels a move part-way, only a new position to go to.
+
+        Returns True if the jaws came to a stop, which is also what closing on
+        an object looks like: the gripper stalls where the object is and
+        reports itself stopped. `gripper_opening` is what tells the two apart —
+        short of the target means something is in the way. Returns False if
+        `wait` was False or if `timeout` elapsed with the jaws still moving.
+
+        Raises ValueError if `opening` or `speed` is out of range, and
+        `XArmError` if the gripper faults (it stops being enabled when it
+        does; `clear_errors()` clears it).
+        """
+        pulses = raw_position(opening)
+        pulse_speed = raw_speed(speed)
+        self._enable_gripper()
+        code = self.arm.set_gripper_position(
+            pulses,
+            speed=pulse_speed,
+            wait=bool(wait),
+            timeout=timeout,
+            # The gripper isn't on the arm's motion queue, but the SDK holds
+            # this command back until the arm's own move has finished unless
+            # told not to — a coupling nothing about the hardware asks for.
+            wait_motion=False,
+        )
+        if code == _WAIT_FINISH_TIMEOUT:
+            return False
+        if code in (_GRIPPER_FAULT, _GRIPPER_NOT_ENABLED):
+            with self._lock:
+                self._gripper_ready = False  # a fault drops the enable
+            raise XArmError(
+                "gripper would not move (its own error code is "
+                f"{self.arm.gripper_error_code}); clear_errors() clears it",
+                code,
+            )
+        self._check(code, "set_gripper_position")
+        return bool(wait)
+
     # ------------------------------------------------------------------
     # Extras
     # ------------------------------------------------------------------
@@ -526,18 +625,27 @@ class RealXArm7(RobotInterface):
         return bool(self.arm.has_err_warn)
 
     def clear_errors(self):
-        """Clear a latched error/warning and re-arm the arm for motion."""
+        """Clear a latched error/warning and re-arm the arm for motion.
+
+        A fault on the gripper is cleared too — it keeps its own error code,
+        which the arm's own clearing doesn't reach — and the gripper is
+        re-enabled by the next grip, since faulting drops its enable.
+        """
         with self._lock:
             self.arm.clean_warn()
             self.arm.clean_error()
             self._check(self.arm.motion_enable(True), "motion_enable")
             self._apply_mode(MODE_POSITION)
+            if self._has_gripper:
+                self._clear_gripper_error()
+                self._gripper_ready = False
 
     def close(self):
         """Stop the arm and drop the connection.
 
         The motors stay enabled and holding — disabling them would let the arm
-        fall under its own weight.
+        fall under its own weight — and the gripper is left exactly as it is,
+        holding whatever is in it, for the same reason.
         """
         with self._lock:
             self._begin_command()
@@ -666,7 +774,8 @@ class RealXArm7(RobotInterface):
         they run on the controller in real time, which nothing here does.
         """
         self._check(self.arm.set_self_collision_detection(True), "self-collision")
-        self._check(self.arm.set_collision_tool_model(_TOOL_NONE), "tool model")
+        tool = _TOOL_XARM_GRIPPER if self._has_gripper else _TOOL_NONE
+        self._check(self.arm.set_collision_tool_model(tool), "tool model")
 
         if not controller_boundary:
             return
@@ -689,6 +798,43 @@ class RealXArm7(RobotInterface):
         code, states = self.arm.get_joint_states(is_radian=True, num=3)
         self._check(code, "get_joint_states")
         return [np.asarray(s[: self.nq], dtype=float) for s in states]
+
+    def _require_gripper(self):
+        """Raise unless this arm was told it has a gripper on it."""
+        if not self._has_gripper:
+            raise XArmError(
+                "this arm was constructed with gripper=False; pass "
+                "gripper=True if there is an xArm Gripper on the flange"
+            )
+
+    def _enable_gripper(self):
+        """Put the gripper in position mode and energize it, once.
+
+        Left until the first grip rather than done on connect: these are
+        round trips to a device that may not be plugged in, and an arm with a
+        bare flange has to be able to connect and move without them.
+        """
+        self._require_gripper()
+        with self._lock:
+            if self._gripper_ready:
+                return
+            if self._auto_clear_errors:
+                self._clear_gripper_error()
+            self._check(self.arm.set_gripper_mode(0), "set_gripper_mode")
+            self._check(self.arm.set_gripper_enable(True), "set_gripper_enable")
+            self._gripper_ready = True
+
+    def _clear_gripper_error(self):
+        """Clear a fault the gripper is latching, if it has one.
+
+        The gripper keeps its own error code and refuses to move while it is
+        set; the arm's `clean_error` doesn't reach it. Caller must hold the
+        lock.
+        """
+        code, err = self.arm.get_gripper_err_code()
+        if code == 0 and not err:
+            return
+        self._check(self.arm.clean_gripper_error(), "clean_gripper_error")
 
     def _begin_command(self):
         """Supersede whatever is running. Caller must hold the lock."""

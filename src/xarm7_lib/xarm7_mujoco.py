@@ -37,11 +37,29 @@ happens, is visible, and stops where it should. A warning says what was hit.
 The real arm refuses these commands outright instead. Anything the simulator
 merely warns about is something the hardware will reject.
 
-The MJCF carries a gripper the real arm doesn't. `gripper=False` takes it out
-of both the picture and the contact set; its mass stays either way, standing in
-for whatever is actually bolted on. Turning it back on gives you a gripper the
-guard knows nothing about, so the simulator can then jam on a part no check will
-warn you about — which is why the flange is bare by default.
+The MJCF's gripper is the one the real arm now carries, so it is kept: it is
+drawn, it collides, and `grip` drives it (open at the actuator's ctrl minimum,
+shut at its maximum, as Menagerie's model has it). The jaws are ramped to their
+goal at the commanded speed rather than snapped to it, for the reason the arm's
+setpoint is, and that ramp is open-loop — closing on an object leaves the
+setpoint shut and the fingers wherever the object stopped them, which is how a
+grasp reads here and on the hardware both.
+
+`gripper=False` takes the gripper out of the picture and out of the contact set,
+leaving the bare flange the arm used to have; its mass stays either way,
+standing in for whatever is bolted on. `grip` still drives the jaws then — they
+just can't be seen or hit anything.
+
+The MJCF's jaws are soft and heavily damped, so they asymptote onto the
+setpoint over seconds rather than arriving at it: a grip returns once they stop
+moving, which leaves a shut gripper reading a few hundredths above
+`GRIPPER_CLOSED` and a wide one the same distance below `GRIPPER_OPEN`. Read
+`gripper_opening` as the measurement it is — how far the jaws got — rather than
+testing it for equality with what was commanded.
+
+What no setting changes is that the guard's model has no gripper in it (see
+`gripper.py`). The simulator can jam the jaws on a part, or carry one straight
+through the safety box, with nothing to say about it.
 """
 
 import contextlib
@@ -52,6 +70,13 @@ import mujoco
 import numpy as np
 
 from .api import RobotInterface
+from .gripper import (
+    FULL_TRAVEL_TIME,
+    GRIPPER_CLOSED,
+    GRIPPER_OPEN,
+    check_opening,
+    check_speed,
+)
 from .mujoco_meshcat import MeshcatVisualizer
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyGuard
 
@@ -65,6 +90,13 @@ _VELOCITY_TOLERANCE = 1e-2  # rad/s
 _STRIBECK_VELOCITY = 1e-2  # rad/s, smooths the Coulomb friction sign()
 
 SERVO_TIMEOUT = 0.1  # s without a new servo command before the arm coasts down
+
+# The jaws creep the last fraction of a millimetre into whatever stopped them
+# well below `_VELOCITY_TOLERANCE`, so a grip that reads as finished the
+# instant they go quiet reports a position short of where they end up. Holding
+# the test for this long costs nothing and makes `gripper_opening` mean
+# something the moment `grip` returns.
+_GRIP_SETTLE_HOLD = 0.1  # s the jaws must hold still before a grip is done
 
 # The guard costs about as much as a physics tick, so it is not run on every
 # one. Re-checking once the setpoint has used up this fraction of the clearance
@@ -85,6 +117,7 @@ _FACE_PROXIMITY = 0.15  # m
 _FLOOR_FACE = "zmin"
 
 _GRIPPER_BODIES = ("gripper", "finger", "knuckle")
+_GRIPPER_DRIVER = "driver"  # the joints the gripper's one actuator drives
 _HIDDEN_GROUP = 3  # outside the groups the visualizer draws
 
 _MODE_HOLD = "hold"
@@ -122,9 +155,9 @@ class SimulatedXArm7(RobotInterface):
         the arm where they are drawn.
     guard : check every setpoint for self-collision and box violations. Turning
         this off lets the arm drive into itself, which the real one won't do.
-    gripper : keep the MJCF's gripper. Off by default, matching the bare flange
-        the guard and the real arm assume; on, it is drawn and collides, but
-        the guard still doesn't model it.
+    gripper : draw the MJCF's gripper and let it collide, matching the one the
+        real arm carries. Off leaves the bare flange the arm used to have; the
+        jaws still move when gripped either way, and the guard models neither.
     """
 
     def __init__(
@@ -141,7 +174,7 @@ class SimulatedXArm7(RobotInterface):
         safety_box=DEFAULT_BOX,
         safety_margin=DEFAULT_MARGIN,
         guard=True,
-        gripper=False,
+        gripper=True,
     ):
         super().__init__()
 
@@ -177,6 +210,9 @@ class SimulatedXArm7(RobotInterface):
         self._frictionloss = self.model.dof_frictionloss[self._vadr].copy()
 
         self._gripper_geoms = self._find_gripper_geoms()
+        self._grip_act, self._grip_qadr, self._grip_vadr, self._grip_shut = (
+            self._index_gripper()
+        )
         if not gripper:
             self._remove_gripper()
 
@@ -404,6 +440,51 @@ class SimulatedXArm7(RobotInterface):
             self._vel_deadline = None
             self._vel_target = np.zeros(self.nv)
 
+    @property
+    def gripper_opening(self):
+        """How far open the jaws are, 0.0 shut to 1.0 wide open.
+
+        Measured off the gripper's driver joints, so this is where the fingers
+        actually are — short of the goal when they have closed on something,
+        and a few hundredths short of either end even when they haven't (the
+        model's jaws asymptote onto the setpoint; see the module docstring).
+        """
+        self._require_gripper()
+        with self._lock:
+            return self._measured_opening()
+
+    def grip(self, opening=GRIPPER_CLOSED, speed=None, wait=True, timeout=None):
+        """Open or close the gripper, 0.0 shut to 1.0 wide open.
+
+        The gripper is driven apart from the arm, as it is on the hardware:
+        this doesn't touch the arm's mode or its setpoint, and the arm can be
+        commanded while the jaws are still moving. Nothing is checked against
+        the guard — its model has no gripper in it.
+
+        The setpoint ramps to `opening` at `speed` (a fraction of the
+        gripper's full speed) instead of jumping there, and it keeps ramping
+        whatever the fingers do, so closing on an object leaves the setpoint
+        shut and the fingers held open by the object.
+
+        Returns True if the jaws came to a stop — at `opening`, or on whatever
+        they closed on, with `gripper_opening` telling the two apart. False if
+        `wait` was False, if `timeout` elapsed first, or if the simulation has
+        been shut down.
+        """
+        self._require_gripper()
+        goal = check_opening(opening)
+        rate = check_speed(speed) / FULL_TRAVEL_TIME
+
+        with self._lock:
+            if goal != self._grip_ref:
+                self._grip_still_since = None
+            self._grip_goal = goal
+            self._grip_rate = rate
+
+        if not wait:
+            return False
+        return self._wait_for_grip(timeout)
+
     # ------------------------------------------------------------------
     # Extras
     # ------------------------------------------------------------------
@@ -469,6 +550,28 @@ class SimulatedXArm7(RobotInterface):
                     self.step(self.dt)  # no sim thread: drive it ourselves
                 else:
                     time.sleep(self.dt)
+
+    def _wait_for_grip(self, timeout=None):
+        """Block until the jaws stop moving. Returns False on timeout, or if
+        the simulation can no longer make progress.
+
+        An interrupt is left alone here, unlike the arm's waits: there is
+        nothing in the gripper to stop — the hardware has no way to cancel a
+        grip part-way either — so the jaws finish what they were told.
+        """
+        deadline = None if timeout is None else time.perf_counter() + float(timeout)
+        while True:
+            with self._lock:
+                if self._grip_settled():
+                    return True
+            if deadline is not None and time.perf_counter() >= deadline:
+                return False
+            if self._thread is not None and not self._thread.is_alive():
+                return False
+            if self._thread is None:
+                self.step(self.dt)  # no sim thread: drive it ourselves
+            else:
+                time.sleep(self.dt)
 
     def _wait_until(self, deadline):
         """Block until the velocity command expiring at sim time `deadline` is
@@ -545,6 +648,48 @@ class SimulatedXArm7(RobotInterface):
                 raise ValueError(f"expected exactly one actuator for {name!r}")
             act.append(driving[0])
         return tuple(np.asarray(v) for v in (jid, qadr, vadr, act))
+
+    def _index_gripper(self):
+        """Locate the gripper: its actuator, the joints it drives, and the
+        driver angle at which the jaws are shut. All None if there is no
+        gripper in the model.
+
+        The MJCF drives both fingers from one actuator through a tendon, so the
+        gripper is the one actuator that isn't an arm joint's, and the driver
+        joints are what say where the fingers ended up — the actuator's own
+        setpoint is open-loop and says nothing about an object in the way.
+
+        A model without them is not an error: `mjcf_path` can point at a bare
+        arm, which has everything but a gripper to offer. Only `grip` is lost,
+        and it says so when it is called.
+        """
+        act = [a for a in range(self.model.nu) if a not in set(self._act.tolist())]
+
+        qadr, vadr, shut = [], [], []
+        for j in range(self.model.njnt):
+            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_JOINT, j) or ""
+            if _GRIPPER_DRIVER in name:
+                qadr.append(self.model.jnt_qposadr[j])
+                vadr.append(self.model.jnt_dofadr[j])
+                shut.append(self.model.jnt_range[j, 1])
+
+        if len(act) != 1 or not qadr:
+            return None, None, None, None
+        return (
+            act[0],
+            np.asarray(qadr),
+            np.asarray(vadr),
+            np.asarray(shut, dtype=float),
+        )
+
+    def _require_gripper(self):
+        """Raise unless the loaded model has a gripper to drive."""
+        if self._grip_act is None:
+            raise ValueError(
+                "the loaded MJCF has no gripper on it: one actuator that isn't "
+                "an arm joint's, driving joints named *driver*, is what this "
+                "looks for"
+            )
 
     def _base_frame(self):
         """The arm's base frame in the world, as a 4x4.
@@ -645,9 +790,15 @@ class SimulatedXArm7(RobotInterface):
         self._servo_t = -np.inf
         self._guard_checked = q.copy()
         self._t = 0.0
-        # Park every actuator we don't drive (the gripper) at its own setpoint.
+        self._grip_ref = self._grip_goal = self._measured_opening()
+        self._grip_rate = 1.0 / FULL_TRAVEL_TIME
+        self._grip_still_since = 0.0
+        # Zero first, so any actuator this class doesn't drive sits at its own
+        # setpoint rather than at whatever a keyframe left behind.
         self.data.ctrl[:] = 0.0
         self.data.ctrl[self._act] = q
+        if self._grip_act is not None:
+            self.data.ctrl[self._grip_act] = self._grip_ctrl(self._grip_ref)
 
     # ------------------------------------------------------------------
     # Internals
@@ -798,6 +949,54 @@ class SimulatedXArm7(RobotInterface):
 
         self._v_ref = np.zeros(self.nv)
 
+    def _measured_opening(self):
+        """Where the fingers are, 0.0 shut to 1.0 wide open, or `GRIPPER_OPEN`
+        for a model with no gripper. Caller must hold the lock."""
+        if self._grip_act is None:
+            return GRIPPER_OPEN
+        driver = self.data.qpos[self._grip_qadr] / self._grip_shut
+        return float(np.clip(1.0 - np.mean(driver), GRIPPER_CLOSED, GRIPPER_OPEN))
+
+    def _grip_ctrl(self, opening):
+        """An opening as the gripper actuator's own setpoint: the ctrl range
+        runs from wide open at its low end to shut at its high end."""
+        low, high = self.model.actuator_ctrlrange[self._grip_act]
+        return low + (GRIPPER_OPEN - opening) * (high - low)
+
+    def _grip_settled(self):
+        """Whether the jaws have been still for `_GRIP_SETTLE_HOLD`. Caller
+        must hold the lock."""
+        if self._grip_still_since is None:
+            return False
+        return self._t - self._grip_still_since >= _GRIP_SETTLE_HOLD
+
+    def _advance_gripper(self):
+        """Ramp the jaws' setpoint one dt toward their goal, write it, and note
+        whether they are still.
+
+        Outside the arm's reference funnel on purpose: the gripper is a
+        separate device with no guard to answer to, and a grip must not
+        disturb — or be disturbed by — whatever mode the arm is in.
+        """
+        if self._grip_act is None:
+            return
+        if self._grip_ref != self._grip_goal:
+            step = self._grip_rate * self.dt
+            delta = self._grip_goal - self._grip_ref
+            self._grip_ref += float(np.clip(delta, -step, step))
+        self.data.ctrl[self._grip_act] = self._grip_ctrl(self._grip_ref)
+
+        # A grip is done once the setpoint has arrived *and* the fingers have
+        # stopped — the first alone would call a grasp finished while they were
+        # still closing on the part, the second alone before they set off.
+        moving = self._grip_ref != self._grip_goal or bool(
+            np.max(np.abs(self.data.qvel[self._grip_vadr])) > _VELOCITY_TOLERANCE
+        )
+        if moving:
+            self._grip_still_since = None
+        elif self._grip_still_since is None:
+            self._grip_still_since = self._t
+
     def _apply_control(self):
         """Write the servo setpoints. Caller must hold the lock."""
         ctrl = self._q_ref
@@ -820,6 +1019,7 @@ class SimulatedXArm7(RobotInterface):
         """One physics tick. Caller must hold the lock."""
         self._update_reference()
         self._apply_control()
+        self._advance_gripper()
         mujoco.mj_step(self.model, self.data)
         self._t = self.data.time
 
