@@ -57,9 +57,12 @@ moving, which leaves a shut gripper reading a few hundredths above
 `gripper_opening` as the measurement it is — how far the jaws got — rather than
 testing it for equality with what was commanded.
 
-What no setting changes is that the guard's model has no gripper in it (see
-`gripper.py`). The simulator can jam the jaws on a part, or carry one straight
-through the safety box, with nothing to say about it.
+`gripper` says the same thing to the guard, which carries the jaws as one
+envelope when they are there (see `safety.py`): on, the safety box stops the
+fingertips and the self-collision check sees them; off, both stop at the bare
+flange. So the flag is one statement about what is bolted on, not a drawing
+option — turning it off to tidy up the picture also tells the guard the last
+175 mm of the arm isn't there.
 """
 
 import contextlib
@@ -155,9 +158,11 @@ class SimulatedXArm7(RobotInterface):
         the arm where they are drawn.
     guard : check every setpoint for self-collision and box violations. Turning
         this off lets the arm drive into itself, which the real one won't do.
-    gripper : draw the MJCF's gripper and let it collide, matching the one the
-        real arm carries. Off leaves the bare flange the arm used to have; the
-        jaws still move when gripped either way, and the guard models neither.
+    gripper : there is a gripper on the flange — it is drawn, it collides, and
+        the safety guard carries it. Off leaves the bare flange the arm used to
+        have, in the picture and in the guard both; the jaws still move when
+        gripped either way, they just aren't there as far as anything else is
+        concerned.
     """
 
     def __init__(
@@ -216,7 +221,11 @@ class SimulatedXArm7(RobotInterface):
         if not gripper:
             self._remove_gripper()
 
-        self._guard = SafetyGuard(safety_box, safety_margin) if guard else None
+        self._guard = (
+            SafetyGuard(safety_box, safety_margin, gripper=gripper)
+            if guard
+            else None
+        )
         self.last_violation = None
         self._warned_at = -np.inf
         # A joint turning by dq sweeps the far end of the arm through about
@@ -459,7 +468,8 @@ class SimulatedXArm7(RobotInterface):
         The gripper is driven apart from the arm, as it is on the hardware:
         this doesn't touch the arm's mode or its setpoint, and the arm can be
         commanded while the jaws are still moving. Nothing is checked against
-        the guard — its model has no gripper in it.
+        the guard, which carries the jaws at every opening: moving them between
+        two openings it already allows takes the arm nowhere new.
 
         The setpoint ramps to `opening` at `speed` (a fraction of the
         gripper's full speed) instead of jumping there, and it keeps ramping
@@ -748,11 +758,12 @@ class SimulatedXArm7(RobotInterface):
     def _remove_gripper(self):
         """Take the gripper out of the contact set and out of the picture.
 
-        The real arm this mirrors has a bare flange, and the guard's model has
-        no gripper either. Leaving the MJCF's one collidable would have the
-        simulator jam on a part the hardware doesn't carry — and jam silently,
-        since the guard would have nothing to say about it. Only the geometry
-        goes; the mass stays, standing in for whatever is actually bolted on.
+        For `gripper=False`, which says there is nothing bolted on: the guard
+        is built without the gripper too, so leaving the MJCF's one collidable
+        would have the simulator jam on a part that is not supposed to be there
+        and jam silently, with the guard having nothing to say about it. Only
+        the geometry goes; the mass stays, standing in for whatever really is
+        on the flange.
         """
         for geom in self._gripper_geoms:
             self.model.geom_contype[geom] = 0

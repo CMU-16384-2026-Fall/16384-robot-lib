@@ -15,11 +15,13 @@ thing that means the same in both places, and it leaves each backend to say
 what a fraction is in its own terms — which is what makes a script holding a
 part in simulation the same script that holds it for real.
 
-The arm's own geometry is all the safety guard in `safety.py` knows about: its
-model has no gripper on it, and a grip is not checked against anything. So the
-jaws, and whatever is between them, stick out past every boundary this library
-enforces — the safety box stops `link7`, not the fingertips, and nothing here
-will warn you before a held part hits the table.
+The safety guard in `safety.py` carries the gripper: it is in the guard's model
+as one convex envelope on the flange, covering the jaws at every opening and the
+space between them, so the safety box and the self-collision check both account
+for the jaws and for a part held in them. What the guard does *not* check is the
+grip itself — opening or closing the jaws moves nothing the guard models, so a
+`grip` is never refused, and a part wider than the envelope is a part the guard
+cannot see.
 """
 
 GRIPPER_CLOSED = 0.0

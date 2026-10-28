@@ -57,7 +57,9 @@ The gripper on the flange is a separate device again: the controller drives it
 over its own modbus link, outside the motion modes entirely, so `grip` doesn't
 touch the arm's mode, doesn't supersede the running command, and doesn't wait
 for it. It is set up lazily — mode and enable go out with the first grip — so
-an arm with nothing bolted on still connects.
+an arm with nothing bolted on still connects. Its *geometry* is not lazy: the
+guard carries the jaws from construction, so every arm command here is checked
+with the gripper on the end of it.
 
 The controller has its own self-collision detection, which is switched on here
 as a backstop. It only covers planned moves in mode 0 though: the setpoints in
@@ -184,11 +186,11 @@ class RealXArm7(RobotInterface):
     guard : refuse commands that would self-collide or leave the box. With this
         off you are left with the controller's own detection, which does not
         cover servo or velocity commands.
-    gripper : there is an xArm Gripper on the flange. On means `grip` works and
-        the controller's own collision detection is told to include the
-        gripper; off means `grip` raises and the flange is modelled bare. The
-        gripper itself is only talked to when it is first used, so this costs
-        nothing on an arm that never grips.
+    gripper : there is an xArm Gripper on the flange. On means `grip` works, the
+        safety guard carries the gripper, and the controller's own collision
+        detection is told about it too; off means `grip` raises and the flange
+        is modelled bare everywhere. The gripper itself is only talked to when
+        it is first used, so this costs nothing on an arm that never grips.
     controller_boundary : also hand the box to the controller as its reduced-mode
         TCP boundary. Off by default: it constrains only the tool where the box
         here constrains the whole arm, and switching reduced mode on also caps
@@ -198,8 +200,6 @@ class RealXArm7(RobotInterface):
     The arm is left energized and holding position on `close()`; dropping the
     motors would let it fall, and the gripper is left holding whatever it has
     for the same reason.
-
-    The safety guard knows nothing about the gripper — see `gripper.py`.
     """
 
     def __init__(
@@ -270,7 +270,11 @@ class RealXArm7(RobotInterface):
                 error_code=self.arm.error_code,
             )
 
-        self._guard = SafetyGuard(safety_box, safety_margin) if guard else None
+        self._guard = (
+            SafetyGuard(safety_box, safety_margin, gripper=self._has_gripper)
+            if guard
+            else None
+        )
 
         self._check(self.arm.motion_enable(True), "motion_enable")
         self._apply_mode(MODE_POSITION)
@@ -500,8 +504,9 @@ class RealXArm7(RobotInterface):
         mode, doesn't supersede the command the arm is running, and doesn't
         wait for it — the jaws can close while the arm is still moving, which
         is what makes grasping on the fly possible. Nothing is checked against
-        the safety guard either, because the guard's model has no gripper in
-        it (see `gripper.py`).
+        the safety guard either: the guard carries the jaws at every opening,
+        so moving them between two openings it already allows cannot take the
+        arm anywhere new.
 
         The gripper is put into position mode and energized on the first grip,
         not on connect, and a fault it is latching is cleared then too if the
