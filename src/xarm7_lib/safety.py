@@ -72,7 +72,7 @@ import pinocchio as pin
 # shoulder sweeps back to x = -204 mm in ordinary poses and the arm stands over
 # a metre tall, so a box drawn only around the reachable *workspace* would
 # exclude the arm holding still at home. z = 0 is the mounting surface.
-DEFAULT_BOX = ((-0.10, 0.70), (-0.45, 0.45), (0.00, 0.80))
+DEFAULT_BOX = ((-0.20, 0.80), (-0.5, 0.5), (-0.15, 0.65))
 
 # 10 mm of clearance between link pairs, with room to spare: the home pose,
 # where link2 and link4 legitimately sit close together at the elbow, only
