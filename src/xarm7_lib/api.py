@@ -1,3 +1,6 @@
+from .gripper import GRIPPER_CLOSED
+
+
 class RobotInterface:
     def __init__(self):
         pass
@@ -79,6 +82,33 @@ class RobotInterface:
 
         Returns:
             None
+        """
+        raise NotImplementedError("This method should be implemented by subclasses.")
+
+    @property
+    def gripper_opening(self):
+        """How far open the gripper is, 0.0 shut to 1.0 wide open."""
+        raise NotImplementedError("This method should be implemented by subclasses.")
+
+    def grip(self, opening=GRIPPER_CLOSED, speed=None, wait=True, timeout=None):
+        """Open or close the gripper.
+
+        The gripper is a separate device from the arm: this neither waits for
+        nor cancels whatever the arm is doing, and the arm can be commanded
+        while the jaws are still moving.
+
+        Args:
+            opening: how far open to go, 0.0 (shut) to 1.0 (wide open).
+                Defaults to shut.
+            speed: how fast to get there, as a fraction of the gripper's full
+                speed in (0, 1]. None is the library's default.
+            wait: If True, block until the jaws stop moving.
+            timeout: The maximum time to wait for the jaws to stop.
+
+        Returns:
+            True if the jaws came to a stop — either at `opening` or on
+            whatever they closed on, which `gripper_opening` tells apart.
+            False if wait was False, or if timeout elapsed first.
         """
         raise NotImplementedError("This method should be implemented by subclasses.")
 

@@ -53,6 +53,14 @@ refused with `SafetyError` rather than started and stopped part-way. The
 simulator, by contrast, runs such a command and halts at the boundary — so
 anything it merely warns about is something this class will reject outright.
 
+The gripper on the flange is a separate device again: the controller drives it
+over its own modbus link, outside the motion modes entirely, so `grip` doesn't
+touch the arm's mode, doesn't supersede the running command, and doesn't wait
+for it. It is set up lazily — mode and enable go out with the first grip — so
+an arm with nothing bolted on still connects. Its *geometry* is not lazy: the
+guard carries the jaws from construction, so every arm command here is checked
+with the gripper on the end of it.
+
 The controller has its own self-collision detection, which is switched on here
 as a backstop. It only covers planned moves in mode 0 though: the setpoints in
 mode 1 and the velocities in mode 4 aren't planned, so for those the check on
@@ -72,7 +80,6 @@ from xarm.wrapper import XArmAPI
 from .api import RobotInterface
 from .free_drive import (
     FREE_DRIVE_RATE,
-    FREE_JOINTS,
     LOCKED_TOLERANCE,
     LOCKED_WARN_FRACTION,
     RATE_LIMITS,
@@ -82,8 +89,14 @@ from .free_drive import (
     STALL_ABORT,
     WARN_PERIOD,
     Trajectory,
-    free_mask,
     hands_off_prompt,
+    watch_mask,
+)
+from .gripper import (
+    GRIPPER_CLOSED,
+    RAW_TRAVEL,
+    raw_position,
+    raw_speed,
 )
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyError, SafetyGuard
 
@@ -115,9 +128,12 @@ _STATE_PAUSED = 3  # ... and has been paused part-way through it
 
 _WAIT_FINISH_TIMEOUT = 100  # APIState.WAIT_FINISH_TIMEOUT
 _STOPPED = -9  # APIState.EMERGENCY_STOP: the move was cancelled mid-flight
+_GRIPPER_FAULT = 102  # APIState.END_EFFECTOR_HAS_FAULT
+_GRIPPER_NOT_ENABLED = 103  # APIState.END_EFFECTOR_NOT_ENABLED
 _DURATION_FIRMWARE = (1, 8, 0)  # vc_set_joint_velocity honours `duration` from here
 
 _TOOL_NONE = 0  # set_collision_tool_model: bare flange
+_TOOL_XARM_GRIPPER = 1  # ... and with the xArm Gripper on it
 # How far ahead an open-ended velocity command is checked. It runs until it is
 # replaced, so there is no natural end to check up to; this is far enough that
 # anything closer is the caller aiming at a wall.
@@ -169,6 +185,11 @@ class RealXArm7(RobotInterface):
     guard : refuse commands that would self-collide or leave the box. With this
         off you are left with the controller's own detection, which does not
         cover servo or velocity commands.
+    gripper : there is an xArm Gripper on the flange. On means `grip` works, the
+        safety guard carries the gripper, and the controller's own collision
+        detection is told about it too; off means `grip` raises and the flange
+        is modelled bare everywhere. The gripper itself is only talked to when
+        it is first used, so this costs nothing on an arm that never grips.
     controller_boundary : also hand the box to the controller as its reduced-mode
         TCP boundary. Off by default: it constrains only the tool where the box
         here constrains the whole arm, and switching reduced mode on also caps
@@ -176,7 +197,8 @@ class RealXArm7(RobotInterface):
         box.
 
     The arm is left energized and holding position on `close()`; dropping the
-    motors would let it fall.
+    motors would let it fall, and the gripper is left holding whatever it has
+    for the same reason.
     """
 
     def __init__(
@@ -191,6 +213,7 @@ class RealXArm7(RobotInterface):
         safety_box=DEFAULT_BOX,
         safety_margin=DEFAULT_MARGIN,
         guard=True,
+        gripper=True,
         controller_boundary=False,
     ):
         super().__init__()
@@ -219,6 +242,9 @@ class RealXArm7(RobotInterface):
         self._timer = None
         self._mode = None
         self._acc = None if acceleration is None else float(acceleration)
+        self._has_gripper = bool(gripper)
+        self._gripper_ready = False  # set up on first use, not on connect
+        self._auto_clear_errors = bool(clear_errors)
 
         self._wait_for_report(timeout)
 
@@ -243,7 +269,11 @@ class RealXArm7(RobotInterface):
                 error_code=self.arm.error_code,
             )
 
-        self._guard = SafetyGuard(safety_box, safety_margin) if guard else None
+        self._guard = (
+            SafetyGuard(safety_box, safety_margin, gripper=self._has_gripper)
+            if guard
+            else None
+        )
 
         self._check(self.arm.motion_enable(True), "motion_enable")
         self._apply_mode(MODE_POSITION)
@@ -449,6 +479,79 @@ class RealXArm7(RobotInterface):
             code = self.arm.set_servo_angle_j(target.tolist(), is_radian=True)
         self._check(code, "set_servo_angle_j")
 
+    @property
+    def gripper_opening(self):
+        """How far open the gripper is, 0.0 shut to 1.0 wide open.
+
+        A live modbus round trip to the gripper, like `joint_efforts` and
+        unlike the joint readings: the gripper is not in the arm's report
+        stream, so there is nothing cached here to read. Poll it sparingly.
+        """
+        self._require_gripper()
+        with self._lock:
+            code, pulses = self.arm.get_gripper_position()
+        self._check(code, "get_gripper_position")
+        if pulses is None:
+            raise XArmError("gripper reported no position")
+        return float(np.clip(pulses / RAW_TRAVEL, 0.0, 1.0))
+
+    def grip(self, opening=GRIPPER_CLOSED, speed=None, wait=True, timeout=None):
+        """Open or close the gripper, 0.0 shut to 1.0 wide open.
+
+        The gripper is its own device on its own link, so this is the one
+        command here that leaves the arm alone: it doesn't change the arm's
+        mode, doesn't supersede the command the arm is running, and doesn't
+        wait for it — the jaws can close while the arm is still moving, which
+        is what makes grasping on the fly possible. Nothing is checked against
+        the safety guard either: the guard carries the jaws at every opening,
+        so moving them between two openings it already allows cannot take the
+        arm anywhere new.
+
+        The gripper is put into position mode and energized on the first grip,
+        not on connect, and a fault it is latching is cleared then too if the
+        arm was constructed with `clear_errors=True`.
+
+        `speed` is a fraction of the gripper's full speed; `timeout` defaults
+        to the SDK's own 10 s. A keyboard interrupt out of the wait leaves the
+        jaws doing as they were told — the gripper's protocol has nothing that
+        cancels a move part-way, only a new position to go to.
+
+        Returns True if the jaws came to a stop, which is also what closing on
+        an object looks like: the gripper stalls where the object is and
+        reports itself stopped. `gripper_opening` is what tells the two apart —
+        short of the target means something is in the way. Returns False if
+        `wait` was False or if `timeout` elapsed with the jaws still moving.
+
+        Raises ValueError if `opening` or `speed` is out of range, and
+        `XArmError` if the gripper faults (it stops being enabled when it
+        does; `clear_errors()` clears it).
+        """
+        pulses = raw_position(opening)
+        pulse_speed = raw_speed(speed)
+        self._enable_gripper()
+        code = self.arm.set_gripper_position(
+            pulses,
+            speed=pulse_speed,
+            wait=bool(wait),
+            timeout=timeout,
+            # The gripper isn't on the arm's motion queue, but the SDK holds
+            # this command back until the arm's own move has finished unless
+            # told not to — a coupling nothing about the hardware asks for.
+            wait_motion=False,
+        )
+        if code == _WAIT_FINISH_TIMEOUT:
+            return False
+        if code in (_GRIPPER_FAULT, _GRIPPER_NOT_ENABLED):
+            with self._lock:
+                self._gripper_ready = False  # a fault drops the enable
+            raise XArmError(
+                "gripper would not move (its own error code is "
+                f"{self.arm.gripper_error_code}); clear_errors() clears it",
+                code,
+            )
+        self._check(code, "set_gripper_position")
+        return bool(wait)
+
     # ------------------------------------------------------------------
     # Extras
     # ------------------------------------------------------------------
@@ -526,18 +629,27 @@ class RealXArm7(RobotInterface):
         return bool(self.arm.has_err_warn)
 
     def clear_errors(self):
-        """Clear a latched error/warning and re-arm the arm for motion."""
+        """Clear a latched error/warning and re-arm the arm for motion.
+
+        A fault on the gripper is cleared too — it keeps its own error code,
+        which the arm's own clearing doesn't reach — and the gripper is
+        re-enabled by the next grip, since faulting drops its enable.
+        """
         with self._lock:
             self.arm.clean_warn()
             self.arm.clean_error()
             self._check(self.arm.motion_enable(True), "motion_enable")
             self._apply_mode(MODE_POSITION)
+            if self._has_gripper:
+                self._clear_gripper_error()
+                self._gripper_ready = False
 
     def close(self):
         """Stop the arm and drop the connection.
 
         The motors stay enabled and holding — disabling them would let the arm
-        fall under its own weight.
+        fall under its own weight — and the gripper is left exactly as it is,
+        holding whatever is in it, for the same reason.
         """
         with self._lock:
             self._begin_command()
@@ -666,7 +778,8 @@ class RealXArm7(RobotInterface):
         they run on the controller in real time, which nothing here does.
         """
         self._check(self.arm.set_self_collision_detection(True), "self-collision")
-        self._check(self.arm.set_collision_tool_model(_TOOL_NONE), "tool model")
+        tool = _TOOL_XARM_GRIPPER if self._has_gripper else _TOOL_NONE
+        self._check(self.arm.set_collision_tool_model(tool), "tool model")
 
         if not controller_boundary:
             return
@@ -689,6 +802,43 @@ class RealXArm7(RobotInterface):
         code, states = self.arm.get_joint_states(is_radian=True, num=3)
         self._check(code, "get_joint_states")
         return [np.asarray(s[: self.nq], dtype=float) for s in states]
+
+    def _require_gripper(self):
+        """Raise unless this arm was told it has a gripper on it."""
+        if not self._has_gripper:
+            raise XArmError(
+                "this arm was constructed with gripper=False; pass "
+                "gripper=True if there is an xArm Gripper on the flange"
+            )
+
+    def _enable_gripper(self):
+        """Put the gripper in position mode and energize it, once.
+
+        Left until the first grip rather than done on connect: these are
+        round trips to a device that may not be plugged in, and an arm with a
+        bare flange has to be able to connect and move without them.
+        """
+        self._require_gripper()
+        with self._lock:
+            if self._gripper_ready:
+                return
+            if self._auto_clear_errors:
+                self._clear_gripper_error()
+            self._check(self.arm.set_gripper_mode(0), "set_gripper_mode")
+            self._check(self.arm.set_gripper_enable(True), "set_gripper_enable")
+            self._gripper_ready = True
+
+    def _clear_gripper_error(self):
+        """Clear a fault the gripper is latching, if it has one.
+
+        The gripper keeps its own error code and refuses to move while it is
+        set; the arm's `clean_error` doesn't reach it. Caller must hold the
+        lock.
+        """
+        code, err = self.arm.get_gripper_err_code()
+        if code == 0 and not err:
+            return
+        self._check(self.arm.clean_gripper_error(), "clean_gripper_error")
 
     def _begin_command(self):
         """Supersede whatever is running. Caller must hold the lock."""
@@ -844,9 +994,10 @@ class RealXArm7(RobotInterface):
 
     def free_drive(
         self,
-        free=FREE_JOINTS,
         duration=30.0,
         *,
+        watch=(),
+        until=None,
         tolerance=LOCKED_TOLERANCE,
         rate=FREE_DRIVE_RATE,
         recover_speed=RECOVER_SPEED,
@@ -858,10 +1009,16 @@ class RealXArm7(RobotInterface):
         """Let a person push the arm by hand, and record where they took it.
 
         This runs the controller's own joint teaching mode, which frees **every**
-        joint and gravity-compensates the arm. There is no per-joint version of
-        it, so the joints outside `free` are not held — they are watched. Their
-        positions are latched before the run starts, and if one of them drifts
-        more than `tolerance` off its latched value the run interrupts itself:
+        joint and gravity-compensates the arm. By default that is the whole run:
+        the arm goes wherever it is pushed, the loop samples it, and the
+        recording is what you get back. The safety guard is still checked every
+        tick — see below.
+
+        `watch` is for joints that are meant to stay put. Teaching mode has no
+        per-joint version, so the joints named there are not held — they are
+        watched. Their positions are latched before the run starts, and if one
+        of them drifts more than `tolerance` off its latched value the run
+        interrupts itself:
 
             1. back to position control, which stiffens the arm where it stands;
             2. `confirm` asks the person to take their hands off, and waits;
@@ -875,34 +1032,51 @@ class RealXArm7(RobotInterface):
         interruption leaves a gap in the returned `t` — see `Trajectory`.
 
         Args:
-            free: which joints to release *and mean it*, as **0-indexed** joint
-                numbers — `[0, 3, 6]` is joint1, joint4 and joint7 — or a
-                length-7 boolean mask. The rest are watched. Defaults to
-                `FREE_JOINTS`, the three the lab's `HOME_POSE` is built around.
-            duration: seconds of teaching to run for. Time spent stopped for an
-                interruption doesn't count against it. Ctrl-C ends the run early
-                and still returns everything recorded up to that point.
+            duration: seconds of teaching to run for, or None for no limit —
+                then only `until`, `on_sample`, Ctrl-C, the guard or a fault
+                ends the run. Time spent stopped for an interruption doesn't
+                count against it. Ctrl-C ends a run early and still returns
+                everything recorded up to that point.
+            watch: which joints to watch, as **0-indexed** joint numbers —
+                `[1, 2]` is joint2 and joint3 — or a length-7 boolean mask in
+                which True means watched. Defaults to watching nothing: every
+                joint is free and the arm is simply recorded. `WATCHED_JOINTS`
+                is the four the lab's `HOME_POSE` is defined by. Keyword-only,
+                so that a run holding part of the arm has to say so.
+            until: called with no arguments once per tick; return something
+                truthy to end the run. `stop_on_enter()` is the one for "go
+                until somebody presses Enter": it peeks at the terminal rather
+                than reading it, so waiting doesn't stop the watching and the
+                run leaves nothing behind holding stdin. Like `on_sample`, it
+                runs inside the loop and must return quickly. A `reason`
+                attribute on it, if there is one, is what `Trajectory.reason`
+                will say.
             tolerance: rad a watched joint may drift before the run puts it
                 back. Below about 0.02 rad ordinary handling of the free joints
-                trips it through the arm's own structure.
-            rate: how often the watched joints are checked, Hz, 20 to 250.
-                Nothing is commanded at this rate — it is a sampling rate, and
-                the report stream underneath it is what really limits how soon
-                a drift is seen.
-            recover_speed: rad/s for the move that puts a watched joint back.
+                trips it through the arm's own structure. Unused if nothing is
+                watched.
+            rate: how often the arm is sampled, Hz, 20 to 250. Nothing is
+                commanded at this rate — it is a sampling rate, and the report
+                stream underneath it is what really limits how soon a drift or
+                a guard violation is seen.
+            recover_speed: rad/s for the move that puts a watched joint back,
+                and for the step back inside the guard.
             teach_sensitivity: 1-5 to apply for the duration and restore
                 afterwards, or None to leave the controller's own setting alone.
                 Higher is easier to push. UFACTORY's advice is not to touch it
                 unless the arm is hard to move.
-            confirm: called with the hands-off warning when a watched joint has
-                to be put back, and must not return until it is safe for the arm
-                to move. Return True to carry on, False to end the run. Defaults
-                to a terminal prompt.
+            confirm: called with the hands-off warning when the arm has to move
+                on its own — a watched joint put back, or a step back inside the
+                guard — and must not return until it is safe for it to. Return
+                True to carry on, False to end the run. Defaults to a terminal
+                prompt, which ignores anything typed before it went up — a
+                newline meant for `stop_on_enter` cannot answer a hands-off
+                warning on behalf of someone still holding the arm.
             on_sample: called as `on_sample(t, q)` after every recorded tick,
                 for live plotting or a caller's own stop condition. Return
                 something truthy to end the run. It runs inside the watch loop,
                 so it must return quickly — time spent in it is time nothing is
-                watching the locked joints, and past `STALL_ABORT` the run ends.
+                watching, and past `STALL_ABORT` the run ends.
             verbose: print the banner and the running warnings. The guard is
                 checked either way — it ends the run rather than reporting it.
 
@@ -911,8 +1085,9 @@ class RealXArm7(RobotInterface):
             `reason` saying why the run ended and `interruptions` saying how many
             gaps are in it.
 
-        Raises ValueError for a malformed `free`, and `SafetyError` if the arm is
-        somewhere the guard won't allow before the run even starts.
+        Raises ValueError for a malformed `watch` or `duration`, and
+        `SafetyError` if the arm is somewhere the guard won't allow before the
+        run even starts.
 
         The guard cannot *refuse* anything during the run — the person's hand
         is not a command — so a self-collision or a step outside the safety box
@@ -927,10 +1102,21 @@ class RealXArm7(RobotInterface):
         outside the box would refuse every move afterwards. `reason` says what
         was hit; everything recorded up to it is returned as usual.
         """
-        mask = free_mask(free, self.nq)
-        duration = float(duration)
-        if duration <= 0.0:
-            raise ValueError("duration must be positive")
+        mask = watch_mask(watch, self.nq)
+        try:
+            duration = np.inf if duration is None else float(duration)
+        except TypeError:
+            # The old signature took the joints first. Someone porting a script
+            # gets this rather than a run that quietly means something else.
+            raise ValueError(
+                f"duration must be a number of seconds or None, not "
+                f"{duration!r} — joints go in `watch=`, and they are the ones "
+                "to *hold*, not the ones to free"
+            ) from None
+        # `not > 0` rather than `<= 0`, so a NaN duration is caught here rather
+        # than becoming a run that never reaches its own deadline.
+        if not duration > 0.0:
+            raise ValueError("duration must be positive, or None for no limit")
         rate = float(rate)
         if not RATE_LIMITS[0] <= rate <= RATE_LIMITS[1]:
             raise ValueError(
@@ -939,11 +1125,10 @@ class RealXArm7(RobotInterface):
         tolerance = float(tolerance)
         if tolerance <= 0.0:
             raise ValueError("tolerance must be positive")
-        if mask.all():
+        if until is not None and not callable(until):
             raise ValueError(
-                "every joint is free, so there is nothing to watch — that is "
-                "the controller's own drag-teach, and `arm.set_mode(2)` is all "
-                "it takes"
+                "until must be callable and take no arguments — it is asked "
+                "once a tick whether the run is over"
             )
         confirm = hands_off_prompt if confirm is None else confirm
 
@@ -977,14 +1162,14 @@ class RealXArm7(RobotInterface):
             )
 
         if verbose:
-            self._free_drive_banner(mask, tolerance, rate, teach_sensitivity)
+            self._free_drive_banner(mask, duration, tolerance, rate, until)
 
         try:
             self._ensure_mode(MODE_TEACH)
             reason = self._free_drive_loop(
                 mask=mask, duration=duration, period=period, tolerance=tolerance,
                 recover_speed=recover_speed, q_latched=q_latched, confirm=confirm,
-                on_sample=on_sample, verbose=verbose, run=run,
+                until=until, on_sample=on_sample, verbose=verbose, run=run,
             )
         except KeyboardInterrupt:
             # Deliberately swallowed rather than re-raised: Ctrl-C is how a run
@@ -1022,24 +1207,35 @@ class RealXArm7(RobotInterface):
             return "count", count
         return "state", tuple(self.joint_values)
 
-    def _free_drive_banner(self, mask, tolerance, rate, teach_sensitivity):
+    def _free_drive_banner(self, mask, duration, tolerance, rate, until):
         """Say what the run is about to do. Cheap to print, expensive to
         discover halfway through a lab."""
-        free = np.flatnonzero(mask).tolist()
-        locked = np.flatnonzero(~mask).tolist()
-        sensitivity = (
-            self.arm.teach_sensitivity if teach_sensitivity is None
-            else teach_sensitivity
-        )
+        watched = np.flatnonzero(~mask).tolist()
+        print("[xarm7] free drive (joint teaching mode): every joint is free")
+        if watched:
+            names = ", ".join(self.joint_names[i] for i in watched)
+            print(
+                f"        watching {names} — pushed more than "
+                f"{np.degrees(tolerance):.1f} deg off and the run stops to put "
+                "them back"
+            )
+        ends = "no time limit" if np.isinf(duration) else f"{duration:g} s"
+        stops = ["Ctrl-C"]
+        if until is not None:
+            stops.insert(0, "the caller's `until`")
         print(
-            f"[xarm7] free drive (joint teaching mode)"
+            f"        {ends}, sampling at {rate:.0f} Hz; "
+            f"{' or '.join(stops)} ends it early"
         )
 
     def _free_drive_loop(self, *, mask, duration, period, tolerance,
-                         recover_speed, q_latched, confirm, on_sample,
+                         recover_speed, q_latched, confirm, until, on_sample,
                          verbose, run):
         """Sample the arm and watch the locked joints. Returns why it ended."""
         warn_at = tolerance * LOCKED_WARN_FRACTION
+        # Nothing watched is the default, and then the drift check has nothing
+        # to compare: the loop is there to record and to check the guard.
+        watching = bool((~mask).any())
         started = time.monotonic()
         next_tick = started + period
         last = started
@@ -1082,6 +1278,8 @@ class RealXArm7(RobotInterface):
             run["qd"].append(self.joint_velocities)
             if on_sample is not None and on_sample(now - started, q.copy()):
                 return "stopped by the caller"
+            if until is not None and until():
+                return getattr(until, "reason", "stopped by `until`")
 
             # Checked whether or not anyone is watching the terminal: this is
             # the one thing in the run that ends it rather than reporting it.
@@ -1095,6 +1293,16 @@ class RealXArm7(RobotInterface):
                     verbose=verbose,
                 )
             q_safe = q
+
+            if not watching:
+                next_tick += period
+                sleep = next_tick - time.monotonic()
+                if sleep > 0:
+                    time.sleep(sleep)
+                else:
+                    run["overruns"] += 1
+                    next_tick = time.monotonic()
+                continue
 
             drift = np.abs(q - q_latched)
             drift[mask] = 0.0
