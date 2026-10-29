@@ -1045,11 +1045,12 @@ class RealXArm7(RobotInterface):
                 so that a run holding part of the arm has to say so.
             until: called with no arguments once per tick; return something
                 truthy to end the run. `stop_on_enter()` is the one for "go
-                until somebody presses Enter", and reads stdin on its own
-                thread so that waiting doesn't stop the watching. Like
-                `on_sample`, it runs inside the loop and must return quickly.
-                A `reason` attribute on it, if there is one, is what
-                `Trajectory.reason` will say.
+                until somebody presses Enter": it peeks at the terminal rather
+                than reading it, so waiting doesn't stop the watching and the
+                run leaves nothing behind holding stdin. Like `on_sample`, it
+                runs inside the loop and must return quickly. A `reason`
+                attribute on it, if there is one, is what `Trajectory.reason`
+                will say.
             tolerance: rad a watched joint may drift before the run puts it
                 back. Below about 0.02 rad ordinary handling of the free joints
                 trips it through the arm's own structure. Unused if nothing is
@@ -1068,8 +1069,9 @@ class RealXArm7(RobotInterface):
                 on its own — a watched joint put back, or a step back inside the
                 guard — and must not return until it is safe for it to. Return
                 True to carry on, False to end the run. Defaults to a terminal
-                prompt, which shares stdin with `stop_on_enter` rather than
-                fighting it for lines.
+                prompt, which ignores anything typed before it went up — a
+                newline meant for `stop_on_enter` cannot answer a hands-off
+                warning on behalf of someone still holding the arm.
             on_sample: called as `on_sample(t, q)` after every recorded tick,
                 for live plotting or a caller's own stop condition. Return
                 something truthy to end the run. It runs inside the watch loop,

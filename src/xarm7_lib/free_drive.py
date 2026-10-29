@@ -36,9 +36,10 @@ after it has been parked outside it.
 """
 
 import dataclasses
-import queue
+import io
+import os
+import select
 import sys
-import threading
 
 import numpy as np
 
@@ -151,84 +152,89 @@ def watch_mask(watch, nq=7):
     return ~watched
 
 
-# One reader for the process: stdin cannot be shared by two threads blocked on
-# it, and a run that both waits for Enter to stop and prompts for hands-off
-# needs both of those lines to come from the same place. Created on demand by
-# `stop_on_enter`, so a run that doesn't ask for one starts no thread.
-_STDIN = None
+# Watching the terminal without owning it. The condition `stop_on_enter`
+# hands back is asked once a tick by the watch loop, and it *peeks* at stdin
+# with `select` rather than reading it: nothing is waiting on stdin between
+# ticks, and nothing at all is once the run is over.
+#
+# A reader thread is the obvious way to do this and the wrong one. A thread
+# blocked in `readline` goes on owning stdin after the run that started it has
+# ended, there is no portable way to call it back, and in an interactive
+# session the next thing typed at the prompt disappears into it instead of
+# reaching Python.
+_STDIN_EOF = False
+_STDIN_BUFFER = bytearray()
 
 
-class _StdinReader:
-    """A daemon thread turning stdin into a queue of lines.
+def _stdin_fd():
+    """stdin's file descriptor, or None if it hasn't got one.
 
-    A daemon, so neither an abandoned stop condition nor a line nobody ever
-    types can keep the interpreter from exiting.
+    A notebook kernel or an IDE console replaces `sys.stdin` with an object
+    that has no descriptor to select on. Worth saying plainly rather than
+    crashing over.
     """
+    try:
+        fd = sys.stdin.fileno()
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        return None
+    return fd if fd >= 0 else None
 
-    def __init__(self):
-        self._lines = queue.Queue()
-        self._eof = threading.Event()
-        self._thread = threading.Thread(
-            target=self._read, name="xarm7-stdin", daemon=True
-        )
-        self._thread.start()
 
-    def _read(self):
-        while True:
-            try:
-                line = sys.stdin.readline()
-            except (ValueError, OSError):
-                # stdin closed under us; nothing more will ever arrive.
-                line = ""
-            if line == "":
-                self._eof.set()
-                return
-            self._lines.put(line)
+def _stdin_waiting(fd):
+    """Whether stdin has anything to read this instant.
 
-    @property
-    def at_eof(self):
-        return self._eof.is_set() and self._lines.empty()
+    Raises if `select` cannot answer for this kind of descriptor, which on
+    Windows is most of them.
+    """
+    return bool(select.select([fd], [], [], 0.0)[0])
 
-    def pending(self):
-        """True if a line has been typed since this was last asked. Consumes
-        it, so the same Enter cannot both stop a run and answer a prompt."""
+
+def _stdin_take_line(fd):
+    """True if a whole line has been typed since this was last asked.
+
+    Consumes that line, so one Enter cannot both stop a run and answer a
+    prompt. Reads the descriptor rather than `sys.stdin`, which would block
+    on a partial line and would hide what it had read in a buffer of its own
+    where a later `input()` could not reach it.
+    """
+    global _STDIN_EOF
+    while not _STDIN_EOF:
         try:
-            self._lines.get_nowait()
-        except queue.Empty:
-            return False
-        return True
+            if not _stdin_waiting(fd):
+                break
+            chunk = os.read(fd, 4096)
+        except (OSError, ValueError):
+            _STDIN_EOF = True
+            break
+        if not chunk:
+            _STDIN_EOF = True
+            break
+        _STDIN_BUFFER.extend(chunk)
 
-    def wait(self, prompt):
-        """Print `prompt` and block for a *fresh* line. Raises EOFError if
-        stdin is finished.
+    if b"\n" not in _STDIN_BUFFER:
+        return False
+    del _STDIN_BUFFER[: _STDIN_BUFFER.index(b"\n") + 1]
+    return True
 
-        Anything typed before the prompt went up is dropped: a stray newline
-        sitting in the queue must not answer a hands-off warning on behalf of
-        someone whose hands are still on the arm.
-        """
-        while self.pending():
-            pass
-        if self.at_eof:
-            raise EOFError("stdin is closed")
-        print(prompt, end="", flush=True)
-        while True:
-            try:
-                return self._lines.get(timeout=0.2)
-            except queue.Empty:
-                if self.at_eof:
-                    raise EOFError("stdin is closed") from None
+
+def drain_terminal():
+    """Throw away anything typed but not yet read.
+
+    For a prompt that must not be answered by a newline from earlier — "take
+    your hands off the robot" above all.
+    """
+    fd = _stdin_fd()
+    if fd is None:
+        return
+    while _stdin_take_line(fd):
+        pass
+    _STDIN_BUFFER.clear()
 
 
 def read_line(prompt=""):
-    """Read one line from the terminal, from whichever reader owns stdin.
-
-    Plain `input` while nothing else is reading stdin. Once `stop_on_enter` has
-    put a thread on it, through that thread instead — two readers blocked on
-    stdin at once means a prompt that hangs while the other one eats the line.
-    """
-    if _STDIN is None:
-        return input(prompt)
-    return _STDIN.wait(prompt)
+    """Prompt for a line at the terminal, ignoring anything typed before now."""
+    drain_terminal()
+    return input(prompt)
 
 
 def stop_on_enter(announce=True):
@@ -236,38 +242,62 @@ def stop_on_enter(announce=True):
 
         robot.free_drive(None, until=stop_on_enter())
 
-    Returns a callable the watch loop asks once a tick. It reads stdin on a
-    background thread, so the loop keeps watching and recording while it waits
-    — unlike `input()`, which would stop both. Ctrl-C still ends a run too;
-    this is for the student who shouldn't have to reach for it.
+    Returns a callable the watch loop asks once a tick. It peeks at the
+    terminal instead of reading it, so the arm goes on being sampled and
+    watched while it waits — and so the run leaves nothing behind holding
+    stdin, which in an interactive session would swallow the next thing typed
+    at the prompt. Ctrl-C still ends a run too; this is for the student who
+    shouldn't have to reach for it.
 
-    Pressing Enter at any other prompt — the hands-off warning, say — does not
-    stop the run: whichever asked first consumes the line.
+    Enter pressed at a prompt the run puts up — the hands-off warning — does
+    not also stop the run: that prompt ignores anything typed before it.
+
+    Anything typed before the condition is made is dropped, so a run started
+    by pressing Enter is not stopped by the same keystroke.
 
     `announce` prints the one-line instruction. Pass False if your own banner
-    already says it. Set `reason` on the returned object to change what
-    `Trajectory.reason` ends up saying.
+    already says it. `reason` on the returned object is what
+    `Trajectory.reason` will say.
     """
-    global _STDIN
-    if _STDIN is None:
-        _STDIN = _StdinReader()
-    reader = _STDIN
+    fd = _stdin_fd()
+    if fd is None:
+        unusable = "stdin has no file descriptor here"
+    else:
+        try:
+            _stdin_waiting(fd)
+        except (OSError, ValueError):
+            unusable = "stdin cannot be polled on this platform"
+        else:
+            _stdin_take_line(fd)
+            unusable = "stdin is closed" if _STDIN_EOF else None
 
-    if not sys.stdin.isatty():
-        # Worth saying plainly: with `duration=None` as well, nothing would
-        # ever end the run but Ctrl-C.
+    if unusable is not None:
+        # Say so now: with `duration=None` as well, nothing would be left to
+        # end the run.
         print(
-            "[xarm7] stdin is not a terminal, so Enter will never be seen — "
-            "the run will need its duration or Ctrl-C to end"
+            f"[xarm7] {unusable}, so Enter will never be seen — this run needs "
+            "its duration, another stop condition, or Ctrl-C to end"
         )
-    elif announce:
+
+        class _NeverStops:
+            reason = "stopped by Enter at the terminal"
+
+            def __call__(self):
+                return False
+
+            def __repr__(self):
+                return "stop_on_enter() [the terminal cannot be watched]"
+
+        return _NeverStops()
+
+    if announce:
         print("[xarm7] press Enter to stop the run")
 
     class _EnterStop:
         reason = "stopped by Enter at the terminal"
 
         def __call__(self):
-            return reader.pending()
+            return _stdin_take_line(fd)
 
         def __repr__(self):
             return "stop_on_enter()"
@@ -396,7 +426,6 @@ class Trajectory:
 
 if __name__ == "__main__":
     import argparse
-    import os
 
     from .xarm7_real import MODE_POSITION, MODE_TEACH, RealXArm7
 

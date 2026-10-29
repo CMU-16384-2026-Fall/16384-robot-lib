@@ -143,8 +143,10 @@ traj = robot.free_drive(None, until=stop_on_enter())
 ```
 
 `until=` is asked once a tick and ends the run as soon as it returns something
-truthy. `stop_on_enter()` reads the terminal on a background thread, so the arm
-goes on being sampled and watched while it waits — which `input()` would not.
+truthy. `stop_on_enter()` peeks at the terminal rather than reading it, so the
+arm goes on being sampled and watched while it waits — which `input()` would
+not — and so the run hands stdin back when it ends, instead of leaving a reader
+to swallow the next thing you type at a `>>>` prompt.
 `on_sample=lambda t, q: ...` is the same idea with the sample in hand, for
 stopping when joint4 passes some angle or when a recording is long enough.
 
