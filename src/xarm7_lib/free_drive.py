@@ -1,15 +1,16 @@
 """Tunables and data types for `RealXArm7.free_drive`.
 
-Free drive lets a person push the arm around by hand while a chosen subset of
-joints is supposed to stay put. The controller has one mode for hand-guiding —
-joint teaching, `set_mode(2)` — and it frees all seven joints at once. There is
-no way to tell it to hold four of them.
+Free drive lets a person push the arm around by hand and records where they
+took it. Every joint is free unless you ask for otherwise, which is also all
+the controller can do: its one hand-guiding mode — joint teaching,
+`set_mode(2)` — frees all seven joints at once and gravity-compensates the arm,
+and there is no way to tell it to hold some of them.
 
-So the four are not locked, they are *watched*. The arm sits in joint teaching
-mode with everything free and gravity-compensated by the controller, and the
-loop in `xarm7_real.py` reads the joint positions and compares the watched ones
-against the values latched when the run started. Past `tolerance` on any of
-them the run interrupts itself: back to position control, which stiffens the
+`watch=` is for the joints that are meant to stay put anyway. They are not
+locked, they are *watched*. The arm still sits in joint teaching mode with
+everything free, and the loop in `xarm7_real.py` reads the joint positions and
+compares the watched ones against the values latched when the run started. Past
+`tolerance` on any of them the run interrupts itself: back to position control, which stiffens the
 arm where it stands, a prompt asking the person to let go, then a slow move
 that puts the watched joints back on their latched values, then back to
 teaching. The recording continues afterwards with a gap in it.
@@ -29,12 +30,15 @@ Nothing here needs a robot — the constants you tune, the mask arithmetic, the
 trajectory the loop hands back — so it can be read and changed without one.
 
 Running this module (`python -m xarm7_lib.free_drive`) does none of it. That is
-the plain drag-teach underneath: mode 2, nothing watched, nothing recorded and
-the guard off, for checking the link to the arm and for pushing one back inside
-the safety box after it has been parked outside it.
+the plain drag-teach underneath: mode 2, nothing recorded and the guard off, for
+checking the link to the arm and for pushing one back inside the safety box
+after it has been parked outside it.
 """
 
 import dataclasses
+import queue
+import sys
+import threading
 
 import numpy as np
 
@@ -86,52 +90,189 @@ HOME_POSE = (
     0.0,              # joint7,   0 deg   free
 )
 FREE_JOINTS = (0, 3, 6)  # 0-indexed: joint1, joint4, joint7
+WATCHED_JOINTS = (1, 2, 4, 5)  # the other four: what `HOME_POSE` is defined by,
+# and so what `free_drive(watch=)` wants to be given to hold that pose
 
 
-def free_mask(free, nq=7):
-    """Turn a set of joint indices into a boolean mask, (nq,).
+def watch_mask(watch, nq=7):
+    """Turn the joints to watch into the free mask the loop uses, (nq,).
 
-    `free` is a sequence of **0-indexed** joint numbers — `[0, 1, 3]` frees
-    joint1, joint2 and joint4 — or a length-`nq` boolean array. Joint names are
-    deliberately not accepted: the SDK's own `servo_id` is 1-indexed, and the
-    one thing worth being loud about here is which convention applies.
+    Returns a boolean array in which True means *free* — the sense the watch
+    loop wants — so `watch_mask(())` is all True and nothing is watched.
+
+    `watch` is a sequence of **0-indexed** joint numbers to watch — `[1, 2]`
+    watches joint2 and joint3 and frees the other five — or a length-`nq`
+    boolean array in which True means watched. None and `()` watch nothing.
+    Joint names are deliberately not accepted: the SDK's own `servo_id` is
+    1-indexed, and the one thing worth being loud about here is which
+    convention applies.
 
     A duplicate index is an error rather than something to quietly drop, since
     it usually means the caller miscounted.
     """
-    array = np.asarray(free)
+    if watch is None:
+        return np.ones(nq, dtype=bool)
+
+    array = np.asarray(watch)
     if array.dtype == bool:
         if array.shape != (nq,):
             raise ValueError(
                 f"a boolean mask must have {nq} entries, got shape {array.shape}"
             )
-        mask = array.copy()
-        if not mask.any():
-            raise ValueError("no joints are free; free drive would only hold position")
-        return mask
+        watched = array.copy()
+    else:
+        indices = []
+        for value in np.atleast_1d(array).tolist():
+            if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
+                raise ValueError(
+                    f"joint indices must be integers, got {value!r} "
+                    f"({type(value).__name__})"
+                )
+            index = int(value)
+            if not 0 <= index < nq:
+                raise ValueError(
+                    f"joint index {index} is out of range for a {nq}-joint arm. "
+                    f"Joints are 0-indexed here, so joint{nq} is index {nq - 1}."
+                )
+            if index in indices:
+                raise ValueError(
+                    f"duplicate joint index {index} in watch={list(watch)!r}"
+                )
+            indices.append(index)
 
-    indices = []
-    for value in np.atleast_1d(array).tolist():
-        if isinstance(value, bool) or not isinstance(value, (int, np.integer)):
-            raise ValueError(
-                f"joint indices must be integers, got {value!r} ({type(value).__name__})"
-            )
-        index = int(value)
-        if not 0 <= index < nq:
-            raise ValueError(
-                f"joint index {index} is out of range for a {nq}-joint arm. "
-                f"Joints are 0-indexed here, so joint{nq} is index {nq - 1}."
-            )
-        if index in indices:
-            raise ValueError(f"duplicate joint index {index} in free={list(free)!r}")
-        indices.append(index)
+        watched = np.zeros(nq, dtype=bool)
+        watched[indices] = True
 
-    if not indices:
-        raise ValueError("free is empty; free drive would only hold position")
+    if watched.all():
+        raise ValueError(
+            "every joint is watched, so there is nothing to push — free drive "
+            "would only hold position"
+        )
+    return ~watched
 
-    mask = np.zeros(nq, dtype=bool)
-    mask[indices] = True
-    return mask
+
+# One reader for the process: stdin cannot be shared by two threads blocked on
+# it, and a run that both waits for Enter to stop and prompts for hands-off
+# needs both of those lines to come from the same place. Created on demand by
+# `stop_on_enter`, so a run that doesn't ask for one starts no thread.
+_STDIN = None
+
+
+class _StdinReader:
+    """A daemon thread turning stdin into a queue of lines.
+
+    A daemon, so neither an abandoned stop condition nor a line nobody ever
+    types can keep the interpreter from exiting.
+    """
+
+    def __init__(self):
+        self._lines = queue.Queue()
+        self._eof = threading.Event()
+        self._thread = threading.Thread(
+            target=self._read, name="xarm7-stdin", daemon=True
+        )
+        self._thread.start()
+
+    def _read(self):
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except (ValueError, OSError):
+                # stdin closed under us; nothing more will ever arrive.
+                line = ""
+            if line == "":
+                self._eof.set()
+                return
+            self._lines.put(line)
+
+    @property
+    def at_eof(self):
+        return self._eof.is_set() and self._lines.empty()
+
+    def pending(self):
+        """True if a line has been typed since this was last asked. Consumes
+        it, so the same Enter cannot both stop a run and answer a prompt."""
+        try:
+            self._lines.get_nowait()
+        except queue.Empty:
+            return False
+        return True
+
+    def wait(self, prompt):
+        """Print `prompt` and block for a *fresh* line. Raises EOFError if
+        stdin is finished.
+
+        Anything typed before the prompt went up is dropped: a stray newline
+        sitting in the queue must not answer a hands-off warning on behalf of
+        someone whose hands are still on the arm.
+        """
+        while self.pending():
+            pass
+        if self.at_eof:
+            raise EOFError("stdin is closed")
+        print(prompt, end="", flush=True)
+        while True:
+            try:
+                return self._lines.get(timeout=0.2)
+            except queue.Empty:
+                if self.at_eof:
+                    raise EOFError("stdin is closed") from None
+
+
+def read_line(prompt=""):
+    """Read one line from the terminal, from whichever reader owns stdin.
+
+    Plain `input` while nothing else is reading stdin. Once `stop_on_enter` has
+    put a thread on it, through that thread instead — two readers blocked on
+    stdin at once means a prompt that hangs while the other one eats the line.
+    """
+    if _STDIN is None:
+        return input(prompt)
+    return _STDIN.wait(prompt)
+
+
+def stop_on_enter(announce=True):
+    """A `free_drive(until=)` condition that fires when Enter is pressed.
+
+        robot.free_drive(None, until=stop_on_enter())
+
+    Returns a callable the watch loop asks once a tick. It reads stdin on a
+    background thread, so the loop keeps watching and recording while it waits
+    — unlike `input()`, which would stop both. Ctrl-C still ends a run too;
+    this is for the student who shouldn't have to reach for it.
+
+    Pressing Enter at any other prompt — the hands-off warning, say — does not
+    stop the run: whichever asked first consumes the line.
+
+    `announce` prints the one-line instruction. Pass False if your own banner
+    already says it. Set `reason` on the returned object to change what
+    `Trajectory.reason` ends up saying.
+    """
+    global _STDIN
+    if _STDIN is None:
+        _STDIN = _StdinReader()
+    reader = _STDIN
+
+    if not sys.stdin.isatty():
+        # Worth saying plainly: with `duration=None` as well, nothing would
+        # ever end the run but Ctrl-C.
+        print(
+            "[xarm7] stdin is not a terminal, so Enter will never be seen — "
+            "the run will need its duration or Ctrl-C to end"
+        )
+    elif announce:
+        print("[xarm7] press Enter to stop the run")
+
+    class _EnterStop:
+        reason = "stopped by Enter at the terminal"
+
+        def __call__(self):
+            return reader.pending()
+
+        def __repr__(self):
+            return "stop_on_enter()"
+
+    return _EnterStop()
 
 
 def hands_off_prompt(message):
@@ -143,7 +284,7 @@ def hands_off_prompt(message):
     """
     print(message)
     try:
-        input("        press Enter when your hands are clear: ")
+        read_line("        press Enter when your hands are clear: ")
     except EOFError:
         print("        (nothing on stdin to answer with; ending the run)")
         return False
@@ -160,7 +301,8 @@ class Trajectory:
     kinematics or Jacobian check should be run against.
 
     `interruptions` is how many times a watched joint drifted past tolerance and
-    the run stopped to put it back. Nothing is sampled while that happens, so
+    the run stopped to put it back — always zero for a run that watched nothing,
+    which is the default. Nothing is sampled while that happens, so
     each one leaves a **gap in `t`** — consecutive samples either side of a gap
     are seconds apart and the arm moved under its own power in between. If
     `interruptions` is zero the sampling is uniform and there is nothing to
@@ -205,6 +347,12 @@ class Trajectory:
     def free_indices(self):
         """The joints that were free, as 0-indexed numbers."""
         return np.flatnonzero(self.free).tolist()
+
+    @property
+    def watched_indices(self):
+        """The joints that were watched, as 0-indexed numbers. Empty unless
+        the run was given `watch=`."""
+        return np.flatnonzero(~self.free).tolist()
 
     def as_dict(self):
         """Just the three arrays, for `np.savez` or a DataFrame."""
@@ -256,10 +404,10 @@ if __name__ == "__main__":
         prog="python -m xarm7_lib.free_drive",
         description=(
             "Release every joint so the arm can be pushed by hand, then lock "
-            "it wherever you left it. Nothing is watched, nothing is recorded "
-            "and the guard is off — which is what makes this the way to move "
-            "an arm that started somewhere the guard would not allow. For a "
-            "run that holds some joints and records the result, call "
+            "it wherever you left it. Nothing is recorded and the guard is "
+            "off — which is what makes this the way to move an arm that "
+            "started somewhere the guard would not allow. For a run that is "
+            "recorded, guarded, and can hold some joints, call "
             "`Robot.free_drive` from your own script."
         )
     )

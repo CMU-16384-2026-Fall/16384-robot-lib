@@ -15,8 +15,10 @@ from .free_drive import (
     FREE_JOINTS,
     HOME_POSE,
     LOCKED_TOLERANCE,
+    WATCHED_JOINTS,
     Trajectory,
-    free_mask,
+    stop_on_enter,
+    watch_mask,
 )
 from .gripper import (
     GRIPPER_CLOSED,
@@ -52,8 +54,10 @@ __all__ = [
     "SafetyGuard",
     "SimulatedXArm7",
     "Trajectory",
+    "WATCHED_JOINTS",
     "Violation",
     "XArmError",
     "__version__",
-    "free_mask",
+    "stop_on_enter",
+    "watch_mask",
 ]

@@ -1,7 +1,6 @@
 import os
 
 from .api import RobotInterface
-from .free_drive import FREE_JOINTS
 from .gripper import GRIPPER_CLOSED
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN
 from .xarm7_mujoco import SimulatedXArm7
@@ -75,18 +74,20 @@ class Robot(RobotInterface):
         self.close()
         return False
 
-    def free_drive(self, free=FREE_JOINTS, duration=30.0, **options):
+    def free_drive(self, duration=30.0, **options):
         """Hand-guide the arm and record where it went.
 
-        Real arm only, and deliberately so: there is nothing to push in
-        simulation. See `RealXArm7.free_drive` for the options.
+        Every joint is free unless `watch=` says otherwise, and `duration=None`
+        runs until something stops it. Real arm only, and deliberately so:
+        there is nothing to push in simulation. See `RealXArm7.free_drive` for
+        the options.
         """
         if not hasattr(self.robot, "free_drive"):
             raise NotImplementedError(
                 "free drive needs the real arm — there is nothing to push in "
                 "simulation. Set ROBOT_IP and construct Robot() without sim=True."
             )
-        return self.robot.free_drive(free, duration, **options)
+        return self.robot.free_drive(duration, **options)
 
 
 if __name__ == '__main__':

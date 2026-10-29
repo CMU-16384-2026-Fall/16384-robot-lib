@@ -80,7 +80,6 @@ from xarm.wrapper import XArmAPI
 from .api import RobotInterface
 from .free_drive import (
     FREE_DRIVE_RATE,
-    FREE_JOINTS,
     LOCKED_TOLERANCE,
     LOCKED_WARN_FRACTION,
     RATE_LIMITS,
@@ -90,8 +89,8 @@ from .free_drive import (
     STALL_ABORT,
     WARN_PERIOD,
     Trajectory,
-    free_mask,
     hands_off_prompt,
+    watch_mask,
 )
 from .gripper import (
     GRIPPER_CLOSED,
@@ -995,9 +994,10 @@ class RealXArm7(RobotInterface):
 
     def free_drive(
         self,
-        free=FREE_JOINTS,
         duration=30.0,
         *,
+        watch=(),
+        until=None,
         tolerance=LOCKED_TOLERANCE,
         rate=FREE_DRIVE_RATE,
         recover_speed=RECOVER_SPEED,
@@ -1009,10 +1009,16 @@ class RealXArm7(RobotInterface):
         """Let a person push the arm by hand, and record where they took it.
 
         This runs the controller's own joint teaching mode, which frees **every**
-        joint and gravity-compensates the arm. There is no per-joint version of
-        it, so the joints outside `free` are not held — they are watched. Their
-        positions are latched before the run starts, and if one of them drifts
-        more than `tolerance` off its latched value the run interrupts itself:
+        joint and gravity-compensates the arm. By default that is the whole run:
+        the arm goes wherever it is pushed, the loop samples it, and the
+        recording is what you get back. The safety guard is still checked every
+        tick — see below.
+
+        `watch` is for joints that are meant to stay put. Teaching mode has no
+        per-joint version, so the joints named there are not held — they are
+        watched. Their positions are latched before the run starts, and if one
+        of them drifts more than `tolerance` off its latched value the run
+        interrupts itself:
 
             1. back to position control, which stiffens the arm where it stands;
             2. `confirm` asks the person to take their hands off, and waits;
@@ -1026,34 +1032,49 @@ class RealXArm7(RobotInterface):
         interruption leaves a gap in the returned `t` — see `Trajectory`.
 
         Args:
-            free: which joints to release *and mean it*, as **0-indexed** joint
-                numbers — `[0, 3, 6]` is joint1, joint4 and joint7 — or a
-                length-7 boolean mask. The rest are watched. Defaults to
-                `FREE_JOINTS`, the three the lab's `HOME_POSE` is built around.
-            duration: seconds of teaching to run for. Time spent stopped for an
-                interruption doesn't count against it. Ctrl-C ends the run early
-                and still returns everything recorded up to that point.
+            duration: seconds of teaching to run for, or None for no limit —
+                then only `until`, `on_sample`, Ctrl-C, the guard or a fault
+                ends the run. Time spent stopped for an interruption doesn't
+                count against it. Ctrl-C ends a run early and still returns
+                everything recorded up to that point.
+            watch: which joints to watch, as **0-indexed** joint numbers —
+                `[1, 2]` is joint2 and joint3 — or a length-7 boolean mask in
+                which True means watched. Defaults to watching nothing: every
+                joint is free and the arm is simply recorded. `WATCHED_JOINTS`
+                is the four the lab's `HOME_POSE` is defined by. Keyword-only,
+                so that a run holding part of the arm has to say so.
+            until: called with no arguments once per tick; return something
+                truthy to end the run. `stop_on_enter()` is the one for "go
+                until somebody presses Enter", and reads stdin on its own
+                thread so that waiting doesn't stop the watching. Like
+                `on_sample`, it runs inside the loop and must return quickly.
+                A `reason` attribute on it, if there is one, is what
+                `Trajectory.reason` will say.
             tolerance: rad a watched joint may drift before the run puts it
                 back. Below about 0.02 rad ordinary handling of the free joints
-                trips it through the arm's own structure.
-            rate: how often the watched joints are checked, Hz, 20 to 250.
-                Nothing is commanded at this rate — it is a sampling rate, and
-                the report stream underneath it is what really limits how soon
-                a drift is seen.
-            recover_speed: rad/s for the move that puts a watched joint back.
+                trips it through the arm's own structure. Unused if nothing is
+                watched.
+            rate: how often the arm is sampled, Hz, 20 to 250. Nothing is
+                commanded at this rate — it is a sampling rate, and the report
+                stream underneath it is what really limits how soon a drift or
+                a guard violation is seen.
+            recover_speed: rad/s for the move that puts a watched joint back,
+                and for the step back inside the guard.
             teach_sensitivity: 1-5 to apply for the duration and restore
                 afterwards, or None to leave the controller's own setting alone.
                 Higher is easier to push. UFACTORY's advice is not to touch it
                 unless the arm is hard to move.
-            confirm: called with the hands-off warning when a watched joint has
-                to be put back, and must not return until it is safe for the arm
-                to move. Return True to carry on, False to end the run. Defaults
-                to a terminal prompt.
+            confirm: called with the hands-off warning when the arm has to move
+                on its own — a watched joint put back, or a step back inside the
+                guard — and must not return until it is safe for it to. Return
+                True to carry on, False to end the run. Defaults to a terminal
+                prompt, which shares stdin with `stop_on_enter` rather than
+                fighting it for lines.
             on_sample: called as `on_sample(t, q)` after every recorded tick,
                 for live plotting or a caller's own stop condition. Return
                 something truthy to end the run. It runs inside the watch loop,
                 so it must return quickly — time spent in it is time nothing is
-                watching the locked joints, and past `STALL_ABORT` the run ends.
+                watching, and past `STALL_ABORT` the run ends.
             verbose: print the banner and the running warnings. The guard is
                 checked either way — it ends the run rather than reporting it.
 
@@ -1062,8 +1083,9 @@ class RealXArm7(RobotInterface):
             `reason` saying why the run ended and `interruptions` saying how many
             gaps are in it.
 
-        Raises ValueError for a malformed `free`, and `SafetyError` if the arm is
-        somewhere the guard won't allow before the run even starts.
+        Raises ValueError for a malformed `watch` or `duration`, and
+        `SafetyError` if the arm is somewhere the guard won't allow before the
+        run even starts.
 
         The guard cannot *refuse* anything during the run — the person's hand
         is not a command — so a self-collision or a step outside the safety box
@@ -1078,10 +1100,21 @@ class RealXArm7(RobotInterface):
         outside the box would refuse every move afterwards. `reason` says what
         was hit; everything recorded up to it is returned as usual.
         """
-        mask = free_mask(free, self.nq)
-        duration = float(duration)
-        if duration <= 0.0:
-            raise ValueError("duration must be positive")
+        mask = watch_mask(watch, self.nq)
+        try:
+            duration = np.inf if duration is None else float(duration)
+        except TypeError:
+            # The old signature took the joints first. Someone porting a script
+            # gets this rather than a run that quietly means something else.
+            raise ValueError(
+                f"duration must be a number of seconds or None, not "
+                f"{duration!r} — joints go in `watch=`, and they are the ones "
+                "to *hold*, not the ones to free"
+            ) from None
+        # `not > 0` rather than `<= 0`, so a NaN duration is caught here rather
+        # than becoming a run that never reaches its own deadline.
+        if not duration > 0.0:
+            raise ValueError("duration must be positive, or None for no limit")
         rate = float(rate)
         if not RATE_LIMITS[0] <= rate <= RATE_LIMITS[1]:
             raise ValueError(
@@ -1090,11 +1123,10 @@ class RealXArm7(RobotInterface):
         tolerance = float(tolerance)
         if tolerance <= 0.0:
             raise ValueError("tolerance must be positive")
-        if mask.all():
+        if until is not None and not callable(until):
             raise ValueError(
-                "every joint is free, so there is nothing to watch — that is "
-                "the controller's own drag-teach, and `arm.set_mode(2)` is all "
-                "it takes"
+                "until must be callable and take no arguments — it is asked "
+                "once a tick whether the run is over"
             )
         confirm = hands_off_prompt if confirm is None else confirm
 
@@ -1128,14 +1160,14 @@ class RealXArm7(RobotInterface):
             )
 
         if verbose:
-            self._free_drive_banner(mask, tolerance, rate, teach_sensitivity)
+            self._free_drive_banner(mask, duration, tolerance, rate, until)
 
         try:
             self._ensure_mode(MODE_TEACH)
             reason = self._free_drive_loop(
                 mask=mask, duration=duration, period=period, tolerance=tolerance,
                 recover_speed=recover_speed, q_latched=q_latched, confirm=confirm,
-                on_sample=on_sample, verbose=verbose, run=run,
+                until=until, on_sample=on_sample, verbose=verbose, run=run,
             )
         except KeyboardInterrupt:
             # Deliberately swallowed rather than re-raised: Ctrl-C is how a run
@@ -1173,24 +1205,35 @@ class RealXArm7(RobotInterface):
             return "count", count
         return "state", tuple(self.joint_values)
 
-    def _free_drive_banner(self, mask, tolerance, rate, teach_sensitivity):
+    def _free_drive_banner(self, mask, duration, tolerance, rate, until):
         """Say what the run is about to do. Cheap to print, expensive to
         discover halfway through a lab."""
-        free = np.flatnonzero(mask).tolist()
-        locked = np.flatnonzero(~mask).tolist()
-        sensitivity = (
-            self.arm.teach_sensitivity if teach_sensitivity is None
-            else teach_sensitivity
-        )
+        watched = np.flatnonzero(~mask).tolist()
+        print("[xarm7] free drive (joint teaching mode): every joint is free")
+        if watched:
+            names = ", ".join(self.joint_names[i] for i in watched)
+            print(
+                f"        watching {names} — pushed more than "
+                f"{np.degrees(tolerance):.1f} deg off and the run stops to put "
+                "them back"
+            )
+        ends = "no time limit" if np.isinf(duration) else f"{duration:g} s"
+        stops = ["Ctrl-C"]
+        if until is not None:
+            stops.insert(0, "the caller's `until`")
         print(
-            f"[xarm7] free drive (joint teaching mode)"
+            f"        {ends}, sampling at {rate:.0f} Hz; "
+            f"{' or '.join(stops)} ends it early"
         )
 
     def _free_drive_loop(self, *, mask, duration, period, tolerance,
-                         recover_speed, q_latched, confirm, on_sample,
+                         recover_speed, q_latched, confirm, until, on_sample,
                          verbose, run):
         """Sample the arm and watch the locked joints. Returns why it ended."""
         warn_at = tolerance * LOCKED_WARN_FRACTION
+        # Nothing watched is the default, and then the drift check has nothing
+        # to compare: the loop is there to record and to check the guard.
+        watching = bool((~mask).any())
         started = time.monotonic()
         next_tick = started + period
         last = started
@@ -1233,6 +1276,8 @@ class RealXArm7(RobotInterface):
             run["qd"].append(self.joint_velocities)
             if on_sample is not None and on_sample(now - started, q.copy()):
                 return "stopped by the caller"
+            if until is not None and until():
+                return getattr(until, "reason", "stopped by `until`")
 
             # Checked whether or not anyone is watching the terminal: this is
             # the one thing in the run that ends it rather than reporting it.
@@ -1246,6 +1291,16 @@ class RealXArm7(RobotInterface):
                     verbose=verbose,
                 )
             q_safe = q
+
+            if not watching:
+                next_tick += period
+                sleep = next_tick - time.monotonic()
+                if sleep > 0:
+                    time.sleep(sleep)
+                else:
+                    run["overruns"] += 1
+                    next_tick = time.monotonic()
+                continue
 
             drift = np.abs(q - q_latched)
             drift[mask] = 0.0

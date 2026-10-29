@@ -104,26 +104,99 @@ working and the guard stops at `link7`, as it did before there was a gripper.
 
 # Free drive
 
-Push the arm around by hand with only some of the joints meant to move, and
-record where it went. Real arm only — there is nothing to push in simulation.
-
-Put the arm at `HOME_POSE` first. The four locked joints are posed there so that
-gravity has no moment about joint1, joint4 or joint7 — those three carry
-nothing, wherever you drive them.
+Push the arm around by hand and record where it went. Real arm only — there is
+nothing to push in simulation.
 
 ```python
-from xarm7_lib import Robot, HOME_POSE
+from xarm7_lib import Robot
 robot = Robot()
-robot.set_joint_targets(HOME_POSE)
 
-# Frees joint1, joint4 and joint7; watches the other four.
-traj = robot.free_drive(duration=30)
+traj = robot.free_drive(30)   # 30 s of pushing, every joint free
 
 traj.q     # (N, 7) joint positions, rad
 traj.qd    # (N, 7) joint velocities, rad/s
 traj.t     # (N,)   seconds from the start
 traj.save("run.npz")
 ```
+
+Every joint is free unless you say otherwise. The arm runs in the controller's
+joint teaching mode, which releases all seven and holds the arm up against
+gravity, so it goes wherever it is pushed and stays where it is left.
+
+Ctrl-C ends a run early and still returns everything recorded up to that point;
+`traj.reason` says why it ended. However a run ends, the arm is put back into
+position control — it stays exactly where it was left, but it now resists being
+pushed instead of yielding.
+
+If the arm is hard to move, `teach_sensitivity=` (1-5) is the controller's own
+knob for that.
+
+## Running until something says stop
+
+`duration=None` takes the time limit off. Then it is up to you to end the run —
+Ctrl-C, or a condition:
+
+```python
+from xarm7_lib import stop_on_enter
+
+traj = robot.free_drive(None, until=stop_on_enter())
+```
+
+`until=` is asked once a tick and ends the run as soon as it returns something
+truthy. `stop_on_enter()` reads the terminal on a background thread, so the arm
+goes on being sampled and watched while it waits — which `input()` would not.
+`on_sample=lambda t, q: ...` is the same idea with the sample in hand, for
+stopping when joint4 passes some angle or when a recording is long enough.
+
+## Holding some of the joints
+
+`watch=` names the joints that are meant to stay put, 0-indexed:
+
+```python
+from xarm7_lib import Robot, HOME_POSE, WATCHED_JOINTS, stop_on_enter
+robot = Robot()
+robot.set_joint_targets(HOME_POSE)
+
+# Frees joint1, joint4 and joint7; watches the other four.
+traj = robot.free_drive(None, watch=WATCHED_JOINTS, until=stop_on_enter())
+```
+
+`HOME_POSE` and `WATCHED_JOINTS` go together: the four watched joints are posed
+there so that gravity has no moment about joint1, joint4 or joint7 — those
+three carry nothing, wherever you drive them. Put the arm at `HOME_POSE` first.
+
+### What "watched" means here
+
+There is no way to release only three joints, so the other four are not held —
+they are watched. Their positions are latched before the run starts, and if one
+drifts more than `tolerance` (0.05 rad, about 3°) the run stops to put it back:
+
+1. the arm stiffens where it stands,
+2. you are asked to take your hands off it, and it waits for you to say you have,
+3. it moves slowly to put the watched joints back, leaving the free ones alone,
+4. teaching resumes.
+
+So a watched joint is one the arm *returns to*, not one it refuses to leave. You
+will feel it move if you push it, and if you keep pushing you will be
+interrupted. Ease off when the warning appears and nothing stops.
+
+Each interruption leaves a gap in `traj.t` — the samples either side of it are
+seconds apart and the arm moved on its own in between. `traj.interruptions`
+counts them, and `np.diff(traj.t)` finds them. Time spent stopped doesn't count
+against `duration`.
+
+## The safety guard during a run
+
+Nothing can be *refused* while a person is pushing the arm — a hand is not a
+command — so the guard is checked after each sample rather than before a move.
+What it can do is stop the run: a pose it rejects ends the run there and then,
+the arm stiffens, and after a hands-off prompt it steps back to the last
+configuration the guard allowed. That last part matters beyond tidiness,
+because a guarded command checks the path from wherever the arm *is*: an arm
+left outside the box would refuse every move afterwards.
+
+From `HOME_POSE` the guard is happy with about ±88° on joint1, 99° on joint4
+and all the way round on joint7. `traj.reason` says what was hit.
 
 ## Pushing the arm around from a terminal
 
@@ -135,42 +208,9 @@ Releases every joint, waits for you to push the arm where you want it, and
 locks it there when you press Enter. It reads `$ROBOT_IP`, or takes an address
 as its argument.
 
-This is not `free_drive` above: nothing is watched, nothing is recorded, and
-the safety guard is off. That last part is the point of it — the guard refuses
-to start a run from a pose it would not allow, so if the arm is parked out of
-the safety box this is what gets it back in. It is also the quickest check that
+This is not `free_drive` above: nothing is recorded and the safety guard is
+off. That last part is the point of it — `free_drive` refuses to start a run
+from a pose the guard would not allow, so if the arm is parked out of the
+safety box this is what gets it back in. It is also the quickest check that
 your machine can talk to the controller at all: it connects, prints the joint
 angles, and doesn't move the arm anywhere on its own.
-
-## What "locked" means here
-
-The arm runs in the controller's joint teaching mode, which releases **all
-seven** joints and holds the arm up against gravity. There is no way to release
-only three, so the other four are not held — they are watched. Their positions
-are latched before the run starts, and if one drifts more than `tolerance`
-(0.05 rad, about 3°) the run stops to put it back:
-
-1. the arm stiffens where it stands,
-2. you are asked to take your hands off it, and it waits for you to say you have,
-3. it moves slowly to put the watched joints back, leaving the free ones alone,
-4. teaching resumes.
-
-So a locked joint is one the arm *returns to*, not one it refuses to leave. You
-will feel it move if you push it, and if you keep pushing you will be
-interrupted. Ease off when the warning appears and nothing stops.
-
-Each interruption leaves a gap in `traj.t` — the samples either side of it are
-seconds apart and the arm moved on its own in between. `traj.interruptions`
-counts them, and `np.diff(traj.t)` finds them. Time spent stopped doesn't count
-against `duration`.
-
-Ctrl-C ends a run early and still returns everything recorded up to that point;
-`traj.reason` says why it ended. However a run ends, the arm is put back into
-position control — it stays exactly where it was left, but it now resists being
-pushed instead of yielding, and the locked joints are held rather than watched.
-
-Nothing can be refused while a person is pushing the arm, so the safety guard
-only warns: from the home pose it is happy with about ±88° on joint1, 99° on
-joint4 and all the way round on joint7, and past that you get a message rather
-than a wall. If the arm is hard to move, `teach_sensitivity=` (1-5) is the
-controller's own knob for that.
