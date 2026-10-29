@@ -38,6 +38,70 @@ with Robot() as robot:
 The real arm is left stopped with its motors still holding: switching them off
 would let it fall under its own weight.
 
+# Gripper
+
+There is a UFACTORY xArm Gripper on the flange, driven with `grip`. Openings
+are a fraction of the jaws' travel — `0.0` shut, `1.0` wide open (about 85 mm
+between the fingers) — and speeds a fraction of the gripper's full speed:
+
+```python
+from xarm7_lib import Robot
+
+with Robot() as robot:
+    robot.grip(1.0)             # jaws wide open
+    robot.grip(0.0, speed=0.2)  # close slowly onto a part
+    robot.gripper_opening       # 0.31, say: as far as the part let them shut
+```
+
+`grip` blocks until the jaws stop moving and returns True when they have.
+Stopping is also what a successful grasp looks like — the jaws stall on the
+object instead of reaching the target — so `gripper_opening` is what tells the
+two apart: short of what you asked for means something is in there.
+
+The gripper is a separate device on a link of its own, so a grip doesn't touch
+the arm: it neither waits for the arm's current move nor cancels it, and the
+arm can be commanded while the jaws are still closing. `grip(..., wait=False)`
+returns immediately if you want both at once.
+
+The gripper itself is only talked to on the first grip, not on connect, so an
+arm with nothing bolted on still works; pass `gripper=False` to say so
+properly, which makes `grip` raise and takes the gripper back out of the safety
+guard as well.
+
+In simulation the jaws are the MJCF's own, and they can hold things. They are
+soft and heavily damped, though, so they settle onto the setpoint rather than
+snapping to it — a shut gripper reads a few hundredths above `0.0` rather than
+exactly `0.0`. Compare `gripper_opening` with a tolerance, not with `==`.
+
+## The gripper and the safety guard
+
+The guard in `safety.py` carries the gripper. It is in the guard's model as one
+convex envelope on the flange — the hull of the gripper over the jaws' whole
+travel — so the safety box and the self-collision check both stop the
+fingertips rather than `link7`, whatever the jaws happen to be doing. The hull
+closes over the gap between the jaws as well, which is where a held part sits:
+a part that fits in the jaws can't be taken anywhere the jaws couldn't go.
+
+The envelope is 175 mm of arm that wasn't being checked before, so **poses that
+used to pass can now be refused**. With the default box in particular:
+
+- the all-zeros pose puts the jaws 54 mm below `zmin`,
+- `HOME_POSE` puts them 5 mm below it, which `free_drive` refuses to start from.
+
+Both are the box's `z = 0` floor being drawn at the arm's own mounting surface.
+Re-measure the box for where the arms actually stand and they go away;
+`SafetyGuard(box=...)` and the backends' `safety_box=` are where it is set.
+
+What the guard still doesn't check:
+
+- **the grip itself** — opening or closing the jaws moves nothing the guard
+  models, so `grip` is never refused,
+- **a part wider than the jaws** — the envelope covers the jaws and the space
+  between them, and nothing that sticks out past it.
+
+`gripper=False` on either backend goes back to the bare flange: `grip` stops
+working and the guard stops at `link7`, as it did before there was a gripper.
+
 # Free drive
 
 Push the arm around by hand with only some of the joints meant to move, and
