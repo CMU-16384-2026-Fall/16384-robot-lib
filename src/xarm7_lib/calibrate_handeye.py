@@ -182,16 +182,41 @@ class _Kinematics:
         return pose(relative.rotation, relative.translation)
 
 
+def tool_offset(arm):
+    """The configured TCP offset's translation, in metres in the flange frame.
+
+    Zero when nothing is configured, which is also what an older controller
+    that does not report one looks like.
+    """
+    offset = arm.arm.tcp_offset
+    if offset is None or len(offset) < 3:
+        return np.zeros(3)
+    return np.asarray(offset[:3], dtype=float) / 1000.0
+
+
 def check_kinematics(kinematics, arm, tolerance=FK_TOLERANCE):
-    """Check the model against the controller's own idea of where the flange is.
+    """Check the model against the controller's own idea of where the tool is.
 
-    The controller reports its TCP position; forward kinematics computes the
-    flange. With no tool offset configured those are the same point, so they
-    should agree to within the arm's own repeatability.
+    Forward kinematics here is of the bare flange, while the controller reports
+    the tool point -- the flange moved by whatever TCP offset is configured. So
+    the comparison is made at the tool: the model's flange pose carries the
+    offset forward, and that is what the report is matched against.
 
-    Raises `HandEyeError` if they do not, because every flange pose the solver
-    is given comes from the model, and a constant error in all of them is
-    absorbed into the answer rather than showing up in the residuals.
+    A configured offset is not a problem for the calibration. Every flange pose
+    the solver is given comes from the model, and where the board really sits
+    on the hand is solved as `T_flange_board`, so an offset the controller
+    applies to its own reporting never enters the arithmetic. It only has to be
+    accounted for here, or this check would reject a bench that is set up
+    correctly and ask the TA to break the class's gripper configuration to get
+    past it.
+
+    Only the offset's translation is needed. The tool point is
+    `p_flange + R_flange @ offset`, which the offset's *rotation* does not move,
+    so this makes no assumption about the controller's euler convention.
+
+    Raises `HandEyeError` if the two still disagree, because a constant error in
+    every flange pose is absorbed into the answer rather than showing up in the
+    residuals.
 
     Returns the discrepancy in metres.
     """
@@ -202,30 +227,37 @@ def check_kinematics(kinematics, arm, tolerance=FK_TOLERANCE):
             "kinematics cannot be checked against it"
         )
     controller = np.asarray(reported[:3], dtype=float) / 1000.0
-    model = kinematics.flange_pose(arm.joint_values)[:3, 3]
+    offset = tool_offset(arm)
+    flange = kinematics.flange_pose(arm.joint_values)
+    model = flange[:3, 3] + flange[:3, :3] @ offset
     error = float(np.linalg.norm(controller - model))
 
     if error > tolerance:
-        offset = arm.arm.tcp_offset
-        has_offset = offset is not None and np.any(np.abs(np.asarray(offset[:3])) > 1e-6)
+        world = arm.arm.world_offset
+        shifted = world is not None and np.any(
+            np.abs(np.asarray(world[:6], dtype=float)) > 1e-6
+        )
         culprit = (
-            f"\nThe controller has a TCP offset configured ({offset}), which is "
-            "almost certainly it: the offset moves the point the controller "
-            "reports away from the flange the model computes. Clear it with "
-            "`arm.set_tcp_offset([0]*6)` and run this again."
-            if has_offset
-            else "\nNo TCP offset is configured, so this is not the usual cause. "
-            "Check that the controller is really an xArm7 and that its joint "
-            "zero matches the model's."
+            f"\nThe controller has a base coordinate offset configured "
+            f"({world}), which is almost certainly it: it moves the frame the "
+            "controller reports in away from the model's `link_base`, and "
+            "unlike the tool offset it cannot be read off the report. Clear it "
+            "and run this again."
+            if shifted
+            else "\nThe TCP offset above is already accounted for, so that is "
+            "not it. Check that the controller is really an xArm7 and that its "
+            "joint zero matches the model's."
         )
         raise HandEyeError(
             f"forward kinematics and the controller disagree about where the "
-            f"flange is by {error * 1000:.1f} mm, which is more than the "
+            f"tool is by {error * 1000:.1f} mm, which is more than the "
             f"{tolerance * 1000:.0f} mm allowed.\n"
             f"  controller reports  {np.round(controller, 4)} m\n"
             f"  the model computes  {np.round(model, 4)} m\n"
+            f"  flange              {np.round(flange[:3, 3], 4)} m\n"
+            f"  tool offset         {np.round(offset, 4)} m (in the flange frame)\n"
             "Every flange pose the solver gets comes from the model, so a "
-            "constant error here is absorbed into the calibration instead of "
+            f"constant error here is absorbed into the calibration instead of "
             f"showing up in its residuals.{culprit}"
         )
     return error
@@ -872,6 +904,12 @@ def cmd_run(args):
     print(f"connecting to the arm at {args.ip}...")
     with _open_arm(args) as arm:
         error = check_kinematics(kinematics, arm, tolerance=args.fk_tolerance)
+        offset = tool_offset(arm)
+        if np.any(offset):
+            # Worth saying out loud: it is accounted for in the check and plays
+            # no part in the calibration, which is solved on flange poses.
+            print(f"  controller has a TCP offset of {np.round(offset * 1000, 1)} mm, "
+                  "which is accounted for")
         print(f"  forward kinematics agrees with the controller to {error * 1000:.1f} mm")
 
         print(f"opening the camera ({args.resolution})...")
