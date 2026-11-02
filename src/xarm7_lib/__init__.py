@@ -7,6 +7,12 @@ script runs against either. The backends are also importable directly as
 
 `ZedOpenCapture` and `StereoCalibration` cover the ZED stereo camera, imported on
 first use so that the simulator needs neither OpenCV nor the native shim.
+
+`load_handeye` gives the camera's pose in the robot's base frame, so that a
+point the camera measures can be reached for. It is calibrated once per bench
+by a TA with `python -m xarm7_lib.calibrate_handeye` and filed inside this
+installation, so there is nothing for a student to run or configure. Unlike the
+camera itself this costs no OpenCV, and so is imported normally.
 """
 
 import importlib
@@ -19,6 +25,7 @@ from .free_drive import (
     Trajectory,
     free_mask,
 )
+from .handeye import HandEye, HandEyeError, load_handeye
 from .robot import Robot
 from .safety import (
     DEFAULT_BOX,
@@ -77,6 +84,8 @@ __all__ = [
     "DEFAULT_MARGIN",
     "FREE_JOINTS",
     "HOME_POSE",
+    "HandEye",
+    "HandEyeError",
     "LOCKED_TOLERANCE",
     "RESOLUTIONS",
     "RealXArm7",
@@ -95,5 +104,6 @@ __all__ = [
     "__version__",
     "devices",
     "free_mask",
+    "load_handeye",
     "query_serial",
 ]
