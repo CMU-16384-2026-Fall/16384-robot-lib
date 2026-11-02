@@ -175,25 +175,36 @@ camera is, and where the board ended up on the flange.
 **1. Print the board.**
 
 ```bash
-python -m xarm7_lib.calibrate_handeye board --square-length 30 --marker-length 22
+python -m xarm7_lib.calibrate_handeye board
 ```
 
-Print at 100% — no "fit to page" — then **caliper a square**. The board has its
-own spec printed along the bottom (`5x7  square 30.0 mm  marker 22.0 mm
-DICT_4X4_50`) so you can check the board in your hand against the numbers the
-routine is being given. A board scaled by the print dialog gives a calibration
-wrong by that same scale, with residuals that look perfect.
+That writes `charuco_board.pdf`: the board at exact scale, centred on a sheet
+of the smallest standard paper it fits. `--square-length MM` resizes it, and
+the markers follow at three quarters of the square unless `--marker-length`
+overrides them. Pass `-o board.png` for an image instead — it carries its own
+print size now, but a print dialog has more ways to rescale an image than a
+page.
+
+Print at 100% ("actual size") — no "fit to page" — then **caliper a square**.
+The board has its own spec printed along the bottom (`5x7  square 10.0 mm
+marker 7.5 mm  DICT_4X4_50`) so you can check the board in your hand against
+the numbers the routine is being given. A board scaled by the print dialog
+gives a calibration wrong by that same scale, with residuals that look
+perfect.
 
 Mount it flat on the gripper. It may not move relative to the flange after
 this point.
 
 Bigger is better, and so is `--resolution 2K`. What decides the accuracy is how
-many pixels a square covers at working distance. A 30 mm board at 0.85 m is
-25 px per square in HD, which works but leaves little margin for blur or poor
-lighting; the same board at 2K is 50 px, and on a synthetic bench that is the
-difference between 0.6 mm and 0.16 mm of camera position error. Going to 40 mm
-squares in HD buys about half of that. 2K runs at 15 fps, which costs nothing
-here — the arm stops at every pose anyway.
+many pixels a square covers at working distance. The 10 mm default is sized to
+fit a gripper rather than to measure well: at 0.85 m it is about 8 px per
+square in HD, so it wants 2K and good light, and it wants the camera closer. A
+30 mm board at 0.85 m is 25 px per square in HD and 50 px at 2K, which on a
+synthetic bench is the difference between 0.6 mm and 0.16 mm of camera position
+error. Orientation suffers most from a small board — the board's own pose comes
+back about three times less precisely at 10 mm than at 30 mm — so print the
+largest board the gripper will carry flat. 2K runs at 15 fps, which costs
+nothing here — the arm stops at every pose anyway.
 
 **2. Put the arm where the camera can see the board.** The sweep starts from
 wherever the arm already is and stays near it, so this pose decides what gets

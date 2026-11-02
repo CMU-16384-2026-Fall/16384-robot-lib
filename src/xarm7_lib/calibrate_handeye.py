@@ -33,8 +33,10 @@ Each has a check here, because none of them shows up as an error.
 **The board printed at the wrong scale.** A print dialog set to "fit to page"
 scales the squares by a few percent, and the calibration then comes out wrong
 by that same few percent with residuals that look perfect -- the solver has no
-way to know the board is not the size it was told. So `board` prints the spec
-*onto the board itself* and tells you to caliper a square before trusting it.
+way to know the board is not the size it was told. So `board` writes a PDF
+whose page is a standard paper size with the board on it at exact scale,
+prints the spec *onto the board itself*, and tells you to caliper a square
+before trusting it.
 
 **The model and the controller disagreeing about the flange.** Forward
 kinematics here comes from `xarm7_description`, the same model `safety.py`
@@ -53,8 +55,10 @@ deliberately rotates the wrist about all three of its axes in turn, and
 import argparse
 import os
 import pathlib
+import struct
 import sys
 import time
+import zlib
 
 import cv2
 import numpy as np
@@ -118,8 +122,18 @@ MIN_CORNERS = 8
 GOOD_RMS_PX = 0.5
 GOOD_SPREAD = 0.005  # m of leave-one-out wander
 
+# The marker is printed inside the square, so its size is a fraction of the
+# square rather than a length of its own: the white quiet zone the detector
+# needs around a marker has to stay proportional when the board is resized.
+# Three quarters is what OpenCV's own samples use.
+MARKER_RATIO = 0.75
+DEFAULT_SQUARE_LENGTH = 0.010  # m
+
 DEFAULT_BOARD = BoardSpec(
-    squares_x=5, squares_y=7, square_length=0.030, marker_length=0.022
+    squares_x=5,
+    squares_y=7,
+    square_length=DEFAULT_SQUARE_LENGTH,
+    marker_length=DEFAULT_SQUARE_LENGTH * MARKER_RATIO,
 )
 DEFAULT_DPI = 600
 DEFAULT_MARGIN = 10.0  # mm of white around the printed board
@@ -271,10 +285,20 @@ def charuco_board(spec):
 
 
 def board_image(spec, dpi=DEFAULT_DPI, margin=DEFAULT_MARGIN, caption=True):
-    """Render the board for printing, at exact scale for `dpi`.
+    """Render the board for printing. Reports `(image, dpi)`.
 
     The squares come out `spec.square_length` across when the result is printed
-    at 100%, which is the only reason to care about dpi here.
+    at the dpi reported back, which is the only reason to care about dpi here.
+    That is not quite the `dpi` asked for: a square has to be a whole number of
+    pixels, so the resolution is nudged to the nearest one that makes it so and
+    the exact physical size is preserved instead. Printing at the reported dpi
+    is what `write_board_png` and `write_board_pdf` arrange, so nothing has to
+    be done about it.
+
+    Rounding the square rather than the whole board is what keeps every square
+    identical -- and OpenCV lays the marker bits out inside each square with
+    integer pixel arithmetic, so a square that is a fractional number of pixels
+    across can overflow its cell and abort the render outright.
 
     With `caption`, the spec is drawn in the bottom margin, so the physical
     board says what it is. That line is what lets a TA holding the board tell
@@ -282,12 +306,14 @@ def board_image(spec, dpi=DEFAULT_DPI, margin=DEFAULT_MARGIN, caption=True):
     there to be checked against a caliper, because a board scaled by the print
     dialog is the one error that leaves no trace in the residuals.
     """
+    square_px = max(1, int(round(spec.square_length * dpi / 0.0254)))
+    dpi = square_px / spec.square_length * 0.0254
     pixels_per_metre = dpi / 0.0254
-    width = int(round(spec.squares_x * spec.square_length * pixels_per_metre))
-    height = int(round(spec.squares_y * spec.square_length * pixels_per_metre))
-    # The size is computed from the board's own aspect ratio, so the squares
-    # come out square. marginSize=0 because the margin is added below, where it
-    # is in millimetres rather than whatever fraction of the image OpenCV picks.
+
+    width = spec.squares_x * square_px
+    height = spec.squares_y * square_px
+    # marginSize=0 because the margin is added below, where it is in
+    # millimetres rather than whatever fraction of the image OpenCV picks.
     squares = charuco_board(spec).generateImage(
         (width, height), marginSize=0, borderBits=1
     )
@@ -297,15 +323,18 @@ def board_image(spec, dpi=DEFAULT_DPI, margin=DEFAULT_MARGIN, caption=True):
     text = spec.describe()
     scale = thickness = baseline = 0
     if caption:
-        # Aim for roughly 4 mm of cap height, then shrink if the line would be
-        # wider than the board.
+        # Aim for roughly 4 mm of cap height, then shrink if the line would run
+        # off the sheet. The caption is allowed the full width including the
+        # margins, because on a small board it would otherwise shrink to
+        # something a caliper-wielding TA cannot read.
+        room = width + 2 * pad
         scale = max(0.3, 4.0 / 1000.0 * pixels_per_metre / 22.0)
         thickness = max(1, int(round(scale * 2)))
         (text_width, text_height), baseline = cv2.getTextSize(
             text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
         )
-        if text_width > width:
-            scale *= width / text_width
+        if text_width > room:
+            scale *= room / text_width
             thickness = max(1, int(round(scale * 2)))
             (text_width, text_height), baseline = cv2.getTextSize(
                 text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
@@ -318,14 +347,122 @@ def board_image(spec, dpi=DEFAULT_DPI, margin=DEFAULT_MARGIN, caption=True):
         cv2.putText(
             canvas,
             text,
-            (pad, height + 2 * pad + text_height),
+            (max(0, (canvas.shape[1] - text_width) // 2), height + 2 * pad + text_height),
             cv2.FONT_HERSHEY_SIMPLEX,
             scale,
             0,
             thickness,
             cv2.LINE_AA,
         )
-    return canvas
+    return canvas, dpi
+
+
+PAPER_SIZES = (
+    # name, width, height, in mm. Tried in this order; the first the board fits
+    # on is the page the PDF gets, so the page matches the paper actually in the
+    # tray and nothing in the print dialog is tempted to rescale it.
+    ("Letter", 215.9, 279.4),
+    ("A4", 210.0, 297.0),
+    ("Legal", 215.9, 355.6),
+    ("Tabloid", 279.4, 431.8),
+    ("A3", 297.0, 420.0),
+)
+
+
+def write_board_png(path, image, dpi):
+    """Write the board as a PNG that says how big it is.
+
+    OpenCV writes no `pHYs` chunk, and a PNG without one has no physical size:
+    every viewer falls back to 72 dpi, so a 600 dpi board claims to be eight
+    times its real width and "100%" prints it eight times too big. The chunk is
+    nine bytes and goes straight after IHDR, so it is added here rather than
+    taking on an imaging dependency for it.
+    """
+    ok, buffer = cv2.imencode(".png", image)
+    if not ok:
+        raise HandEyeError(f"could not encode {path}")
+    data = buffer.tobytes()
+
+    # 8-byte signature, then IHDR: 4 length + 4 type + 13 data + 4 crc.
+    end_of_ihdr = 8 + 25
+    if data[8 + 4:8 + 8] != b"IHDR":
+        raise HandEyeError("encoded PNG does not start with IHDR, which is a bug")
+    pixels_per_metre = int(round(dpi / 0.0254))
+    body = b"pHYs" + struct.pack(">IIB", pixels_per_metre, pixels_per_metre, 1)
+    chunk = struct.pack(">I", len(body) - 4) + body + struct.pack(">I", zlib.crc32(body))
+
+    path.write_bytes(data[:end_of_ihdr] + chunk + data[end_of_ihdr:])
+
+
+def write_board_pdf(path, image, dpi):
+    """Write the board as a PDF page at exact scale, and report the page size.
+
+    This is the format to print. A PDF carries the board's size in points
+    rather than in metadata a viewer may ignore, and the page is a standard
+    paper size with the board centred on it, so "actual size" and "100%" and
+    "no scaling" all mean the same thing and "fit to page" has nothing to
+    shrink. Returns the paper name, or None if the board needed a page of its
+    own because it fits no standard size.
+
+    Written by hand because the alternative is a PDF library in the
+    dependencies of a robot arm package. The whole file is one grayscale image
+    XObject on one page, which is about as small as a PDF gets.
+    """
+    height, width = image.shape[:2]
+    board_mm = (width / dpi * 25.4, height / dpi * 25.4)
+
+    paper = next(
+        (name for name, w, h in PAPER_SIZES if board_mm[0] <= w and board_mm[1] <= h),
+        None,
+    )
+    if paper is None:
+        page_mm = board_mm
+    else:
+        page_mm = next((w, h) for name, w, h in PAPER_SIZES if name == paper)
+
+    # PDF user space is 1/72 inch, which is what "72 dpi" has always meant.
+    to_points = 72.0 / 25.4
+    page = (page_mm[0] * to_points, page_mm[1] * to_points)
+    drawn = (board_mm[0] * to_points, board_mm[1] * to_points)
+    origin = ((page[0] - drawn[0]) / 2.0, (page[1] - drawn[1]) / 2.0)
+
+    samples = zlib.compress(np.ascontiguousarray(image).tobytes(), 9)
+    content = (
+        f"q {drawn[0]:.4f} 0 0 {drawn[1]:.4f} {origin[0]:.4f} {origin[1]:.4f} cm "
+        "/Im0 Do Q\n"
+    ).encode("ascii")
+
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        (
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page[0]:.4f} {page[1]:.4f}] "
+            "/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
+        ).encode("ascii"),
+        b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream",
+        (
+            f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
+            "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
+            f"/Length {len(samples)} >>\nstream\n"
+        ).encode("ascii") + samples + b"\nendstream",
+    ]
+
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+
+    start_xref = len(out)
+    out += b"xref\n0 %d\n" % (len(objects) + 1)
+    out += b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += b"%010d 00000 n \n" % offset
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
+    out += b"startxref\n%d\n%%%%EOF\n" % start_xref
+
+    path.write_bytes(bytes(out))
+    return paper
 
 
 class BoardDetector:
@@ -532,25 +669,53 @@ def _report(T_base_cam, T_flange_board, stats, spread=None):
 
 def cmd_board(args):
     spec = _spec_from_args(args)
-    image = board_image(spec, dpi=args.dpi, margin=args.margin, caption=not args.no_caption)
+    # Not args.dpi: board_image nudges it to whatever keeps a square a whole
+    # number of pixels, and it is the nudged one that makes the squares come
+    # out the size the spec says.
+    image, dpi = board_image(
+        spec, dpi=args.dpi, margin=args.margin, caption=not args.no_caption
+    )
 
     output = pathlib.Path(args.output)
-    if not cv2.imwrite(str(output), image):
-        raise HandEyeError(f"could not write {output}")
+    paper = None
+    if output.suffix.lower() == ".pdf":
+        paper = write_board_pdf(output, image, dpi)
+    else:
+        write_board_png(output, image, dpi)
 
     width = spec.squares_x * spec.square_length * 1000
     height = spec.squares_y * spec.square_length * 1000
-    print(f"wrote {output}  ({image.shape[1]}x{image.shape[0]} px at {args.dpi} dpi)")
+    sheet = (image.shape[1] / dpi * 25.4, image.shape[0] / dpi * 25.4)
+    print(f"wrote {output}  ({image.shape[1]}x{image.shape[0]} px at {dpi:.0f} dpi)")
     print(f"  {spec.describe()}")
     print(f"  board area {width:.1f} x {height:.1f} mm, {spec.n_corners} corners")
+    print(f"  printed size {sheet[0]:.1f} x {sheet[1]:.1f} mm including the margin")
+    if paper is not None:
+        print(f"  on one {paper} page, centred")
+    elif output.suffix.lower() == ".pdf":
+        print(
+            "  on a page of its own: this board fits no standard paper size, so "
+            "the\n  print dialog will offer to scale it. Don't let it — print it "
+            "on larger\n  paper, or use a smaller --square-length."
+        )
+
     print(
-        "\nPrint it at 100% — no 'fit to page', no 'shrink to printable area'.\n"
-        "Then measure one square with a caliper and check it against "
-        f"{spec.square_length * 1000:.1f} mm.\n"
+        "\nPrint it at 100% — 'actual size', not 'fit to page' and not 'shrink to\n"
+        "printable area'. Then measure one square with a caliper and check it "
+        f"against\n{spec.square_length * 1000:.1f} mm.\n"
         "A board scaled by the print dialog gives a calibration that is wrong "
         "by that\nsame scale, with residuals that look perfect. The sizes "
         "printed on the board\nare there so you can check them.\n"
-        "\nMount it flat on the gripper — a board that flexes is a board whose "
+    )
+    if paper is None and output.suffix.lower() != ".pdf":
+        print(
+            "This is a PNG, which print dialogs scale to the paper by default. "
+            "It now\ncarries its real size, so 100% is the right size — but "
+            f"`-o {output.stem}.pdf` gives\nyou a page that is already the "
+            "right size, which is harder to get wrong.\n"
+        )
+    print(
+        "Mount it flat on the gripper — a board that flexes is a board whose "
         "corners are\nin the wrong place. It may not move relative to the "
         "flange after this point."
     )
@@ -916,11 +1081,19 @@ def cmd_self_test(args):
     conventions. Every transform here is composed in the same direction the
     real routine composes it, so a flipped inverse fails this.
 
-    The thresholds are a regression check on the method, not a target. Over ten
-    seeds at the defaults the camera comes back within 0.012-0.044 degrees and
-    0.28-0.75 mm of truth, so they are set at about twice the worst of that:
-    the draw alone should never fail this, while a mistake in the geometry
-    misses by degrees and centimetres rather than by tenths.
+    The thresholds are a regression check on the method, not a target. Over
+    twelve seeds at the defaults the camera comes back within 0.01-0.07 degrees
+    and 0.21-0.96 mm of truth, and the board within 0.08-0.24 degrees and
+    0.06-0.33 mm, so they are set at about twice the worst of that: the draw
+    alone should never fail this, while a mistake in the geometry misses by
+    degrees and centimetres rather than by tenths.
+
+    How much headroom that needs depends on the board. Orientation is recovered
+    from how the corners spread across the image, so a board a third the size
+    gives up roughly three times the angular precision -- the 30 mm board these
+    thresholds were first set against held the board's rotation under 0.07
+    degrees, where the 10 mm default reaches 0.24. Shrinking the default board
+    again means measuring the range again rather than assuming these still fit.
     """
     rng = np.random.default_rng(args.seed)
     spec = _spec_from_args(args)
@@ -1050,11 +1223,20 @@ def _squares(value):
 
 
 def _spec_from_args(args):
+    square_length = args.square_length / 1000.0
+    # Scaled off the square unless asked for outright, so that changing
+    # --square-length alone gives a board in proportion rather than one whose
+    # markers overflow their squares.
+    marker_length = (
+        square_length * MARKER_RATIO
+        if args.marker_length is None
+        else args.marker_length / 1000.0
+    )
     return BoardSpec(
         squares_x=args.squares[0],
         squares_y=args.squares[1],
-        square_length=args.square_length / 1000.0,
-        marker_length=args.marker_length / 1000.0,
+        square_length=square_length,
+        marker_length=marker_length,
         dictionary=args.dict,
         legacy=args.legacy,
     )
@@ -1074,16 +1256,17 @@ def _add_board_arguments(parser, default=DEFAULT_BOARD):
         type=float,
         default=default.square_length * 1000,
         metavar="MM",
-        help=f"square side in mm (default {default.square_length * 1000:.0f})",
+        help=f"square side in mm (default {default.square_length * 1000:g})",
     )
     group.add_argument(
         "--marker-length",
         type=float,
-        default=default.marker_length * 1000,
+        default=None,
         metavar="MM",
         help=(
-            "marker side in mm, smaller than the square (default "
-            f"{default.marker_length * 1000:.0f})"
+            "marker side in mm, smaller than the square. Defaults to "
+            f"{MARKER_RATIO:g} of --square-length, which is "
+            f"{default.marker_length * 1000:g} mm for the default board"
         ),
     )
     group.add_argument(
@@ -1135,7 +1318,13 @@ def build_parser():
     )
     _add_board_arguments(board)
     board.add_argument(
-        "-o", "--output", default="charuco_board.png", help="where to write the PNG"
+        "-o",
+        "--output",
+        default="charuco_board.pdf",
+        help=(
+            "where to write it. A .pdf is a page at exact scale, which is what "
+            "to print; any other extension writes an image instead"
+        ),
     )
     board.add_argument(
         "--dpi", type=int, default=DEFAULT_DPI, help=f"print resolution (default {DEFAULT_DPI})"
@@ -1250,8 +1439,10 @@ def build_parser():
     # Roughly twice the worst seen over ten seeds at the defaults (0.044 deg,
     # 0.75 mm) -- see SELF_TEST_TOLERANCE. Loose enough not to be a coin flip
     # on the draw, tight enough that a broken convention cannot pass.
-    self_test.add_argument("--max-rotation", type=float, default=0.10, metavar="DEG")
-    self_test.add_argument("--max-translation", type=float, default=1.5, metavar="MM")
+    # Twice the worst seen over twelve seeds at the default board; see
+    # cmd_self_test's docstring for why this tracks the board's size.
+    self_test.add_argument("--max-rotation", type=float, default=0.50, metavar="DEG")
+    self_test.add_argument("--max-translation", type=float, default=2.0, metavar="MM")
     self_test.set_defaults(handler=cmd_self_test)
 
     return parser
