@@ -229,9 +229,19 @@ Two numbers decide whether to keep it:
   pose. This is the one that catches a pose set that did not rotate enough, and
   it can be bad while the RMS looks excellent.
 
+A window shows the left eye throughout, with the corners the solver is going
+to use drawn in green and the ones only one eye could see in amber. Watch it
+for the first few poses: a board that is edge-on, half out of frame, washed out
+or still ringing from the move is obvious there and invisible in a corner
+count. `--no-window` turns it off for a session with no display, and
+`--display-scale` sizes it; if OpenCV has no GUI to open, it says so once and
+carries on without one.
+
 `--manual` instead releases the arm between poses so you can push it by hand,
 for a bench where the generated sweep puts the board out of view. Turn the
-wrist a long way between poses: rotation is what solves this.
+wrist a long way between poses: rotation is what solves this. With the window
+up, space captures the pose you have posed and `q` finishes — the live corner
+count is what you are aiming at while you move the arm.
 
 **4. File it.**
 
@@ -254,7 +264,10 @@ python -m xarm7_lib.calibrate_handeye verify
 ```
 
 Compares the board pose the camera measures against the one forward kinematics
-predicts, live, while you move the arm by hand. Do this at poses the fit never
+predicts, live, while you move the arm by hand. The window draws both: magenta
+rings where the calibration says the corners are, green dots where they
+actually are. Rings sitting on dots is a good calibration, and the gap between
+them is the error the table is reporting. Do this at poses the fit never
 saw — it is the only check that catches a calibration that is self-consistent
 and wrong. A tape measure to the camera is worth one more minute: the reported
 position should be where the camera physically is, to within a few centimetres.

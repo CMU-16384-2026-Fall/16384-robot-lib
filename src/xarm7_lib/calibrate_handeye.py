@@ -96,6 +96,14 @@ _FLANGE_FRAME = "link_eef"
 # is actually different, and the usual something is a configured TCP offset.
 FK_TOLERANCE = 0.010  # m
 
+WINDOW = "calibrate_handeye"
+PREVIEW_SCALE = 0.5
+# How close the joints have to be to the target before the preview stops
+# pumping frames and the controller's own settle test is asked. Looser than the
+# controller's tolerance on purpose: this only decides when to stop drawing.
+ARRIVAL_TOLERANCE = 0.01  # rad
+MOVE_TIMEOUT = 30.0  # s, a backstop on the frame-pumping loop
+
 # The generated sweep. The wrist joints carry the rotation, because turning the
 # wrist re-orients the board without walking it out of the camera's view; the
 # others are nudged for translation spread.
@@ -550,16 +558,32 @@ def _average_detections(detector, frames):
     )
 
 
-def observe(camera, detector, flange, frames=DEFAULT_FRAMES):
+def observe(camera, detector, flange, frames=DEFAULT_FRAMES, preview=None, note=()):
     """Look at the board from where the arm is now. Returns an `Observation` or None.
 
     None, with a reason printed, when the board is not usably in view -- which
     is an ordinary outcome for a generated pose, not an error.
+
+    With a `preview`, the averaged detections are drawn on the last frame
+    grabbed, including the ones only one eye saw. A pose that fails is drawn
+    too, and before it is reported: the picture of a near miss is the useful
+    part, and it is gone by the time the arm has moved on.
     """
     grabbed = [camera.read_rectified() for _ in range(frames)]
     left, right = _average_detections(detector, grabbed)
 
     shared = sorted(set(left) & set(right))
+    if preview is not None:
+        lonely = sorted(set(left) - set(right))
+        preview.show(
+            grabbed[-1][0],
+            corners=[left[i] for i in shared],
+            extra=[left[i] for i in lonely],
+            note=list(note) + [
+                f"{len(shared)} corners in both eyes"
+                + (f", {len(lonely)} in the left only" if lonely else "")
+            ],
+        )
     if len(shared) < MIN_CORNERS:
         print(
             f"      skipped: {len(shared)} corners in both eyes "
@@ -574,6 +598,152 @@ def observe(camera, detector, flange, frames=DEFAULT_FRAMES):
         left=np.array([left[i] for i in shared]),
         right=np.array([right[i] for i in shared]),
     )
+
+
+# ----------------------------------------------------------------------
+# The window
+# ----------------------------------------------------------------------
+
+
+class Preview:
+    """A window showing the left eye while the routine runs.
+
+    Worth having because the one thing that decides whether this works is
+    whether the board is in view and detectable at every pose, and without a
+    picture the only evidence of that is a corner count after the fact. With
+    one, a board that is edge-on, half out of frame, blown out or still
+    blurring from the move is obvious while there is time to do something
+    about it.
+
+    Opening it is best-effort. OpenCV built without GUI support, or a session
+    with no display, raises on the first call, and a calibration that is
+    otherwise fine should not die for want of a window: the reason is printed
+    once and the routine carries on blind.
+    """
+
+    def __init__(self, size, enabled=True, scale=PREVIEW_SCALE):
+        self.scale = scale
+        self.enabled = bool(enabled)
+        self.key = -1
+        if not self.enabled:
+            return
+        try:
+            cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(WINDOW, int(scale * size[0]), int(scale * size[1]))
+        except cv2.error as error:
+            self._give_up(error)
+
+    def _give_up(self, error):
+        self.enabled = False
+        reason = str(error).strip().splitlines()[-1] if str(error).strip() else error
+        print(f"\n  no preview window ({reason}); carrying on without one\n")
+
+    def show(self, image, corners=None, extra=None, predicted=None, note=()):
+        """Draw one frame. Returns the key pressed in the window, or -1.
+
+        `corners` are the detections the solver will use, `extra` the ones it
+        cannot (seen in one eye only), and `predicted` where the calibration
+        says the corners should be -- which is the whole of what `verify` has
+        to say, drawn on the thing it is talking about.
+
+        Everything is drawn *after* the frame is scaled down, so the markers
+        and the caption stay the same size on screen whatever
+        `--display-scale` is set to. Drawn before it, a 3-pixel dot at half
+        scale is a pixel and a half of nothing.
+        """
+        self.key = -1
+        if not self.enabled:
+            return self.key
+        canvas = image if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+        canvas = cv2.resize(canvas, None, fx=self.scale, fy=self.scale)
+        for points, colour, radius in (
+            (extra, (0, 180, 255), 3),
+            (predicted, (255, 0, 255), 6),
+            (corners, (0, 255, 0), 3),
+        ):
+            if points is None:
+                continue
+            # Open circles for the prediction, filled for a measurement: where
+            # the two disagree the pair reads as a target and a miss.
+            thickness = 1 if points is predicted else -1
+            for u, v in np.asarray(points, dtype=float).reshape(-1, 2) * self.scale:
+                if not (np.isfinite(u) and np.isfinite(v)):
+                    continue
+                cv2.circle(canvas, (int(round(u)), int(round(v))), radius,
+                           colour, thickness, cv2.LINE_AA)
+        self._caption(canvas, note)
+        try:
+            cv2.imshow(WINDOW, canvas)
+            self.key = self._key(cv2.waitKey(1))
+        except cv2.error as error:
+            self._give_up(error)
+        return self.key
+
+    @staticmethod
+    def _key(value):
+        """`waitKey`'s answer as a plain key code, or -1 for nothing pressed."""
+        return -1 if value == -1 else value & 0xFF
+
+    @staticmethod
+    def _caption(canvas, lines):
+        """Text at the top left, over a dark strip so it stays readable."""
+        lines = [line for line in lines if line]
+        if not lines:
+            return
+        # Sized off the window, not the sensor: the point is on-screen
+        # legibility, and the two are the same thing only at scale 1.
+        k = min(1.5, max(0.5, canvas.shape[1] / 1280.0))
+        step = int(18 + 10 * k)
+        height = min(canvas.shape[0], step * len(lines) + step // 2)
+        canvas[:height] = (canvas[:height].astype(np.float32) * 0.35).astype(np.uint8)
+        for index, line in enumerate(lines, start=1):
+            cv2.putText(canvas, line, (int(12 * k), index * step),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45 + 0.25 * k,
+                        (255, 255, 255), 1, cv2.LINE_AA)
+
+    def hold(self, seconds):
+        """Keep the last frame up, and the window responsive, for a while.
+
+        `waitKey` is the GUI's own event pump, so one call is both the wait and
+        the thing that stops the window going grey. Returns the key pressed.
+        """
+        self.key = -1
+        if not self.enabled:
+            time.sleep(seconds)
+            return self.key
+        try:
+            self.key = self._key(cv2.waitKey(max(1, int(seconds * 1000))))
+        except cv2.error as error:
+            self._give_up(error)
+        return self.key
+
+    @property
+    def closed(self):
+        """True once the window has been closed from the window manager."""
+        if not self.enabled:
+            return False
+        try:
+            return cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1
+        except cv2.error:
+            return True
+
+    def close(self):
+        if not self.enabled:
+            return
+        self.enabled = False
+        try:
+            cv2.destroyWindow(WINDOW)
+            # A destroyed window is only really gone once the GUI loop runs.
+            cv2.waitKey(1)
+        except cv2.error:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        self.close()
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -786,7 +956,38 @@ def _open_camera(args):
     return ZedOpenCapture(resolution=args.resolution, serial=args.serial)
 
 
-def _capture_automatic(arm, camera, detector, kinematics, args):
+def _stream(camera, preview, seconds, note=()):
+    """Hold the window open for a while with nothing to decide."""
+    if not preview.enabled:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        preview.show(camera.read_rectified()[0], note=note)
+
+
+def _move_watching(arm, camera, preview, goal, speed, note=()):
+    """Move to `goal`, keeping frames coming while the arm travels.
+
+    `set_joint_targets(wait=True)` blocks, and a frozen window beside a moving
+    robot reads as a hung program. So with a window the move is started without
+    waiting and the preview is pumped until the joints stop changing, after
+    which the controller's own settle test has the last word exactly as it does
+    when the call is left to block. With no window this *is* that call.
+    """
+    if not preview.enabled:
+        arm.set_joint_targets(goal, speed=speed, wait=True)
+        return
+    arm.set_joint_targets(goal, speed=speed, wait=False)
+    deadline = time.monotonic() + MOVE_TIMEOUT
+    while time.monotonic() < deadline:
+        preview.show(camera.read_rectified()[0], note=list(note) + ["moving"])
+        if np.max(np.abs(arm.joint_values - goal)) < ARRIVAL_TOLERANCE:
+            break
+    arm.wait_for_motion()
+
+
+def _capture_automatic(arm, camera, detector, kinematics, args, preview):
     """Walk the arm through a generated sweep, observing at each stop."""
     seed = arm.joint_values
     print(f"  seed pose {np.round(np.degrees(seed), 1)} deg (where the arm is now)")
@@ -812,14 +1013,16 @@ def _capture_automatic(arm, camera, detector, kinematics, args):
     try:
         for index, q in enumerate(poses, start=1):
             print(f"\n  pose {index}/{len(poses)}")
-            arm.set_joint_targets(q, speed=args.speed, wait=True)
-            time.sleep(args.settle)
+            label = f"pose {index}/{len(poses)}"
+            _move_watching(arm, camera, preview, q, args.speed, note=[label])
+            _stream(camera, preview, args.settle, note=[label, "settling"])
             # Where the arm actually is, not where it was sent. The two differ
             # by the servos' own steady-state error, and the solver should be
             # told the truth.
             measured = arm.joint_values
             observation = observe(
-                camera, detector, kinematics.flange_pose(measured), args.frames
+                camera, detector, kinematics.flange_pose(measured), args.frames,
+                preview=preview, note=[label],
             )
             if observation is not None:
                 print(f"      {len(observation)} corners")
@@ -831,7 +1034,35 @@ def _capture_automatic(arm, camera, detector, kinematics, args):
     return observations
 
 
-def _capture_manual(arm, camera, detector, kinematics, args):
+def _pose_from_window(camera, detector, preview, index, frames):
+    """Stream, with live detections, until the TA asks for a capture.
+
+    Returns "capture" or "done". The window is the better prompt here: posing
+    the arm by hand is a hunt for a view where the board reads, and the corner
+    count has to be visible *while* the hunting happens, not after.
+    """
+    while True:
+        left, _ = camera.read_rectified()
+        ids, corners = detector.detect(left)
+        key = preview.show(
+            left,
+            corners=corners,
+            note=[
+                f"pose {index}: space to capture, q when you have enough",
+                f"{len(ids)} corners in the left eye"
+                + ("" if len(ids) >= MIN_CORNERS else f" -- need {MIN_CORNERS}"),
+            ],
+        )
+        if key in (ord(" "), 13, 10):
+            return "capture"
+        if key in (ord("q"), 27):
+            return "done"
+        if preview.closed:
+            print("  window closed — finishing capture")
+            return "done"
+
+
+def _capture_manual(arm, camera, detector, kinematics, args, preview):
     """Let the TA push the arm to each pose by hand.
 
     The controller's teaching mode, the same one `python -m
@@ -847,25 +1078,38 @@ def _capture_manual(arm, camera, detector, kinematics, args):
         "Keep the e-stop in reach.\n"
         "  Turn the wrist a long way between poses, not just move the arm "
         "around: rotation\n  is what solves this.\n"
-        "  Press Enter to capture where it stands, or Ctrl-C when you have "
-        "enough."
+        + (
+            "  Space in the window captures where it stands, q finishes."
+            if preview.enabled
+            else "  Press Enter to capture where it stands, or Ctrl-C when you "
+            "have enough."
+        )
     )
 
     observations = []
     try:
         while len(observations) < args.poses:
+            index = len(observations) + 1
             arm._ensure_mode(MODE_TEACH)
-            try:
-                input(f"\n  pose {len(observations) + 1}: push the arm, then Enter: ")
-            except EOFError:
-                print("  (nothing on stdin to wait for)")
-                break
+            if preview.enabled:
+                if _pose_from_window(
+                    camera, detector, preview, index, args.frames
+                ) == "done":
+                    break
+            else:
+                try:
+                    input(f"\n  pose {index}: push the arm, then Enter: ")
+                except EOFError:
+                    print("  (nothing on stdin to wait for)")
+                    break
             arm._ensure_mode(MODE_POSITION)
-            time.sleep(args.settle)
+            _stream(camera, preview, args.settle,
+                    note=[f"pose {index}", "settling"])
 
             measured = arm.joint_values
             observation = observe(
-                camera, detector, kinematics.flange_pose(measured), args.frames
+                camera, detector, kinematics.flange_pose(measured), args.frames,
+                preview=preview, note=[f"pose {index}"],
             )
             if observation is not None:
                 print(f"      {len(observation)} corners")
@@ -925,8 +1169,18 @@ def cmd_run(args):
             print(f"  SN{serial} at {camera.size[0]}x{camera.size[1]}, {lens} lens")
             intrinsics = Intrinsics.from_stereo(camera.calibration)
 
-            capture = _capture_manual if args.manual else _capture_automatic
-            observations = capture(arm, camera, detector, kinematics, args)
+            preview = Preview(
+                camera.size, enabled=not args.no_window, scale=args.display_scale
+            )
+            try:
+                capture = _capture_manual if args.manual else _capture_automatic
+                observations = capture(
+                    arm, camera, detector, kinematics, args, preview
+                )
+            finally:
+                # Closed before the report, so the solver's numbers are not
+                # printed behind a window the TA now has to go and dismiss.
+                preview.close()
 
     print(f"\n{len(observations)} usable poses")
     if len(observations) < 3:
@@ -1055,13 +1309,16 @@ def cmd_verify(args):
             )
 
             worst = 0.0
+            preview = Preview(
+                camera.size, enabled=not args.no_window, scale=args.display_scale
+            )
             try:
                 while True:
                     measured = arm.joint_values
                     flange = kinematics.flange_pose(measured)
                     observation = observe(camera, detector, flange, args.frames)
                     if observation is None:
-                        time.sleep(0.5)
+                        _stream(camera, preview, 0.5, note=["board not in view"])
                         continue
 
                     seen = fit_board_pose(
@@ -1080,12 +1337,35 @@ def cmd_verify(args):
                         detector.object_points,
                     )
                     worst = max(worst, position)
+                    rms = float(np.sqrt(np.mean(errors ** 2)))
                     print(
                         f"  {position * 1000:9.1f} mm  {rotation:7.2f}°  "
-                        f"{len(observation):7d}  {np.sqrt(np.mean(errors ** 2)):9.2f} px"
+                        f"{len(observation):7d}  {rms:9.2f} px"
                     )
-                    time.sleep(args.period)
+                    # Magenta is where the calibration says the corners are,
+                    # green where they actually are. Overlapping rings mean it
+                    # is right, and no table of residuals says it as plainly.
+                    live, _ = camera.read_rectified()
+                    in_camera = (
+                        detector.object_points @ predicted[:3, :3].T + predicted[:3, 3]
+                    )
+                    preview.show(
+                        live,
+                        corners=observation.left,
+                        predicted=handeye.intrinsics.project(in_camera, "left"),
+                        note=[
+                            f"{position * 1000:.1f} mm and {rotation:.2f}° off "
+                            "the prediction",
+                            f"{len(observation)} corners, {rms:.2f} px  "
+                            "(magenta: predicted, green: measured)",
+                        ],
+                    )
+                    if preview.hold(args.period) in (ord("q"), 27) or preview.closed:
+                        break
             except KeyboardInterrupt:
+                print()
+            finally:
+                preview.close()
                 print(f"\n  worst position error seen: {worst * 1000:.1f} mm")
     return 0
 
@@ -1335,6 +1615,15 @@ def _add_hardware_arguments(parser):
         type=int,
         default=DEFAULT_FRAMES,
         help=f"frames averaged per pose (default {DEFAULT_FRAMES})",
+    )
+    group.add_argument(
+        "--no-window", action="store_true", help="no preview window, terminal only"
+    )
+    group.add_argument(
+        "--display-scale",
+        type=float,
+        default=PREVIEW_SCALE,
+        help=f"shrink the preview window (default {PREVIEW_SCALE})",
     )
 
 
