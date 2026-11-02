@@ -32,11 +32,21 @@ downloading will quietly give the wrong answer otherwise.
 The camera also carries its calibration on an onboard EEPROM, but reading that
 is an SDK 5.3+ feature and so needs CUDA like the rest of the SDK. The endpoint
 is the way in without one.
+
+One wrinkle in reading these files: they never say which distortion model
+they mean. A file that lists `p1`/`p2` is giving cv2's pinhole coefficients,
+and one that lists `k3`/`k4` with no tangential terms is giving the fisheye
+(equidistant) ones. The two are different models and not interchangeable --
+handing fisheye coefficients to the pinhole routines leaves nearly all of the
+distortion in place, and quietly, because the numbers are the same size and
+the result still looks like a picture. Which model a file means is read off
+its keys, and `StereoCalibration.fisheye` says which was found.
 """
 
 import configparser
 import os
 import pathlib
+import re
 import urllib.request
 
 import cv2
@@ -63,8 +73,13 @@ _CACHE = (
 
 _DOWNLOAD_TIMEOUT = 10.0
 
-# Radial and tangential terms, in the order cv2 expects them.
-_DISTORTION_KEYS = ("k1", "k2", "p1", "p2", "k3")
+# The coefficients each of cv2's two distortion models wants, in its own
+# order. `p1`/`p2` are the giveaway for the pinhole model: the fisheye one has
+# no tangential terms, and spends the same key names on further radial ones.
+_PINHOLE_KEYS = ("k1", "k2", "p1", "p2", "k3")
+_FISHEYE_KEYS = ("k1", "k2", "k3", "k4")
+
+_NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 
 class CalibrationError(RuntimeError):
@@ -114,22 +129,41 @@ def find_conf(serial, download=True):
     return destination
 
 
+def _number(text):
+    """Read the number at the front of a value, ignoring any trailing rubbish.
+
+    These files are machine-written but not always cleanly: a stray letter
+    welded onto the end of a coefficient has been seen in the wild, and
+    refusing the whole calibration over one character would be a poor trade.
+    """
+    match = _NUMBER.match(text.strip())
+    if match is None:
+        raise ValueError(f"{text!r} is not a number")
+    return float(match.group(0))
+
+
 def _intrinsics(conf, section):
+    """Return `(K, D, fisheye)` for one eye, with the model read off the keys."""
     if section not in conf:
         raise CalibrationError(f"conf file has no [{section}] section")
     values = conf[section]
+    fisheye = "k4" in values and "p1" not in values and "p2" not in values
+    keys = _FISHEYE_KEYS if fisheye else _PINHOLE_KEYS
     try:
         K = np.array(
             [
-                [float(values["fx"]), 0.0, float(values["cx"])],
-                [0.0, float(values["fy"]), float(values["cy"])],
+                [_number(values["fx"]), 0.0, _number(values["cx"])],
+                [0.0, _number(values["fy"]), _number(values["cy"])],
                 [0.0, 0.0, 1.0],
             ]
         )
-        D = np.array([float(values.get(key, 0.0)) for key in _DISTORTION_KEYS])
+        coefficients = [_number(values[key]) if key in values else 0.0 for key in keys]
     except (KeyError, ValueError) as error:
         raise CalibrationError(f"[{section}] is missing or malformed: {error}") from error
-    return K, D
+    # cv2's fisheye entry points insist on a column vector; the pinhole ones
+    # take either, and a flat array is what the rest of this module expects.
+    D = np.array(coefficients).reshape(4, 1) if fisheye else np.array(coefficients)
+    return K, D, fisheye
 
 
 def _extrinsics(conf, resolution):
@@ -181,8 +215,17 @@ class StereoCalibration:
         self.resolution = resolution
         self.serial = serial
         self.image_size = RESOLUTIONS[resolution]
-        self.K1, self.D1 = _intrinsics(conf, f"LEFT_CAM_{resolution}")
-        self.K2, self.D2 = _intrinsics(conf, f"RIGHT_CAM_{resolution}")
+        self.K1, self.D1, left_fisheye = _intrinsics(conf, f"LEFT_CAM_{resolution}")
+        self.K2, self.D2, right_fisheye = _intrinsics(conf, f"RIGHT_CAM_{resolution}")
+        if left_fisheye != right_fisheye:
+            left_lens = "fisheye" if left_fisheye else "pinhole"
+            right_lens = "fisheye" if right_fisheye else "pinhole"
+            raise CalibrationError(
+                f"[LEFT_CAM_{resolution}] describes a {left_lens} lens and "
+                f"[RIGHT_CAM_{resolution}] a {right_lens} one; there is no "
+                "rectification that spans two models, so this conf file is malformed"
+            )
+        self.fisheye = left_fisheye
         self.R, self.T = _extrinsics(conf, resolution)
         self._rectified = None
         self._maps = None
@@ -206,19 +249,36 @@ class StereoCalibration:
         return cls(conf, resolution=resolution, serial=serial)
 
     def rectify(self):
-        """Return `(R1, R2, P1, P2, Q)` from `cv2.stereoRectify`, computed once."""
+        """Return `(R1, R2, P1, P2, Q)` from cv2's rectification, computed once."""
         if self._rectified is None:
-            R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
-                self.K1,
-                self.D1,
-                self.K2,
-                self.D2,
-                self.image_size,
-                self.R,
-                self.T,
-                flags=cv2.CALIB_ZERO_DISPARITY,
-                alpha=0,
-            )
+            if self.fisheye:
+                # balance=0 is the fisheye spelling of alpha=0: keep only
+                # pixels that are valid in both eyes.
+                R1, R2, P1, P2, Q = cv2.fisheye.stereoRectify(
+                    self.K1,
+                    self.D1,
+                    self.K2,
+                    self.D2,
+                    self.image_size,
+                    self.R,
+                    self.T,
+                    cv2.CALIB_ZERO_DISPARITY,
+                    newImageSize=self.image_size,
+                    balance=0.0,
+                    fov_scale=1.0,
+                )
+            else:
+                R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
+                    self.K1,
+                    self.D1,
+                    self.K2,
+                    self.D2,
+                    self.image_size,
+                    self.R,
+                    self.T,
+                    flags=cv2.CALIB_ZERO_DISPARITY,
+                    alpha=0,
+                )
             # For a rectification referenced to the left eye, P2[0, 3] is -f*B
             # and so negative. Positive means the translation picked up the
             # wrong sign and every depth computed from it would come out behind
@@ -252,13 +312,14 @@ class StereoCalibration:
         """
         if self._maps is None:
             R1, R2, P1, P2, _ = self.rectify()
+            initialise = (
+                cv2.fisheye.initUndistortRectifyMap
+                if self.fisheye
+                else cv2.initUndistortRectifyMap
+            )
             self._maps = (
-                cv2.initUndistortRectifyMap(
-                    self.K1, self.D1, R1, P1, self.image_size, cv2.CV_32FC1
-                ),
-                cv2.initUndistortRectifyMap(
-                    self.K2, self.D2, R2, P2, self.image_size, cv2.CV_32FC1
-                ),
+                initialise(self.K1, self.D1, R1, P1, self.image_size, cv2.CV_32FC1),
+                initialise(self.K2, self.D2, R2, P2, self.image_size, cv2.CV_32FC1),
             )
         return self._maps
 
@@ -293,7 +354,8 @@ class StereoCalibration:
         else:
             K, D, R, P = self.K2, self.D2, R2, P2
         pixels = np.asarray(points, dtype=np.float64).reshape(-1, 1, 2)
-        return cv2.undistortPoints(pixels, K, D, R=R, P=P).reshape(-1, 2)
+        undistort = cv2.fisheye.undistortPoints if self.fisheye else cv2.undistortPoints
+        return undistort(pixels, K, D, R=R, P=P).reshape(-1, 2)
 
     def triangulate(self, left_points, right_points):
         """Triangulate matched detections into 3D points.
@@ -330,4 +392,5 @@ class StereoCalibration:
 
     def __repr__(self):
         serial = f"SN{self.serial}" if self.serial else "unknown serial"
-        return f"<StereoCalibration {serial} {self.resolution}>"
+        lens = "fisheye" if self.fisheye else "pinhole"
+        return f"<StereoCalibration {serial} {self.resolution} {lens}>"
