@@ -5,6 +5,10 @@ environment variable is set and the MuJoCo simulation otherwise, so the same
 script runs against either. The backends are also importable directly as
 `RealXArm7` and `SimulatedXArm7`.
 
+Both carry the xArm Gripper on the flange, driven with `grip`; the safety guard
+carries it too, so the box and the self-collision check stop the fingertips
+rather than the flange. See `gripper.py`.
+
 `ZedOpenCapture` and `StereoCalibration` cover the ZED stereo camera, imported on
 first use so that the simulator needs neither OpenCV nor the native shim.
 
@@ -22,8 +26,15 @@ from .free_drive import (
     FREE_JOINTS,
     HOME_POSE,
     LOCKED_TOLERANCE,
+    WATCHED_JOINTS,
     Trajectory,
-    free_mask,
+    stop_on_enter,
+    watch_mask,
+)
+from .gripper import (
+    GRIPPER_CLOSED,
+    GRIPPER_OPEN,
+    GRIPPER_STROKE,
 )
 from .handeye import HandEye, HandEyeError, load_handeye
 from .visualize import (
@@ -91,6 +102,9 @@ __all__ = [
     "DemoVisualizer",
     "DEFAULT_MARGIN",
     "FREE_JOINTS",
+    "GRIPPER_CLOSED",
+    "GRIPPER_OPEN",
+    "GRIPPER_STROKE",
     "HOME_POSE",
     "HandEye",
     "HandEyeError",
@@ -106,6 +120,7 @@ __all__ = [
     "SimulatedXArm7",
     "StereoCalibration",
     "Trajectory",
+    "WATCHED_JOINTS",
     "Violation",
     "VisualizerHandle",
     "XArmError",
@@ -118,4 +133,6 @@ __all__ = [
     "load_handeye",
     "query_serial",
     "segment_transform",
+    "stop_on_enter",
+    "watch_mask",
 ]

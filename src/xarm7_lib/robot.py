@@ -3,7 +3,7 @@ import os
 import traceback
 
 from .api import RobotInterface
-from .free_drive import FREE_JOINTS
+from .gripper import GRIPPER_CLOSED
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN
 from .visualize import RobotMirror, VisualizerHandle
 from .xarm7_mujoco import SimulatedXArm7
@@ -23,21 +23,21 @@ class Robot(RobotInterface):
 
     def __init__(self, sim=False, safety_box=DEFAULT_BOX,
                  safety_margin=DEFAULT_MARGIN, guard=True, q0=None,
-                 visualize=True, zmq_url=None):
+                 visualize=True, zmq_url=None, gripper=True):
         super().__init__()
         safety = dict(safety_box=safety_box, safety_margin=safety_margin, guard=guard)
         ip = os.environ.get('ROBOT_IP', '').strip()
         self._mirror = None
         self._visualizers = []
         if ip and not sim:
-            self.robot = RealXArm7(ip, **safety)
+            self.robot = RealXArm7(ip, gripper=gripper, **safety)
             if visualize:
                 self._mirror = RobotMirror(
                     self.robot, guard=self.robot.guard, zmq_url=zmq_url
                 )
         else:
             self.robot = SimulatedXArm7(
-                visualize=visualize, q0=q0, zmq_url=zmq_url, **safety
+                visualize=visualize, q0=q0, gripper=gripper, zmq_url=zmq_url, **safety
             )
 
     # ------------------------------------------------------------------
@@ -135,6 +135,13 @@ class Robot(RobotInterface):
     def servo_joints(self, joints, velocities=None):
         return self.robot.servo_joints(joints, velocities=velocities)
 
+    @property
+    def gripper_opening(self):
+        return self.robot.gripper_opening
+
+    def grip(self, opening=GRIPPER_CLOSED, speed=None, wait=True, timeout=None):
+        return self.robot.grip(opening, speed=speed, wait=wait, timeout=timeout)
+
     def stop(self, wait=True, timeout=None):
         return self.robot.stop(wait=wait, timeout=timeout)
 
@@ -177,18 +184,20 @@ class Robot(RobotInterface):
         self.close()
         return False
 
-    def free_drive(self, free=FREE_JOINTS, duration=30.0, **options):
+    def free_drive(self, duration=30.0, **options):
         """Hand-guide the arm and record where it went.
 
-        Real arm only, and deliberately so: there is nothing to push in
-        simulation. See `RealXArm7.free_drive` for the options.
+        Every joint is free unless `watch=` says otherwise, and `duration=None`
+        runs until something stops it. Real arm only, and deliberately so:
+        there is nothing to push in simulation. See `RealXArm7.free_drive` for
+        the options.
         """
         if not hasattr(self.robot, "free_drive"):
             raise NotImplementedError(
                 "free drive needs the real arm — there is nothing to push in "
                 "simulation. Set ROBOT_IP and construct Robot() without sim=True."
             )
-        return self.robot.free_drive(free, duration, **options)
+        return self.robot.free_drive(duration, **options)
 
 
 if __name__ == '__main__':
@@ -200,6 +209,9 @@ if __name__ == '__main__':
     # loop below is interrupted.
     with Robot() as robot:
         robot.set_joint_targets([0, 0, 0, 0, 0, 0, 0], wait=True)
+
+        robot.grip(1.0)  # jaws open
+        robot.grip(0.0)  # and shut again
 
         t = 0
         try:

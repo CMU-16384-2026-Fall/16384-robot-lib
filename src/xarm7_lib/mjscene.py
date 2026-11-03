@@ -86,11 +86,12 @@ def find_gripper_geoms(model):
 def hide_gripper(model, geoms):
     """Take the gripper out of the contact set and out of the picture.
 
-    The real arm this mirrors has a bare flange, and the guard's model has
-    no gripper either. Leaving the MJCF's one collidable would have the
-    simulator jam on a part the hardware doesn't carry — and jam silently,
-    since the guard would have nothing to say about it. Only the geometry
-    goes; the mass stays, standing in for whatever is actually bolted on.
+    For an arm told it has no gripper, which says there is nothing bolted on:
+    the guard is built without the gripper too, so leaving the MJCF's one
+    collidable would have the simulator jam on a part that is not supposed to
+    be there — and jam silently, with the guard having nothing to say about
+    it. Only the geometry goes; the mass stays, standing in for whatever
+    really is on the flange.
     """
     for geom in geoms:
         model.geom_contype[geom] = 0

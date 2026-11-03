@@ -8,15 +8,16 @@ answer (the sim stops at the boundary and warns, the real arm refuses).
 
 The geometry is UFACTORY's own, via Pinocchio and Coal:
 
-    model       `xarm7_description`, 7 DoF and no gripper, so `q` is exactly the
-                7 joint values the rest of this library passes around.
+    model       `xarm7_description` with the gripper on it and the finger joints
+                frozen out, so `q` is exactly the 7 joint values the rest of
+                this library passes around.
     meshes      the simplified `xarm7_1305/collision` meshes, reduced further to
                 their convex hulls — as loaded they are triangle-soup BVHs and a
                 single check costs 11 ms, which is 500x too slow to sit inside a
-                servo loop. Convex hulls bring that to ~30 us.
+                servo loop. Convex hulls bring that to ~35 us.
     pairs       from the arm's own MoveIt SRDF. Of the 28 link pairs, 17 are
                 disabled there as Adjacent/Default/Never, leaving 11 that can
-                genuinely collide.
+                genuinely collide; the gripper brings 6 more.
 
 That SRDF is doing real work. Links which are merely *adjacent* rest against
 each other permanently — `link1` and `link_base` sit fractions of a millimetre
@@ -30,6 +31,21 @@ provides.
 With the adjacent pairs disabled, a clearance margin becomes meaningful again,
 and `margin` is applied as Coal's security margin — the check trips that far
 before contact, rather than after.
+
+The gripper is in the model as a single convex envelope on the flange rather
+than as its seven links. Nothing here is ever told how far open the jaws are —
+`q` is the arm's seven joints and nothing else — so the envelope is the hull of
+the gripper over the jaws' whole travel, and clearing it means clearing the
+gripper whatever it is doing. The hull closes over the gap between the jaws,
+which is where a held part sits: that a part cannot be anywhere the jaws
+couldn't be is the only account of one this guard has.
+
+That merge is why the gripper's own SRDF rows can't be applied one for one.
+They name `left_finger` and `right_inner_knuckle` where the envelope is all
+seven links at once, so a pair is dropped only when every one of them is
+cleared against that arm link — true of `link6` and `link7`, the two the
+gripper is bolted against, and not of `link3` (five of the seven) or `link5`
+(four), which stay armed.
 
 The safety box is carried in the same collision problem as six half-spaces, one
 per face, each oriented so that the solid half is the *outside*. Leaving the box
@@ -56,7 +72,7 @@ import pinocchio as pin
 # shoulder sweeps back to x = -204 mm in ordinary poses and the arm stands over
 # a metre tall, so a box drawn only around the reachable *workspace* would
 # exclude the arm holding still at home. z = 0 is the mounting surface.
-DEFAULT_BOX = ((-0.10, 0.70), (-0.45, 0.45), (0.00, 0.80))
+DEFAULT_BOX = ((-0.20, 0.80), (-0.5, 0.5), (-0.15, 0.65))
 
 # 10 mm of clearance between link pairs, with room to spare: the home pose,
 # where link2 and link4 legitimately sit close together at the elbow, only
@@ -66,6 +82,25 @@ DEFAULT_MARGIN = 0.010
 
 _DESCRIPTION = "xarm7_description"
 _SRDF_RELPATH = "xarm_moveit_config/srdf/_xarm7_macro.srdf.xacro"
+
+# The description builds the gripper on request, and its SRDF carries the
+# gripper's own disabled pairs behind the same switch.
+_GRIPPER_XACRO = {"add_gripper": "true"}
+# The flange: what the gripper is bolted to, and the frame its envelope is
+# written in.
+_FLANGE_JOINT = "joint7"
+_FLANGE_LINK = "link7"
+# One geometry stands for the whole gripper, under this name — so a violation
+# says "gripper" rather than naming a knuckle nobody can place.
+_GRIPPER_NAME = "gripper"
+# Jaw openings pooled into that envelope. The jaws don't sweep a convex volume
+# between the two extremes — they come in by 33 mm and reach 12 mm further
+# forward as they close — so the ends alone would miss the middle. Their path
+# is an arc, which a pooled hull chords: at this many samples the fingers bulge
+# at most 0.03 mm outside the envelope between them, which is a thousandth of
+# `DEFAULT_MARGIN` and far below what the simplified meshes are worth anyway.
+# Five samples would leave 0.3 mm of it, 21 would leave 0.01 mm.
+_GRIPPER_SAMPLES = 13
 
 # The base is bolted down. Including it in the box would mean reporting a
 # violation the caller has no way to move out of.
@@ -122,19 +157,24 @@ class SafetyGuard:
     margin : clearance in metres between link pairs; the check trips this far
         before two links touch. It does not apply to the box, whose faces trip
         where they are drawn.
+    gripper : include the xArm Gripper, as one convex envelope on the flange
+        covering the jaws at every opening. Off models the bare flange the arm
+        used to have, which is 175 mm shorter and will call poses safe that
+        put the jaws through a wall.
 
     Building one loads and convexifies the meshes, which takes a moment; the
     checks themselves are tens of microseconds, so share a guard rather than
     building one per call.
     """
 
-    def __init__(self, box=DEFAULT_BOX, margin=DEFAULT_MARGIN):
+    def __init__(self, box=DEFAULT_BOX, margin=DEFAULT_MARGIN, gripper=True):
         from robot_descriptions.loaders.pinocchio import load_robot_description
 
-        robot = load_robot_description(_DESCRIPTION)
+        robot = load_robot_description(
+            _DESCRIPTION, xacro_args=_GRIPPER_XACRO if gripper else None
+        )
         self.model = robot.model
         self.geometry = robot.collision_model
-        self.nq = self.model.nq
 
         # Triangle meshes make this 500x slower for no benefit here: the links
         # are convex enough that their hulls are what the arm's own planner
@@ -156,6 +196,12 @@ class SafetyGuard:
             if obj.geometry.convex is None:
                 raise RuntimeError(f"no convex hull built for {obj.name}")
             obj.geometry = obj.geometry.convex
+
+        # Before the pairs are drawn up: merging swaps seven gripper links for
+        # one envelope and takes the finger joints out of the model, both of
+        # which change what there is to pair.
+        self._gripper_links = self._merge_gripper() if gripper else []
+        self.nq = self.model.nq
 
         self.geometry.addAllCollisionPairs()
         self._apply_srdf()
@@ -336,6 +382,101 @@ class SafetyGuard:
             raise ValueError(f"expected {self.nq} joint values, got {q.size}")
         return q
 
+    def _merge_gripper(self):
+        """Swap the gripper's seven links for one convex envelope on the flange,
+        and lock the finger joints out of the model.
+
+        Two things have to be true at once. `q` is the arm's seven joints
+        everywhere in this library, so the finger joints the description brings
+        with the gripper cannot stay — `buildReducedModel` freezes them and
+        hands back a seven-joint model. And the guard is never told how far open
+        the jaws are, so the one envelope has to answer for all of them: it is
+        the convex hull of the gripper over its whole travel, which is what
+        makes "the envelope is clear" mean "the gripper is clear, whatever it is
+        doing".
+
+        The hull closes over the gap between the jaws, which is not a loss. That
+        gap is where a held part sits, and a part is the thing most likely to be
+        carried into something — this is the only account the guard has of it.
+
+        Returns the names of the links that went into the envelope, which
+        `_apply_srdf` needs to work out what it may rest against.
+        """
+        flange = self.model.getJointId(_FLANGE_JOINT)
+        fingers = [j for j in range(1, self.model.njoints) if j > flange]
+        gids = [
+            gid
+            for gid, obj in enumerate(self.geometry.geometryObjects)
+            if obj.parentJoint > flange
+            or (obj.parentJoint == flange and not obj.name.startswith(_FLANGE_LINK))
+        ]
+        if not fingers or not gids:
+            raise RuntimeError(
+                f"{_DESCRIPTION} built with {_GRIPPER_XACRO} has no gripper on "
+                f"it: {len(fingers)} joints and {len(gids)} geometries past "
+                f"{_FLANGE_JOINT}"
+            )
+        links = [_link_name(self.geometry.geometryObjects[gid].name) for gid in gids]
+
+        envelope = self._gripper_envelope(flange, fingers, gids)
+        for gid in sorted(gids, reverse=True):
+            self.geometry.removeGeometryObject(self.geometry.geometryObjects[gid].name)
+        self.model, self.geometry = pin.buildReducedModel(
+            self.model, self.geometry, fingers, pin.neutral(self.model)
+        )
+        # On the flange's own joint, so it rides with `link7` — and so
+        # `addAllCollisionPairs` doesn't pair the two, which is right: they are
+        # bolted together.
+        self.geometry.addGeometryObject(
+            pin.GeometryObject(
+                _GRIPPER_NAME,
+                self.model.getJointId(_FLANGE_JOINT),
+                pin.SE3.Identity(),
+                envelope,
+            )
+        )
+        return links
+
+    def _gripper_envelope(self, flange, fingers, gids):
+        """The gripper's convex hull over the jaws' whole travel, in the
+        flange's frame.
+
+        The points come off the link hulls built a moment ago rather than the
+        meshes, which is the same hull in the end and a tenth of the points to
+        push through Qhull.
+        """
+        data = self.model.createData()
+        geom_data = self.geometry.createData()
+        q = pin.neutral(self.model)
+        index = [self.model.joints[j].idx_q for j in fingers]
+        closed = float(np.max(self.model.upperPositionLimit[index]))
+        opened = float(np.min(self.model.lowerPositionLimit[index]))
+
+        points = []
+        for opening in np.linspace(opened, closed, _GRIPPER_SAMPLES):
+            q[index] = opening
+            pin.updateGeometryPlacements(
+                self.model, data, self.geometry, geom_data, q
+            )
+            into_flange = data.oMi[flange].inverse()
+            for gid in gids:
+                placement = into_flange * geom_data.oMg[gid]
+                local = np.asarray(
+                    self.geometry.geometryObjects[gid].geometry.points(), dtype=float
+                )
+                points.append(local @ placement.rotation.T + placement.translation)
+        points = np.vstack(points)
+
+        hull = coal.BVHModelOBBRSS()
+        hull.beginModel(0, len(points))
+        hull.addVertices(points)
+        hull.endModel()
+        # The same hulling the links get, and for the same reason — see above.
+        hull.buildConvexHull(True, _QHULL_TRIANGULATE)
+        if hull.convex is None:
+            raise RuntimeError("no convex hull built for the gripper envelope")
+        return hull.convex
+
     def _apply_srdf(self):
         """Disable the link pairs the arm's MoveIt config says can't collide.
 
@@ -366,6 +507,42 @@ class SafetyGuard:
                 f"the SRDF at {path} disabled none of the {before} collision "
                 "pairs; without it every adjacent link reads as a collision"
             )
+        self._disable_gripper_pairs(rows)
+
+    def _disable_gripper_pairs(self, rows):
+        """Disable the envelope against the arm links the gripper may rest on.
+
+        The same SRDF covers the gripper, behind the `add_gripper` switch, but
+        it talks about the gripper one link at a time where the envelope is all
+        seven at once. So a pair can only be dropped when the SRDF drops it for
+        every one of them — which it does for `link6` and `link7`, the two the
+        gripper is bolted against, and not for `link3` (five of seven) or
+        `link5` (four). Anything short of unanimous stays armed: those are
+        parts of the gripper that genuinely can reach those links, and a merged
+        envelope cannot tell the guard which half of itself to ignore.
+
+        `removeCollisionPairsFromXML` can't do this itself — the rows name
+        links that stopped existing when the envelope replaced them.
+        """
+        if not self._gripper_links:
+            return
+        parts = set(self._gripper_links)
+
+        allowed = {}
+        for row in rows:
+            names = re.findall(r'link[12]="([^"]+)"', row)
+            if len(names) != 2 or (names[0] in parts) == (names[1] in parts):
+                continue  # both sides gripper, or neither: not about the envelope
+            part, link = sorted(names, key=lambda name: name not in parts)
+            allowed.setdefault(link, set()).add(part)
+
+        envelope = self.geometry.getGeometryId(_GRIPPER_NAME)
+        for gid, obj in enumerate(self.geometry.geometryObjects):
+            if allowed.get(_link_name(obj.name)) != parts:
+                continue
+            pair = pin.CollisionPair(gid, envelope)
+            if self.geometry.existCollisionPair(pair):
+                self.geometry.removeCollisionPair(pair)
 
     def _add_walls(self):
         """Add the six box faces as half-spaces and pair every link with them."""
