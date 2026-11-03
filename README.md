@@ -475,6 +475,7 @@ A visualizer is any object with these. Only `poll` is required:
 | `close()` | once, at the end | — | let go of whatever it owns |
 | `frame` | — | — | `"base"` (the default), `"camera"` or `"world"` |
 | `rate` | — | — | Hz, or `None` to run as fast as `poll` returns |
+| `serial` | — | — | which camera, when `frame` is `"camera"` — see [Frames](#frames) |
 
 The split between `poll` and `geometry` is the reason this is worth having.
 Reading a camera and finding something in the picture takes 60–140 ms, and
@@ -539,6 +540,29 @@ stereo gave it. It never loads a calibration, never composes a transform, and
 never has to know that the MJCF stands the arm's base 120 mm above the world
 origin. Re-filing the calibration and calling `handle.refresh_frame()` moves
 everything it ever drew.
+
+A visualizer in camera coordinates should also say *which* camera, as a
+`serial` or as a `camera` exposing one — `LightsaberDetector` has both, so
+nothing is needed for the usual case:
+
+```python
+class Stick:
+    frame = "camera"
+
+    @property
+    def serial(self):
+        return self.camera.serial      # whatever the camera reported
+```
+
+That is what the calibration is filed under. It has to come from the
+visualizer because a ZED keeps its serial in a register that can only be read
+by *opening* the camera, and the visualizer is already streaming it: asked
+instead of told, the library would open a camera that is busy, get nothing
+back, and go quiet about the one camera it is certainly looking through.
+Without a serial it falls back to probing the bus, which is right for a
+visualizer that owns no camera and fails for one that does. `handeye=` on
+`register_visualizer` hands a calibration over outright and skips the lookup
+either way.
 
 With `frame = "camera"` and no calibration filed on the bench, nothing is
 drawn, and the reason is printed once. That is deliberate: camera coordinates

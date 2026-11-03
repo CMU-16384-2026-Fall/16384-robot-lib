@@ -97,6 +97,86 @@ def test_camera_frame_without_a_calibration_draws_nothing(robot, viewer, monkeyp
     assert handle.frame_transform is None
 
 
+def test_the_visualizers_own_serial_is_what_is_looked_up(robot, viewer, handeye, monkeypatch):
+    """A detector holding the camera open must not be asked to open it again.
+
+    The serial lives in a register that can only be read by opening the camera,
+    so a visualizer streaming one is the only thing that can say which it is.
+    Probing instead opens a camera that is already streaming, which fails, and
+    the blade then quietly stops being drawn.
+    """
+    asked = []
+
+    def record(serial=None):
+        asked.append(serial)
+        return handeye
+
+    monkeypatch.setattr(handeye_module, "load_handeye", record)
+
+    visualizer = Still([0, 0, 1], frame="camera")
+    visualizer.serial = "10028521"
+    handle = VisualizerHandle(robot, visualizer, "still", start=False)
+    step(handle)
+
+    assert asked == ["10028521"], "the visualizer's serial must be used as given"
+    assert handle.frame_transform is not None
+
+
+def test_a_serial_is_taken_off_the_camera_a_visualizer_exposes(robot, viewer, handeye, monkeypatch):
+    """`camera.serial` is the other half of the contract -- see `visualizer_serial`."""
+    asked = []
+    monkeypatch.setattr(
+        handeye_module, "load_handeye", lambda serial=None: asked.append(serial) or handeye
+    )
+
+    class Camera:
+        serial = "10028521"
+
+    visualizer = Still([0, 0, 1], frame="camera")
+    visualizer.camera = Camera()
+    step(VisualizerHandle(robot, visualizer, "still", start=False))
+
+    assert asked == ["10028521"]
+
+
+def test_a_camera_that_raises_falls_back_to_probing(robot, viewer, handeye, monkeypatch):
+    """Asking must never be what breaks the drawing: a property may raise."""
+    asked = []
+    monkeypatch.setattr(
+        handeye_module, "load_handeye", lambda serial=None: asked.append(serial) or handeye
+    )
+
+    class Broken(Still):
+        @property
+        def camera(self):
+            raise RuntimeError("the camera went away")
+
+    step(VisualizerHandle(robot, Broken([0, 0, 1], frame="camera"), "still", start=False))
+
+    assert asked == [None], "a visualizer that cannot say should fall back, not fail"
+
+
+def test_a_visualizer_with_no_camera_still_probes(robot, viewer, handeye, monkeypatch):
+    asked = []
+    monkeypatch.setattr(
+        handeye_module, "load_handeye", lambda serial=None: asked.append(serial) or handeye
+    )
+
+    step(VisualizerHandle(robot, Still([0, 0, 1], frame="camera"), "still", start=False))
+    assert asked == [None]
+
+
+def test_visualizer_serial_prefers_the_visualizers_own(monkeypatch):
+    from xarm7_lib.visualize import visualizer_serial
+
+    class Both:
+        serial = 10028521  # an int, as a camera that read it back might give
+        camera = type("C", (), {"serial": "99999999"})()
+
+    assert visualizer_serial(Both()) == "10028521", "its own serial wins, as a string"
+    assert visualizer_serial(object()) is None
+
+
 def test_an_unknown_frame_is_refused(robot):
     handle = VisualizerHandle(robot, Still([0, 0, 0], frame="elbow"), "still", start=False)
     assert handle._poll()

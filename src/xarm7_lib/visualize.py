@@ -220,15 +220,52 @@ class Visualizer(typing.Protocol):
     animations, arbitrary properties, a hierarchy built by hand. It is called
     with this visualizer's own meshcat node and the viewer's lock held, so it
     must not block.
+
+    `serial` matters only when `frame` is "camera". A ZED will not say which
+    camera it is without being opened, and a visualizer in camera coordinates
+    is usually holding that camera open already — so the library asks the
+    visualizer for it rather than the bus, and a detector that owns a camera
+    should expose it, either as `serial` or on a `camera` attribute. Without it
+    the lookup falls back to probing, which fails on exactly the camera being
+    drawn from.
     """
 
     frame: str = "base"  # "base", "camera" or "world"
     rate: float | None = None  # Hz; None means unpaced, poll() is the clock
+    serial: str | None = None  # which camera, when `frame` is "camera"
 
     def poll(self) -> None: ...
     def geometry(self) -> dict: ...  # optional
     def draw(self, node) -> None: ...  # optional
     def close(self) -> None: ...  # optional
+
+
+def visualizer_serial(visualizer):
+    """Which camera `visualizer` is looking through, or None if it cannot say.
+
+    A ZED's serial number can only be read by opening the camera, and a
+    visualizer drawing in camera coordinates is usually holding that camera
+    open itself -- so going to the bus for it would mean opening a camera that
+    is already streaming, which fails, and the calibration keyed on that serial
+    would then be unfindable for the one camera we are certainly looking
+    through. The object in front of us already knows, so it is asked first: a
+    `serial` of its own, or the `serial` of a `camera` it exposes.
+
+    None means fall back to probing, which is the right answer for a visualizer
+    that owns no camera.
+    """
+    for path in (("serial",), ("camera", "serial")):
+        value = visualizer
+        try:
+            for attribute in path:
+                value = getattr(value, attribute)
+        except Exception:
+            # Asking must not be what breaks the drawing: `camera` may be a
+            # property, and a property is free to raise. The fallback is fine.
+            continue
+        if value is not None:
+            return str(value)
+    return None
 
 
 def _as_item(value):
@@ -502,10 +539,14 @@ class VisualizerHandle:
     def _load_handeye(self):
         """The bench's hand-eye calibration, loaded the first time it is wanted.
 
-        Lazily and on this thread on purpose: finding it with no serial given
-        opens the camera, which needs OpenCV and the native shim, and that must
-        not be what makes `register_visualizer` fail on a machine that has
-        neither.
+        Lazily and on this thread on purpose: finding it without a serial opens
+        the camera, which needs OpenCV and the native shim, and that must not be
+        what makes `register_visualizer` fail on a machine that has neither.
+
+        The serial comes from the visualizer when it can give one -- see
+        `visualizer_serial`. Probing for it is the fallback and not the first
+        choice, because the camera it would have to open to ask is, for a
+        visualizer drawing in camera coordinates, the one already streaming.
         """
         if self._handeye is not None or self._handeye_failed:
             return self._handeye
@@ -513,7 +554,7 @@ class VisualizerHandle:
         from .handeye import HandEyeError, load_handeye
 
         try:
-            self._handeye = load_handeye()
+            self._handeye = load_handeye(serial=visualizer_serial(self.visualizer))
         except HandEyeError as err:
             # Its own message already lists everywhere it looked and says what
             # to run. Drawing camera coordinates as if they were base

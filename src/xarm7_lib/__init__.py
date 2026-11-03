@@ -43,6 +43,7 @@ from .visualize import (
     RobotMirror,
     VisualizerHandle,
     segment_transform,
+    visualizer_serial,
 )
 from .robot import Robot
 from .safety import (
@@ -134,5 +135,6 @@ __all__ = [
     "query_serial",
     "segment_transform",
     "stop_on_enter",
+    "visualizer_serial",
     "watch_mask",
 ]

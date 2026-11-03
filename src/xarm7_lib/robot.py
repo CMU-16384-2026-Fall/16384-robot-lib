@@ -86,6 +86,12 @@ class Robot(RobotInterface):
         calibration, so a detector hands over the numbers it produced and
         nothing else. `visualize.Visualizer` is the full contract.
 
+        A visualizer drawing in camera coordinates should say which camera it
+        is looking through, as a `serial` or a `camera` exposing one: that is
+        how the calibration is found. Asking the camera instead means opening
+        it, and the detector already has it open. `handeye=` hands a
+        calibration over outright and skips the lookup.
+
         Returns a handle; `stop()` it to take the visualizer off the scene.
         `close()` stops every one of them.
         """
