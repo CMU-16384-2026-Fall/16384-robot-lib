@@ -296,3 +296,147 @@ python -m xarm7_lib.calibrate_handeye self-test
 A synthetic bench with a known answer, real kinematics and real board geometry.
 It recovers the camera to about 0.03° and 0.5 mm, and fails loudly if any
 transform is composed the wrong way round.
+
+# The picture
+
+`Robot()` comes with a meshcat scene showing where the arm is, and prints its
+URL on startup. In simulation that is the arm MuJoCo is stepping. On the real
+arm it is a `RobotMirror`: a copy of the same model with the measured joint
+angles written into it and forward kinematics run over them, thirty times a
+second, on its own thread. No physics — a mirror that stepped physics would
+droop away from the arm it is supposed to be showing.
+
+Either way the safety box is drawn around it, and faces light up as the arm
+gets near them. Pass `visualize=False` for a run with nobody watching.
+
+```python
+with Robot() as robot:          # prints e.g. Meshcat: http://127.0.0.1:7000/static/
+    robot.set_joint_targets(HOME_POSE)
+```
+
+## Drawing other things beside the arm
+
+`register_visualizer` adds something to that scene and keeps it up to date on a
+thread of its own:
+
+```python
+det = LightsaberDetector()
+with Robot() as robot:
+    robot.register_visualizer(det)
+    ...                              # det.blade_in_base() while the picture keeps up
+```
+
+A visualizer is any object with these. Only `poll` is required:
+
+| | when | may it block? | what it does |
+|---|---|---|---|
+| `poll()` | every iteration | **yes** | the slow work: read a camera, find something, remember it |
+| `geometry()` | straight after | no | say what should be in the scene *now* |
+| `draw(node)` | straight after | no | the escape hatch: its own meshcat node, for what `geometry` cannot say |
+| `close()` | once, at the end | — | let go of whatever it owns |
+| `frame` | — | — | `"base"` (the default), `"camera"` or `"world"` |
+| `rate` | — | — | Hz, or `None` to run as fast as `poll` returns |
+
+The split between `poll` and `geometry` is the reason this is worth having.
+Reading a camera and finding something in the picture takes 60–140 ms, and
+meshcat speaks over a socket that has to be held exclusively while it is
+written to. `poll` runs with nothing held, so it can take as long as it likes;
+only the handful of messages `geometry` implies are sent under the lock. The
+arm's own thirty frames a second never wait for the camera.
+
+`geometry()` returns `{name: (geometry, material, transform)}` — exactly
+meshcat's `set_object` arguments plus a pose, so a point cloud or a line set
+goes through unchanged:
+
+```python
+import meshcat.geometry as g
+from xarm7_lib import segment_transform
+
+class Stick:
+    frame = "camera"            # the numbers the detector produced, untouched
+
+    def __init__(self):
+        # Once, here — not in geometry(). The scene is diffed, so a geometry
+        # object it has seen before is only moved. Rebuilding it every frame
+        # pushes a new mesh over the socket thirty times a second instead.
+        self.shaft = g.Cylinder(1.0, radiusBottom=1.0, radiusTop=0.6)
+        self.red = g.MeshLambertMaterial(color=0xFF2020)
+
+    def poll(self):
+        self.ends = my_detector.read()          # slow; nothing is held
+
+    def geometry(self):
+        if self.ends is None:
+            return {}                           # nothing named, nothing on screen
+        return {"blade": (self.shaft, self.red,
+                          segment_transform(*self.ends, radius=0.0125))}
+```
+
+Two things follow from `geometry()` being a statement about *now* rather than a
+list of changes. A name that stops appearing is hidden, so a detection going
+stale leaves the screen without anyone having to remember to remove it — which
+matters, because a stick left on screen from four seconds ago is the worst
+outcome available here: it looks right. And a name that comes back is shown
+again without the mesh being re-sent.
+
+`segment_transform(start, end, radius)` places a unit cylinder as the segment
+between two points. The length and radius live in the transform rather than in
+the geometry, which is what makes a moving, re-lengthening stick cost one
+message a frame.
+
+### Frames
+
+`frame` says what the numbers in those transforms mean, and the subtree is
+placed accordingly:
+
+| `frame` | the transform applied to the whole subtree |
+|---|---|
+| `"world"` | nothing |
+| `"base"` | the arm's base frame — what joint angles, the safety box and `points_to_base` all speak |
+| `"camera"` | the base frame composed with the bench's hand-eye calibration |
+
+So a detector declares `frame = "camera"` and hands over the metres its
+stereo gave it. It never loads a calibration, never composes a transform, and
+never has to know that the MJCF stands the arm's base 120 mm above the world
+origin. Re-filing the calibration and calling `handle.refresh_frame()` moves
+everything it ever drew.
+
+With `frame = "camera"` and no calibration filed on the bench, nothing is
+drawn, and the reason is printed once. That is deliberate: camera coordinates
+drawn as if they were base coordinates would be a confident picture of the
+wrong place, about a metre out, and would cost somebody an afternoon. `poll()`
+keeps running, so readings stay available.
+
+### When something goes wrong
+
+`register_visualizer` returns a handle. `stop()` takes the visualizer off the
+scene; `Robot.close()` stops every one it handed out, before disconnecting the
+arm, and the thread is always joined before `close()` is called — a camera
+released while another thread is mid-read crashes inside the driver rather than
+raising.
+
+A visualizer that fails is disabled rather than left printing: `geometry()` and
+`draw()` are pure, so one traceback and it stops; `poll()` touches hardware, so
+it gets five tries first, because a dropped USB frame is not a reason to stay
+dark for the rest of the session. Either way the arm keeps running, and so does
+everything else registered. A browser tab that goes away takes the picture with
+it and nothing else.
+
+## Checking it without a robot
+
+```bash
+python -m xarm7_lib.visualize
+```
+
+The simulated arm with a stick tumbling around it — the whole path with no
+hardware and no camera. `--mirror` drives a `RobotMirror` from a fake arm
+instead, which is the only way to exercise the real-arm picture before there is
+a real arm. `--rate`, `--churn`, `--bad-name` and `--raise-in {poll,geometry}`
+provoke the failure paths on purpose; two of them are silent when they happen
+by accident, which is why they have a switch.
+
+```bash
+pip install -e ".[dev]" && python -m pytest tests -q
+```
+
+The frame chain and the 120 mm are asserted there, against the real MJCF.

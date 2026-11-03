@@ -135,7 +135,7 @@ GOOD_SPREAD = 0.005  # m of leave-one-out wander
 # needs around a marker has to stay proportional when the board is resized.
 # Three quarters is what OpenCV's own samples use.
 MARKER_RATIO = 0.75
-DEFAULT_SQUARE_LENGTH = 0.010  # m
+DEFAULT_SQUARE_LENGTH = 0.020  # m
 
 DEFAULT_BOARD = BoardSpec(
     squares_x=5,

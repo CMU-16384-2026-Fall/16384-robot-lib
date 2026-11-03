@@ -37,8 +37,10 @@ _FLOOR_OPACITY = 0.55
 _WALL_COLOR = 0xD08B2C
 _WALL_OPACITY = 0.12
 
-# three.js builds cylinders along +Y; MuJoCo's axis is +Z.
-_Y_TO_Z = np.array(
+# three.js builds cylinders along +Y; MuJoCo's axis is +Z. Public, because
+# anything drawing its own cylinder into this scene needs the same fix-up —
+# see `visualize.segment_transform`.
+Y_TO_Z = np.array(
     [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, -1.0, 0.0],
@@ -142,13 +144,13 @@ class MeshcatVisualizer:
 
         if gtype == T.mjGEOM_CYLINDER:
             return [
-                ("", g.Cylinder(2.0 * float(size[1]), float(size[0])), _Y_TO_Z),
+                ("", g.Cylinder(2.0 * float(size[1]), float(size[0])), Y_TO_Z),
             ]
 
         if gtype == T.mjGEOM_CAPSULE:
             radius, half = float(size[0]), float(size[1])
             return [
-                ("cylinder", g.Cylinder(2.0 * half, radius), _Y_TO_Z),
+                ("cylinder", g.Cylinder(2.0 * half, radius), Y_TO_Z),
                 ("cap_pos", g.Sphere(radius), _translation([0.0, 0.0, half])),
                 ("cap_neg", g.Sphere(radius), _translation([0.0, 0.0, -half])),
             ]

@@ -895,6 +895,16 @@ def load_handeye(serial=None):
         A `HandEye`.
     """
     if serial is None:
+        # `$XARM7_HANDEYE` names a file outright, so it needs no serial and so
+        # no camera. Checked before anything is probed, because the point of it
+        # is to work on a machine that has no camera to probe -- a TA trying a
+        # calibration on a laptop, or a test with a synthetic one.
+        override = os.environ.get(HANDEYE_ENV, "").strip()
+        if override:
+            path = pathlib.Path(override).expanduser()
+            if path.is_file():
+                return HandEye.load(path)
+
         # Imported here and not at the top of the module: finding the attached
         # camera needs OpenCV and the shim, and loading a calibration for a
         # named camera needs neither.
@@ -907,7 +917,18 @@ def load_handeye(serial=None):
                 "`pip install -e '.[camera]'` or pass serial= -- it is printed "
                 f"on the camera's back panel. ({error})"
             ) from error
-        _, serial = find_device()
+        try:
+            _, serial = find_device()
+        except Exception as error:
+            # Whatever went wrong looking for the camera, what the caller asked
+            # for was a calibration, so that is the failure they should get --
+            # and the two ways out are the same either way.
+            raise HandEyeError(
+                "no camera could be found, so there is no serial number to look "
+                "a calibration up by. Pass serial= -- it is printed on the "
+                f"camera's back panel -- or set ${HANDEYE_ENV} to a calibration "
+                f"file. ({error})"
+            ) from error
         if serial is None:
             raise HandEyeError(
                 "the attached camera's serial number could not be read, so its "

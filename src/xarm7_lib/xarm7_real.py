@@ -633,6 +633,11 @@ class RealXArm7(RobotInterface):
             raise ValueError(f"joint target outside limits: {detail}")
         return q
 
+    @property
+    def guard(self):
+        """The `SafetyGuard` checking this arm's setpoints, or None."""
+        return self._guard
+
     def _check_safe(self, q):
         """Raise if the arm may not be at `q`."""
         if self._guard is None:

@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 camera = ["opencv-python"]
+dev = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/tooflesswulf/16384-prototype-lib"

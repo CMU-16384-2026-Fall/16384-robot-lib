@@ -26,6 +26,13 @@ from .free_drive import (
     free_mask,
 )
 from .handeye import HandEye, HandEyeError, load_handeye
+from .visualize import (
+    DemoVisualizer,
+    Item,
+    RobotMirror,
+    VisualizerHandle,
+    segment_transform,
+)
 from .robot import Robot
 from .safety import (
     DEFAULT_BOX,
@@ -81,22 +88,26 @@ __all__ = [
     "CameraError",
     "ControlsError",
     "DEFAULT_BOX",
+    "DemoVisualizer",
     "DEFAULT_MARGIN",
     "FREE_JOINTS",
     "HOME_POSE",
     "HandEye",
     "HandEyeError",
+    "Item",
     "LOCKED_TOLERANCE",
     "RESOLUTIONS",
     "RealXArm7",
     "Robot",
     "RobotInterface",
+    "RobotMirror",
     "SafetyError",
     "SafetyGuard",
     "SimulatedXArm7",
     "StereoCalibration",
     "Trajectory",
     "Violation",
+    "VisualizerHandle",
     "XArmError",
     "ZedControls",
     "ZedDevice",
@@ -106,4 +117,5 @@ __all__ = [
     "free_mask",
     "load_handeye",
     "query_serial",
+    "segment_transform",
 ]
