@@ -63,7 +63,10 @@ class MeshcatVisualizer:
     ----------
     model, data : the MuJoCo model and the state to render.
     zmq_url : connect to an existing meshcat server instead of starting one.
-    open_browser : open the scene in a browser tab on construction.
+    open_browser : open the scene in a browser tab on construction. False
+        publishes and serves the scene as usual but opens nothing, leaving the
+        tab for a later `open()` — so whatever else is going to be drawn can be
+        put in first and the tab comes up on a finished scene.
     geom_groups : which MuJoCo geom groups to draw.
     prefix : path the scene is published under, so other objects can coexist.
     """
@@ -94,14 +97,36 @@ class MeshcatVisualizer:
         self._moving = [gid for gid in self._geoms if model.geom_bodyid[gid] != 0]
         self._paths = {gid: f"{prefix}/geom_{gid}" for gid in self._geoms}
 
+        self._opened = False
         self._load()
         self.sync(force=True)
         if open_browser:
-            self.viewer.open()
+            self.open()
 
     @property
     def url(self):
         return self.viewer.url()
+
+    @property
+    def opened(self):
+        """Whether a browser tab has been opened on this scene from here.
+
+        Says nothing about whether anyone is still looking at it: the tab can
+        be closed again, and meshcat does not tell us.
+        """
+        return self._opened
+
+    def open(self):
+        """Open the scene in a browser tab, once.
+
+        Idempotent, so the callers that defer the tab can ask for it without
+        keeping track of who asked first. Returns the URL either way.
+        """
+        if not self._opened:
+            self._opened = True
+            with self.lock:
+                self.viewer.open()
+        return self.url
 
     def _load(self):
         with self.lock:

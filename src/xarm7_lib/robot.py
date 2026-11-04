@@ -19,25 +19,42 @@ class Robot(RobotInterface):
     run with nobody watching.
 
     `register_visualizer` adds other things to that scene — see `visualize.py`.
+    Those only arrive after construction, so the browser tab can be held back
+    until there is something more than the arm in it: the first
+    `register_visualizer` opens it, or `show()` does. The scene is published
+    and its URL printed either way.
+
+    Which is the default depends on which arm you got. The simulator is the
+    picture — a run with no tab is a run with nothing to see — so it opens one
+    straight away. The real arm is in the room, and a browser tab appearing
+    over whatever is on screen is an interruption, so it waits for the thing
+    the scene was opened for. `open_browser=True`/`False` says outright.
     """
 
     def __init__(self, sim=False, safety_box=DEFAULT_BOX,
                  safety_margin=DEFAULT_MARGIN, guard=True, q0=None,
-                 visualize=True, zmq_url=None, gripper=True):
+                 visualize=True, open_browser=None, zmq_url=None, gripper=True):
         super().__init__()
         safety = dict(safety_box=safety_box, safety_margin=safety_margin, guard=guard)
         ip = os.environ.get('ROBOT_IP', '').strip()
         self._mirror = None
         self._visualizers = []
-        if ip and not sim:
+        real = bool(ip) and not sim
+        if open_browser is None:
+            open_browser = not real
+        # Only a deferral: with no scene at all there is nothing to open later.
+        self._deferred_open = bool(visualize) and not open_browser
+        if real:
             self.robot = RealXArm7(ip, gripper=gripper, **safety)
             if visualize:
                 self._mirror = RobotMirror(
-                    self.robot, guard=self.robot.guard, zmq_url=zmq_url
+                    self.robot, guard=self.robot.guard, zmq_url=zmq_url,
+                    open_browser=open_browser
                 )
         else:
             self.robot = SimulatedXArm7(
-                visualize=visualize, q0=q0, gripper=gripper, zmq_url=zmq_url, **safety
+                visualize=visualize, open_browser=open_browser, q0=q0,
+                gripper=gripper, zmq_url=zmq_url, **safety
             )
 
     # ------------------------------------------------------------------
@@ -76,6 +93,26 @@ class Robot(RobotInterface):
         """The visualizers currently registered, as their handles."""
         return list(self._visualizers)
 
+    def show(self):
+        """Open the scene in a browser tab, and stop holding the tab back.
+
+        Only needed after `open_browser=False`, and only for a scene nothing
+        was registered into — the first `register_visualizer` opens the tab by
+        itself. Idempotent, and returns the URL.
+        """
+        self._deferred_open = False
+        viewer = self.viewer
+        if viewer is None:
+            print(
+                "[xarm7_lib] nothing to show: this Robot was built with "
+                "visualize=False, so no scene was published"
+            )
+            return None
+        opener = getattr(viewer, "open", None)
+        if opener is not None:
+            opener()
+        return getattr(viewer, "url", None)
+
     def register_visualizer(self, visualizer, rate=None, name=None, handeye=None):
         """Draw `visualizer`'s idea of the scene beside the arm, on its own thread.
 
@@ -91,6 +128,9 @@ class Robot(RobotInterface):
         how the calibration is found. Asking the camera instead means opening
         it, and the detector already has it open. `handeye=` hands a
         calibration over outright and skips the lookup.
+
+        A tab held back by `open_browser=False` opens here, on the first
+        registration: this is the thing it was waiting for.
 
         Returns a handle; `stop()` it to take the visualizer off the scene.
         `close()` stops every one of them.
@@ -114,6 +154,8 @@ class Robot(RobotInterface):
 
         handle = VisualizerHandle(self, visualizer, label, rate=rate, handeye=handeye)
         self._visualizers.append(handle)
+        if self._deferred_open:
+            self.show()
         return handle
 
     @property

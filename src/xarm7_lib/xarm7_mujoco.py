@@ -138,6 +138,9 @@ class SimulatedXArm7(RobotInterface):
         `keyframe="home"` instead to start from the MJCF's home pose.
     keyframe : name or index of an MJCF keyframe to reset into.
     visualize : publish the scene to meshcat and open it in a browser tab.
+    open_browser : open that tab on construction. False still publishes and
+        serves the scene — the URL is printed — but waits for `viz.open()`,
+        which is how the tab can be left until the scene is finished.
     real_time : run the sim in a background thread paced to wall time. When
         False the sim only advances inside `step()` (or while a blocking call
         waits on it), which makes runs deterministic and as fast as the CPU
@@ -170,6 +173,7 @@ class SimulatedXArm7(RobotInterface):
         q0=None,
         keyframe=None,
         visualize=False,
+        open_browser=True,
         real_time=True,
         gravity=True,
         feedforward=True,
@@ -246,7 +250,9 @@ class SimulatedXArm7(RobotInterface):
         self._viz_period = 1.0 / viz_rate if viz_rate else None
         self._last_viz = -np.inf
         if visualize:
-            self.viz = MeshcatVisualizer(self.model, self.data, zmq_url=zmq_url)
+            self.viz = MeshcatVisualizer(
+                self.model, self.data, zmq_url=zmq_url, open_browser=open_browser
+            )
             self._draw_safety_box()
             print(f"Meshcat: {self.viz.url}")
 

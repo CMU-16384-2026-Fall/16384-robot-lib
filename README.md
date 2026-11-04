@@ -440,6 +440,23 @@ with Robot() as robot:          # prints e.g. Meshcat: http://127.0.0.1:7000/sta
     robot.set_joint_targets(HOME_POSE)
 ```
 
+Anything else in the scene is registered after the `Robot` is built, so a tab
+opened on construction shows the arm alone and the rest turns up in a window
+that is already on screen. The tab can wait for it instead: the scene is
+published and its URL printed as usual, the first `register_visualizer` opens
+the tab, and `robot.show()` opens it outright for a run that registers nothing.
+
+```python
+with Robot(open_browser=False) as robot:
+    robot.register_visualizer(det)   # the tab opens here, on a finished scene
+```
+
+Which of the two you get by default depends on the arm. In simulation the
+picture is the whole point, so the tab opens with the `Robot`. On the real arm
+it waits, because the arm is in the room and a tab appearing over whatever you
+are looking at is an interruption — `Robot(open_browser=True)` on the bench
+opens it anyway.
+
 ## Drawing other things beside the arm
 
 `register_visualizer` adds something to that scene and keeps it up to date on a
