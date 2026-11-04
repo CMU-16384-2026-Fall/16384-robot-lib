@@ -28,7 +28,6 @@ from .free_drive import (
     LOCKED_TOLERANCE,
     WATCHED_JOINTS,
     Trajectory,
-    stop_on_enter,
     watch_mask,
 )
 from .gripper import (
@@ -130,11 +129,9 @@ __all__ = [
     "ZedOpenCapture",
     "__version__",
     "devices",
-    "free_mask",
     "load_handeye",
     "query_serial",
     "segment_transform",
-    "stop_on_enter",
     "visualizer_serial",
     "watch_mask",
 ]

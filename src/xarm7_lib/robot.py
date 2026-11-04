@@ -190,20 +190,43 @@ class Robot(RobotInterface):
         self.close()
         return False
 
-    def free_drive(self, duration=30.0, **options):
-        """Hand-guide the arm and record where it went.
+    def free_drive(self, duration=None, **options):
+        """Release the arm so it can be pushed by hand, and start recording.
 
-        Every joint is free unless `watch=` says otherwise, and `duration=None`
-        runs until something stops it. Real arm only, and deliberately so:
-        there is nothing to push in simulation. See `RealXArm7.free_drive` for
-        the options.
+        Returns straight away; `end_free_drive` locks the arm again and hands
+        back the recording, so the waiting in between is yours:
+
+            robot.free_drive()
+            print("push the arm around; press Enter when you are done")
+            input()
+            traj = robot.end_free_drive()
+
+        Every joint is free unless `watch=` says otherwise, and by default
+        there is no time limit. Real arm only, and deliberately so: there is
+        nothing to push in simulation. See `RealXArm7.free_drive` for the
+        options.
         """
+        self._free_drive_backend()
+        return self.robot.free_drive(duration, **options)
+
+    def end_free_drive(self):
+        """End the run `free_drive` started and return its `Trajectory`.
+
+        The arm is locked where it stands on the way out. If a watched joint
+        was pushed off its lock, or the arm ended up outside the safety guard,
+        this is what asks for hands off the robot and puts it right — see
+        `RealXArm7.end_free_drive`.
+        """
+        return self._free_drive_backend().end_free_drive()
+
+    def _free_drive_backend(self):
+        """The backend, if it can be hand-guided at all."""
         if not hasattr(self.robot, "free_drive"):
             raise NotImplementedError(
                 "free drive needs the real arm — there is nothing to push in "
                 "simulation. Set ROBOT_IP and construct Robot() without sim=True."
             )
-        return self.robot.free_drive(duration, **options)
+        return self.robot
 
 
 if __name__ == '__main__':
