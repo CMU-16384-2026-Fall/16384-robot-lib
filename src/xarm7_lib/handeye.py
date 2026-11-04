@@ -85,10 +85,11 @@ from scipy.spatial.transform import Rotation
 # using.
 HANDEYE_ENV = "XARM7_HANDEYE"
 
-# Where a TA who cannot write to the installation puts one instead. Same idea
-# as the local conf file in `calibration.py`: a copy made by hand on this
-# machine outranks the shared one, because the only reason to make it is to
-# override.
+# Where `calibrate_handeye run` writes by default, because the account running
+# it usually cannot write to the installation below. Same idea as the local
+# conf file in `calibration.py`: a copy on this machine outranks the shared
+# one, because the only reasons to have one are to override it or to be on the
+# way to becoming it.
 USER_DIR = (
     pathlib.Path(os.environ.get("XDG_CONFIG_HOME", "~/.config")).expanduser()
     / "xarm7_lib"
@@ -882,9 +883,11 @@ def load_handeye(serial=None):
         base_points = handeye.points_to_base(camera_points)
 
     Looked up in three places, first hit winning: `$XARM7_HANDEYE` if it is
-    set, then `~/.config/xarm7_lib/handeye/`, then the installation. The first
-    two exist so a TA can try a new calibration without disturbing the shared
-    one; the last is the shared one.
+    set, then `~/.config/xarm7_lib/handeye/`, then the installation. The last
+    is the shared one. The first two outrank it so a TA can try a new
+    calibration without disturbing the class's -- and the middle one is where
+    `calibrate_handeye run` writes by default, before a `sudo mv` promotes it
+    into the installation.
 
     Args:
         serial: Which camera's calibration. Read from the attached camera when

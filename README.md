@@ -388,13 +388,25 @@ count is what you are aiming at while you move the arm.
 python -m xarm7_lib.calibrate_handeye run
 ```
 
-Same thing, then written to `<installation>/xarm7_lib/data/handeye/SN<serial>.json`
-— on a lab machine, under `/opt/16384`, which students can read and cannot
-write. Every student on the station now gets it from `load_handeye()`. Writing
-there needs a TA's access; `--user` files it under `~/.config/xarm7_lib/handeye/`
-for this machine's accounts instead, and `--output` puts it anywhere. Those two
-are also where a TA tries a candidate without disturbing the class's copy —
-they are searched first, in that order.
+Same thing, then written to `~/.config/xarm7_lib/handeye/SN<serial>.json` —
+this account's own copy, since the account doing the calibrating is usually not
+the one that can write to the installation. `load_handeye()` finds it for this
+account straight away.
+
+The copy every student on the station reads is the one inside the installation,
+on a lab machine under `/opt/16384`, which they can read and cannot write.
+Putting it there needs root, so `run` finishes by printing the command:
+
+```bash
+sudo mkdir -p <installation>/xarm7_lib/data/handeye && sudo mv ~/.config/xarm7_lib/handeye/SN<serial>.json <installation>/xarm7_lib/data/handeye/SN<serial>.json && sudo chmod 644 <installation>/xarm7_lib/data/handeye/SN<serial>.json
+```
+
+Copy the line the run actually prints — it has the real paths and serial in it.
+`--system` skips the two-step and writes into the installation directly, for a
+machine where this already runs as someone who can; `--output` puts the result
+anywhere. Leaving it under `~/.config` is also how a TA tries a candidate
+without disturbing the class's copy: `$XARM7_HANDEYE`, then `~/.config`, then
+the installation, first hit winning.
 
 **5. Check it.**
 

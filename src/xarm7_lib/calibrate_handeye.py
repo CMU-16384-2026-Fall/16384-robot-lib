@@ -12,12 +12,19 @@ two transforms at once: where the camera is in the base frame, and where the
 board ended up on the flange. `handeye.py` has the geometry and the arithmetic;
 this module is the hardware around it.
 
-The result is filed inside the installed package, which on a lab machine is
-under the read-only `/opt/16384` tree. One calibration per station, written by
-whoever can write there, read by every student through `load_handeye()`. That
-is the whole reason this is a separate command rather than something a student
-script does: it needs the arm to move, it needs the board, it takes a few
-minutes, and getting it wrong quietly is easy.
+The result is filed under `~/.config/xarm7_lib/handeye/`, this account's own
+copy, because the account running a calibration is usually not the one that
+can write to the installation -- on a lab machine that is `/opt/16384`, owned
+by root. The shared copy the whole class reads lives in the installation, and
+`run` finishes by printing the one `sudo` line that moves it there, so the
+step that needs root is a single command and not a calibration that dies after
+the measuring is done. `--system` writes straight into the installation for a
+machine where this already runs as someone who can.
+
+One calibration per station, read by every student through `load_handeye()`.
+That is the whole reason this is a separate command rather than something a
+student script does: it needs the arm to move, it needs the board, it takes a
+few minutes, and getting it wrong quietly is easy.
 
 It is a module of its own rather than an `if __name__ == "__main__"` block in
 `handeye.py` for the reason `zed_probe.py` gives: the package imports
@@ -55,6 +62,7 @@ deliberately rotates the wrist about all three of its axes in turn, and
 import argparse
 import os
 import pathlib
+import shlex
 import struct
 import sys
 import time
@@ -1126,12 +1134,35 @@ def _capture_manual(arm, camera, detector, kinematics, args, preview):
 
 
 def _destination(args, serial):
-    """Where the result goes, and whether it can be written there."""
+    """Where the result goes.
+
+    Under `USER_DIR` unless told otherwise, because the account running this is
+    usually not the one that can write to the installation: on a lab machine
+    that is `/opt/16384`, owned by root. Writing there is a separate step with
+    `sudo`, and `cmd_run` prints the command for it rather than failing
+    halfway through a calibration that took a few minutes to measure.
+    """
     if args.output:
         return pathlib.Path(args.output)
-    if args.user:
-        return USER_DIR / filename(serial)
-    return INSTALLED_DIR / filename(serial)
+    if args.system:
+        return INSTALLED_DIR / filename(serial)
+    return USER_DIR / filename(serial)
+
+
+def _promote_command(written, serial):
+    """The `sudo` line that moves a user-filed calibration into the installation.
+
+    Printed, not run: this process is not the one with the access, and a TA
+    pasting it sees exactly what is about to happen to the shared copy.
+    """
+    target = INSTALLED_DIR / filename(serial)
+    src = shlex.quote(str(written))
+    directory = shlex.quote(str(INSTALLED_DIR))
+    dst = shlex.quote(str(target))
+    return (
+        f"sudo mkdir -p {directory} && sudo mv {src} {dst} && "
+        f"sudo chmod 644 {dst}"
+    )
 
 
 def cmd_run(args):
@@ -1240,21 +1271,47 @@ def cmd_run(args):
     try:
         written = handeye.save(destination)
     except HandEyeError as error:
+        if args.system:
+            raise HandEyeError(
+                f"{error}\n"
+                "That is the shared location inside the installation, so writing "
+                "there needs the\naccess a TA has and a student does not. Drop "
+                "--system to file it under\n"
+                f"{USER_DIR} for this machine's accounts -- which\nis the default, "
+                "and prints the `sudo` line that moves it into the\ninstallation "
+                "afterwards -- or use --output to put it somewhere of your "
+                "choosing."
+            ) from error
         raise HandEyeError(
             f"{error}\n"
-            "That is the shared location inside the installation, so writing "
-            "there needs the\naccess a TA has and a student does not. Either "
-            "run this as someone who can write\nto it, or use --user to file it "
-            f"under {USER_DIR} for this\nmachine's accounts, or --output to put "
-            "it somewhere of your choosing."
+            "That is this account's own configuration directory, so something "
+            "other than\naccess is wrong with it. --output puts the result "
+            "somewhere of your choosing."
         ) from error
 
     print(f"  filed at {written}")
+    if args.system:
+        print(
+            "\nEvery student on this station now gets it from `load_handeye()`."
+        )
+    else:
+        print("\nThis account now gets it from `load_handeye()`.")
     print(
-        "\nEvery student on this station now gets it from `load_handeye()`.\n"
         "Check it before you walk away:\n"
         "    python -m xarm7_lib.calibrate_handeye verify"
     )
+    if not args.system and not args.output:
+        # The one thing left that this process cannot do itself, since it is not
+        # running as the account that owns the installation. Printed last so it
+        # is the line still on screen when the TA looks back at the terminal.
+        print(
+            "\nTo hand it to every student on this station, move it into the "
+            "installation:\n"
+            f"    {_promote_command(written, serial)}\n"
+            "Until then it is this account's calibration and nobody else's. It "
+            "also outranks\nthe shared one for this account, so delete it if "
+            "you later want to check what\nthe class is actually reading."
+        )
     return 0
 
 
@@ -1725,11 +1782,19 @@ def build_parser():
         action="store_true",
         help="solve and report, write nothing — the right first run on a bench",
     )
-    where.add_argument("-o", "--output", help="write here instead of the installation")
+    where.add_argument("-o", "--output", help="write here instead")
     where.add_argument(
         "--user",
         action="store_true",
-        help=f"write under {USER_DIR} instead of the installation",
+        help=f"write under {USER_DIR} — the default, and already implied",
+    )
+    where.add_argument(
+        "--system",
+        action="store_true",
+        help=(
+            f"write straight into the installation ({INSTALLED_DIR}) instead, "
+            "which needs write access to it"
+        ),
     )
     where.add_argument("--station", help="a label for this bench, stored with the result")
     run.set_defaults(handler=cmd_run)
