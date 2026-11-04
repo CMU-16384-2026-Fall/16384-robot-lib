@@ -133,7 +133,6 @@ class RobotMirror:
             self.model, self.data, zmq_url=zmq_url, open_browser=open_browser
         )
         mjscene.draw_box(self.viz, guard, self.base_frame)
-        print(f"Meshcat: {self.viz.url}")
 
         self._period = 1.0 / viz_rate if viz_rate else None
         self._stop = threading.Event()

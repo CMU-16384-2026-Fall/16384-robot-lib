@@ -254,7 +254,6 @@ class SimulatedXArm7(RobotInterface):
                 self.model, self.data, zmq_url=zmq_url, open_browser=open_browser
             )
             self._draw_safety_box()
-            print(f"Meshcat: {self.viz.url}")
 
         if real_time:
             self._thread = threading.Thread(

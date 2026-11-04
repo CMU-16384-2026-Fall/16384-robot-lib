@@ -20,8 +20,31 @@ camera itself this costs no OpenCV, and so is imported normally.
 """
 
 import importlib
+import os
 
-from .api import RobotInterface
+
+def _drop_builtin_gtk_modules():
+    """Stop GTK programs we start from complaining about `atk-bridge`.
+
+    Ubuntu's desktop session sets `GTK_MODULES=gail:atk-bridge`. GTK 3 has both
+    built in, so it ignores the request, but says so on stderr, and whatever we
+    launch inherits our terminal: the browser tab prints "Gtk-Message: Not
+    loading module ..." over the program's output. Dropping them changes nothing
+    else, because GTK was not going to load them anyway.
+    """
+    modules = os.environ.get("GTK_MODULES")
+    if modules is None:
+        return
+    kept = [m for m in modules.split(":") if m not in ("gail", "atk-bridge")]
+    if kept:
+        os.environ["GTK_MODULES"] = ":".join(kept)
+    else:
+        del os.environ["GTK_MODULES"]
+
+
+_drop_builtin_gtk_modules()
+
+from .api import RobotInterface  # noqa: E402
 from .free_drive import (
     FREE_JOINTS,
     HOME_POSE,

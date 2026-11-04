@@ -71,6 +71,7 @@ this end is the only one there is.
 
 import atexit
 import contextlib
+import logging
 import math
 import threading
 import time
@@ -102,6 +103,11 @@ from .gripper import (
     raw_speed,
 )
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyError, SafetyGuard
+
+# The SDK narrates through this logger at INFO: "[motion_enable], xArm is ready
+# to move" and "[set_state], ..." on every connect. Its errors and warnings are
+# what a person needs to see, and those stay on.
+logging.getLogger("origin.print").setLevel(logging.WARNING)
 
 ARM_JOINTS = tuple(f"joint{i}" for i in range(1, 8))
 VELOCITY_LIMIT = 3.14  # rad/s; the controller itself allows up to 4.0
@@ -1023,7 +1029,7 @@ class RealXArm7(RobotInterface):
         teach_sensitivity=None,
         confirm=None,
         on_sample=None,
-        verbose=True,
+        verbose=False,
     ):
         """Release the arm so it can be pushed by hand, and start recording.
 
@@ -1096,8 +1102,10 @@ class RealXArm7(RobotInterface):
                 so it must return quickly — time spent in it is time nothing is
                 watching, and past `STALL_ABORT` the run ends — and whatever it
                 touches, it touches from that thread.
-            verbose: print the banner and the running warnings. The guard is
-                checked either way — it ends the run rather than reporting it.
+            verbose: narrate the run: the banner, why it ended, and a warning
+                as a watched joint nears its limit. Off by default, since
+                `Trajectory.reason` says why a run ended. The guard is checked
+                either way, and faults are printed either way.
 
         Returns:
             None. `end_free_drive` returns the `Trajectory`.
@@ -1296,7 +1304,7 @@ class RealXArm7(RobotInterface):
                 if state["reason"] is None:
                     state["reason"] = "the watch loop stopped responding"
         if ours:
-            self._free_drive_release(state["verbose"])
+            self._free_drive_release()
             self._restore_teach_sensitivity(state)
         return state
 
@@ -1308,8 +1316,7 @@ class RealXArm7(RobotInterface):
         try:
             self.arm.set_teach_sensitivity(int(previous))
         except Exception as err:  # a run ending must not fail over a setting
-            if state["verbose"]:
-                print(f"[xarm7] could not restore the teach sensitivity: {err}")
+            print(f"[xarm7] could not restore the teach sensitivity: {err}")
 
     def _free_drive_thread(self, state):
         """Run the watch loop, then hand the arm back. The thread's whole life.
@@ -1320,20 +1327,18 @@ class RealXArm7(RobotInterface):
         back under position control and the reason is kept for `end_free_drive`
         to report.
         """
-        verbose = state["verbose"]
         try:
             state["reason"] = self._free_drive_loop(state)
         except BaseException as err:  # noqa: BLE001 — see above
             state["reason"] = f"the watch loop failed: {err!r}"
-            if verbose:
-                print(
-                    "[xarm7] the free drive watch loop failed\n"
-                    f"{traceback.format_exc()}"
-                )
+            print(
+                "[xarm7] the free drive watch loop failed\n"
+                f"{traceback.format_exc()}"
+            )
         finally:
-            self._free_drive_release(verbose)
+            self._free_drive_release()
             self._restore_teach_sensitivity(state)
-            if verbose and not state["stop"].is_set():
+            if state["verbose"] and not state["stop"].is_set():
                 # The run ended on its own and whoever started it is off doing
                 # something else: say so, and say what is waiting for them.
                 state["announced"] = True
@@ -1575,16 +1580,17 @@ class RealXArm7(RobotInterface):
         run["warned_at"] = now
         print(f"[xarm7] {what}")
 
-    def _free_drive_release(self, verbose):
+    def _free_drive_release(self):
         """Hand the arm back: out of teaching mode, into position control.
 
         Teaching mode holds the arm up but yields to anything that pushes it,
         so leaving a run in it would leave the arm movable by hand with nothing
         watching where it went. This runs on every path out of a run: the watch
         thread's own way out, and `_free_drive_halt` giving up on a thread that
-        has stopped answering.
+        has stopped answering. Neither fault below is narration, so both print
+        whatever `verbose` says.
         """
-        if verbose and self.arm.has_err_warn:
+        if self.arm.has_err_warn:
             print(
                 "[xarm7] the controller has latched an error; call "
                 f"clear_errors() before moving again (code={self.arm.error_code})"
@@ -1592,8 +1598,7 @@ class RealXArm7(RobotInterface):
         try:
             self._ensure_mode(MODE_POSITION)
         except XArmError as err:
-            if verbose:
-                print(f"[xarm7] could not return to position control: {err}")
+            print(f"[xarm7] could not return to position control: {err}")
 
     def _free_drive_trajectory(self, run, mask, rate, reason, verbose):
         """Assemble the recording, and work out whether `qd` is real.

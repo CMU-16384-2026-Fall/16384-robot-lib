@@ -436,7 +436,7 @@ Either way the safety box is drawn around it, and faces light up as the arm
 gets near them. Pass `visualize=False` for a run with nobody watching.
 
 ```python
-with Robot() as robot:          # prints e.g. Meshcat: http://127.0.0.1:7000/static/
+with Robot() as robot:          # prints the URL, e.g. http://127.0.0.1:7000/static/
     robot.set_joint_targets(HOME_POSE)
 ```
 
