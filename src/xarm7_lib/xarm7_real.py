@@ -23,7 +23,9 @@ motion modes, and the work is in switching between them cleanly:
 gravity-compensates the arm and lets a person push it around. Nothing is
 commanded in that mode, so there is nothing to check before sending: the guard
 is run against what the arm reports instead, and a sample it rejects ends the
-run and steps the arm back. See `free_drive.py` for the rest of what it does.
+run. It is the one call here that leaves something running behind it — a thread
+sampling and watching the arm until `end_free_drive` locks it again and hands
+back the recording. See `free_drive.py` for the rest of what it does.
 
 A mode change is only accepted while the arm is stopped, so `_ensure_mode`
 first cancels whatever is running — zero velocities in mode 4, a state-4 abort
@@ -67,10 +69,13 @@ mode 1 and the velocities in mode 4 aren't planned, so for those the check on
 this end is the only one there is.
 """
 
+import atexit
 import contextlib
+import logging
 import math
 import threading
 import time
+import traceback
 
 import numpy as np
 
@@ -80,12 +85,11 @@ from xarm.wrapper import XArmAPI
 from .api import RobotInterface
 from .free_drive import (
     FREE_DRIVE_RATE,
+    JOIN_TIMEOUT,
     LOCKED_TOLERANCE,
     LOCKED_WARN_FRACTION,
     RATE_LIMITS,
     RECOVER_SPEED,
-    REPEAT_LIMIT,
-    REPEAT_WINDOW,
     STALL_ABORT,
     WARN_PERIOD,
     Trajectory,
@@ -99,6 +103,11 @@ from .gripper import (
     raw_speed,
 )
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyError, SafetyGuard
+
+# The SDK narrates through this logger at INFO: "[motion_enable], xArm is ready
+# to move" and "[set_state], ..." on every connect. Its errors and warnings are
+# what a person needs to see, and those stay on.
+logging.getLogger("origin.print").setLevel(logging.WARNING)
 
 ARM_JOINTS = tuple(f"joint{i}" for i in range(1, 8))
 VELOCITY_LIMIT = 3.14  # rad/s; the controller itself allows up to 4.0
@@ -245,6 +254,7 @@ class RealXArm7(RobotInterface):
         self._has_gripper = bool(gripper)
         self._gripper_ready = False  # set up on first use, not on connect
         self._auto_clear_errors = bool(clear_errors)
+        self._free_drive_run = None  # the run `end_free_drive` is waiting on
 
         self._wait_for_report(timeout)
 
@@ -336,6 +346,10 @@ class RealXArm7(RobotInterface):
         bug in the caller, and starting it anyway would just mean stopping
         part-way somewhere it was never asked to be.
 
+        If `timeout` elapses first, the arm is stopped where it is: a move
+        nobody is waiting for any more should not carry on unattended. Waiting
+        for it to come to rest can take the call slightly past `timeout`.
+
         Returns True if the arm settled on the target, False if `wait` was
         False, if `timeout` elapsed first, or if the move was cancelled while
         waiting — by `stop()`, by another command, or by the emergency stop.
@@ -361,7 +375,7 @@ class RealXArm7(RobotInterface):
 
         self._ensure_mode(MODE_POSITION)
         with self._lock:
-            self._begin_command()
+            generation = self._begin_command()
         # The SDK's own blocking wait knows when the controller's motion queue
         # has drained, so it is the first thing to ask — but it is not the last
         # word: it gives up the moment the *reported* mode isn't 0, which can
@@ -377,7 +391,10 @@ class RealXArm7(RobotInterface):
                 wait=wait,
                 timeout=timeout,
             )
-        if code in (_WAIT_FINISH_TIMEOUT, _STOPPED):
+        if code == _STOPPED:
+            return False
+        if code == _WAIT_FINISH_TIMEOUT:
+            self._stop_timed_out(generation)
             return False
         self._check(code, "set_servo_angle")
 
@@ -387,10 +404,25 @@ class RealXArm7(RobotInterface):
         if timeout is not None:
             remaining = float(timeout) - (time.monotonic() - started)
             if remaining <= 0.0:
+                self._stop_timed_out(generation)
                 return False
         if not self.wait_for_motion(timeout=remaining):
+            self._stop_timed_out(generation)
             return False
         return bool(np.max(np.abs(self.joint_values - goal)) <= _POSITION_TOLERANCE)
+
+    def _stop_timed_out(self, generation):
+        """Stop a move whose wait ran out, and wait for the arm to come to rest.
+
+        Leaves the arm alone if a newer command has replaced the move, since
+        that command is what the arm should be doing now, or if the connection
+        has gone, since there is nothing left to tell it.
+        """
+        with self._lock:
+            if self._generation != generation or not self.arm.connected:
+                return
+            self.stop(wait=False)
+        self.wait_for_motion(timeout=_STOP_TIMEOUT)
 
     def set_velocity(self, speeds, duration=0, wait=True):
         """Command joint velocities, rad/s (7,).
@@ -650,7 +682,18 @@ class RealXArm7(RobotInterface):
         The motors stay enabled and holding — disabling them would let the arm
         fall under its own weight — and the gripper is left exactly as it is,
         holding whatever is in it, for the same reason.
+
+        A free drive run still going is stopped first, and its recording is
+        dropped: `close()` is the way out of a script, not a way to collect a
+        run. What matters here is that the watch thread is not left sampling an
+        arm whose connection is about to go, and that the arm is locked rather
+        than left in teaching mode where anything can push it.
         """
+        try:
+            self._free_drive_halt()
+        except Exception:  # closing must not depend on a healthy link
+            pass
+
         with self._lock:
             self._begin_command()
             try:
@@ -744,6 +787,11 @@ class RealXArm7(RobotInterface):
             )
             raise ValueError(f"joint target outside limits: {detail}")
         return q
+
+    @property
+    def guard(self):
+        """The `SafetyGuard` checking this arm's setpoints, or None."""
+        return self._guard
 
     def _check_safe(self, q):
         """Raise if the arm may not be at `q`."""
@@ -994,114 +1042,126 @@ class RealXArm7(RobotInterface):
 
     def free_drive(
         self,
-        duration=30.0,
+        duration=None,
         *,
         watch=(),
-        until=None,
         tolerance=LOCKED_TOLERANCE,
         rate=FREE_DRIVE_RATE,
         recover_speed=RECOVER_SPEED,
         teach_sensitivity=None,
         confirm=None,
         on_sample=None,
-        verbose=True,
+        verbose=False,
     ):
-        """Let a person push the arm by hand, and record where they took it.
+        """Release the arm so it can be pushed by hand, and start recording.
 
-        This runs the controller's own joint teaching mode, which frees **every**
-        joint and gravity-compensates the arm. By default that is the whole run:
-        the arm goes wherever it is pushed, the loop samples it, and the
-        recording is what you get back. The safety guard is still checked every
-        tick — see below.
+        This returns as soon as the arm is free. The run carries on in a thread
+        behind you, and `end_free_drive` is what ends it and hands back the
+        recording — so the waiting is yours to do, however suits you:
+
+            robot.free_drive()
+            print("push the arm around; press Enter when you are done")
+            input()
+            traj = robot.end_free_drive()
+
+        The arm is sampled, guarded and watched the whole time, including while
+        you sit in `input()`.
+
+        The run uses the controller's own joint teaching mode, which frees
+        **every** joint and gravity-compensates the arm. By default that is the
+        whole of it: the arm goes wherever it is pushed, the loop samples it,
+        and the recording is what you get back. The safety guard is still
+        checked every tick — see below.
 
         `watch` is for joints that are meant to stay put. Teaching mode has no
         per-joint version, so the joints named there are not held — they are
         watched. Their positions are latched before the run starts, and if one
-        of them drifts more than `tolerance` off its latched value the run
-        interrupts itself:
+        of them drifts more than `tolerance` off its latched value the run ends
+        itself: teaching mode is dropped for position control, which stiffens
+        the arm where it stands. Nothing moves then. The next `end_free_drive`
+        asks you to take your hands off and then puts the watched joints back on
+        their latched values, leaving the free ones where you left them.
 
-            1. back to position control, which stiffens the arm where it stands;
-            2. `confirm` asks the person to take their hands off, and waits;
-            3. a slow move puts the watched joints back on their latched values,
-               leaving the free ones where the person left them;
-            4. back to teaching mode, and the recording carries on.
-
-        So a watched joint is one the arm returns to, not one it refuses to
-        leave, and it is free for as long as it takes the loop to notice.
-        `tolerance` is how far wrong the arm may be in the meantime. Every
-        interruption leaves a gap in the returned `t` — see `Trajectory`.
+        That the watch loop stops the arm rather than moving it is what makes it
+        safe to wait for a run at a prompt: whoever started it is sitting in
+        `input()`, where they cannot be asked to let go first. Every move a
+        recovery needs happens inside `end_free_drive`, which runs on your own
+        thread and can ask.
 
         Args:
-            duration: seconds of teaching to run for, or None for no limit —
-                then only `until`, `on_sample`, Ctrl-C, the guard or a fault
-                ends the run. Time spent stopped for an interruption doesn't
-                count against it. Ctrl-C ends a run early and still returns
-                everything recorded up to that point.
+            duration: seconds of teaching after which the run ends itself, or
+                None — the default — for no limit, leaving `end_free_drive`,
+                the guard or a fault to end it. A run that ends on its own still
+                has to be collected with `end_free_drive`, which is what hands
+                over the recording.
             watch: which joints to watch, as **0-indexed** joint numbers —
                 `[1, 2]` is joint2 and joint3 — or a length-7 boolean mask in
                 which True means watched. Defaults to watching nothing: every
                 joint is free and the arm is simply recorded. `WATCHED_JOINTS`
                 is the four the lab's `HOME_POSE` is defined by. Keyword-only,
                 so that a run holding part of the arm has to say so.
-            until: called with no arguments once per tick; return something
-                truthy to end the run. `stop_on_enter()` is the one for "go
-                until somebody presses Enter": it peeks at the terminal rather
-                than reading it, so waiting doesn't stop the watching and the
-                run leaves nothing behind holding stdin. Like `on_sample`, it
-                runs inside the loop and must return quickly. A `reason`
-                attribute on it, if there is one, is what `Trajectory.reason`
-                will say.
-            tolerance: rad a watched joint may drift before the run puts it
-                back. Below about 0.02 rad ordinary handling of the free joints
-                trips it through the arm's own structure. Unused if nothing is
-                watched.
+            tolerance: rad a watched joint may drift before the run ends and
+                waits to be put back. Below about 0.02 rad ordinary handling of
+                the free joints trips it through the arm's own structure.
+                Unused if nothing is watched.
             rate: how often the arm is sampled, Hz, 20 to 250. Nothing is
                 commanded at this rate — it is a sampling rate, and the report
                 stream underneath it is what really limits how soon a drift or
                 a guard violation is seen.
-            recover_speed: rad/s for the move that puts a watched joint back,
-                and for the step back inside the guard.
-            teach_sensitivity: 1-5 to apply for the duration and restore
-                afterwards, or None to leave the controller's own setting alone.
-                Higher is easier to push. UFACTORY's advice is not to touch it
-                unless the arm is hard to move.
-            confirm: called with the hands-off warning when the arm has to move
-                on its own — a watched joint put back, or a step back inside the
-                guard — and must not return until it is safe for it to. Return
-                True to carry on, False to end the run. Defaults to a terminal
-                prompt, which ignores anything typed before it went up — a
-                newline meant for `stop_on_enter` cannot answer a hands-off
-                warning on behalf of someone still holding the arm.
+            recover_speed: rad/s for the move `end_free_drive` makes to put a
+                watched joint back, and for the step back inside the guard.
+            teach_sensitivity: 1-5 to apply for the run and restore afterwards,
+                or None to leave the controller's own setting alone. Higher is
+                easier to push. UFACTORY's advice is not to touch it unless the
+                arm is hard to move.
+            confirm: called by `end_free_drive` with the hands-off warning
+                before the arm moves on its own, and must not return until it
+                is safe for it to. Return True to let it move, False to leave
+                the arm where it stands. Defaults to a terminal prompt.
             on_sample: called as `on_sample(t, q)` after every recorded tick,
-                for live plotting or a caller's own stop condition. Return
-                something truthy to end the run. It runs inside the watch loop,
+                for live plotting or a stop condition of your own. Return
+                something truthy to end the run. It runs on the watch thread,
                 so it must return quickly — time spent in it is time nothing is
-                watching, and past `STALL_ABORT` the run ends.
-            verbose: print the banner and the running warnings. The guard is
-                checked either way — it ends the run rather than reporting it.
+                watching, and past `STALL_ABORT` the run ends — and whatever it
+                touches, it touches from that thread.
+            verbose: narrate the run: the banner, why it ended, and a warning
+                as a watched joint nears its limit. Off by default, since
+                `Trajectory.reason` says why a run ended. The guard is checked
+                either way, and a guard stop and faults print a warning either
+                way.
 
         Returns:
-            A `Trajectory` with `t`, `q` and `qd` sampled once per tick, plus
-            `reason` saying why the run ended and `interruptions` saying how many
-            gaps are in it.
+            None. `end_free_drive` returns the `Trajectory`.
 
-        Raises ValueError for a malformed `watch` or `duration`, and
-        `SafetyError` if the arm is somewhere the guard won't allow before the
-        run even starts.
+        Raises ValueError for a malformed `watch` or `duration`, `SafetyError`
+        if the arm is somewhere the guard won't allow before the run even
+        starts, and RuntimeError if a run is already going.
+
+        Ctrl-C is no longer what ends a run: it lands in whatever you are
+        waiting in rather than in the loop, and the loop goes on watching. What
+        hands the arm back is `end_free_drive`, or `close()` — so a
+        `with Robot() as robot:` block locks the arm on the way out whether it
+        ends normally or not.
 
         The guard cannot *refuse* anything during the run — the person's hand
         is not a command — so a self-collision or a step outside the safety box
         is caught after the fact rather than before it. What it can do is stop:
-        a sample the guard rejects ends the run there and then. Teaching mode is
-        dropped for position control, which stiffens the arm where it stands,
-        and after a hands-off prompt the arm steps back to the last
-        configuration the guard allowed — a few milliseconds of the hand's
-        movement undone, which is all the further past the line it can have got
-        at the sampling rate. That matters for more than tidiness: a guarded
-        command checks the whole path from where the arm *is*, so an arm left
-        outside the box would refuse every move afterwards. `reason` says what
-        was hit; everything recorded up to it is returned as usual.
+        a sample the guard rejects ends the run there and then and the arm
+        stiffens where it stands. `end_free_drive` then steps it back to the
+        last configuration the guard allowed, after a hands-off prompt — a few
+        milliseconds of the hand's movement undone, which is all the further
+        past the line it can have got at the sampling rate. That matters for
+        more than tidiness: a guarded command checks the whole path from where
+        the arm *is*, so an arm left outside the box would refuse every move
+        afterwards. `reason` says what was hit; everything recorded up to it is
+        returned as usual.
         """
+        if self._free_drive_run is not None:
+            raise RuntimeError(
+                "free drive is already running — end_free_drive() ends that "
+                "run and hands back its recording, and then another can start"
+            )
+
         mask = watch_mask(watch, self.nq)
         try:
             duration = np.inf if duration is None else float(duration)
@@ -1125,12 +1185,11 @@ class RealXArm7(RobotInterface):
         tolerance = float(tolerance)
         if tolerance <= 0.0:
             raise ValueError("tolerance must be positive")
-        if until is not None and not callable(until):
+        if confirm is not None and not callable(confirm):
             raise ValueError(
-                "until must be callable and take no arguments — it is asked "
-                "once a tick whether the run is over"
+                "confirm must be callable: it is called with the hands-off "
+                "warning before the arm is moved on its own"
             )
-        confirm = hands_off_prompt if confirm is None else confirm
 
         # A run that starts from a configuration the guard rejects has nowhere
         # legal to put the arm back to, and the recovery move would be refused
@@ -1140,55 +1199,195 @@ class RealXArm7(RobotInterface):
             if blocked is not None:
                 raise SafetyError(blocked)
 
-        period = 1.0 / rate
-        run = {
-            "t": [], "q": [], "qd": [],
-            "overruns": 0, "interruptions": 0, "ticks": 0, "paused": 0.0,
-            "teaching": 0.0, "source": "state", "warned_at": -np.inf,
+        state = {
+            "run": {
+                "t": [], "q": [], "qd": [],
+                "overruns": 0, "interruptions": 0, "ticks": 0,
+                "teaching": 0.0, "source": "state", "warned_at": -np.inf,
+            },
+            "mask": mask,
+            "duration": duration,
+            "period": 1.0 / rate,
+            "rate": rate,
+            "tolerance": tolerance,
+            "recover_speed": recover_speed,
+            "confirm": hands_off_prompt if confirm is None else confirm,
+            "on_sample": on_sample,
+            "verbose": bool(verbose),
+            # Latched while the arm is still in position control and holding
+            # itself, so the lock is where the caller put the arm rather than
+            # wherever it had drifted to a moment after being released.
+            "q_latched": self.joint_values.copy(),
+            "stop": threading.Event(),
+            "thread": None,
+            "sensitivity": None,
+            "reason": None,
+            "recovery": None,  # what `end_free_drive` has to put right
+            "announced": False,  # whether the thread has printed the reason
         }
-        previous_sensitivity = None
-        reason = "duration elapsed"
-
-        # Latched while the arm is still in position control and holding itself,
-        # so the lock is where the caller put the arm rather than wherever it
-        # had drifted to a moment after being released.
-        q_latched = self.joint_values.copy()
 
         if teach_sensitivity is not None:
-            previous_sensitivity = self.arm.teach_sensitivity
+            state["sensitivity"] = self.arm.teach_sensitivity
             self._check(
                 self.arm.set_teach_sensitivity(int(teach_sensitivity)),
                 "set_teach_sensitivity",
             )
 
         if verbose:
-            self._free_drive_banner(mask, duration, tolerance, rate, until)
+            self._free_drive_banner(mask, duration, tolerance, rate)
 
         try:
             self._ensure_mode(MODE_TEACH)
-            reason = self._free_drive_loop(
-                mask=mask, duration=duration, period=period, tolerance=tolerance,
-                recover_speed=recover_speed, q_latched=q_latched, confirm=confirm,
-                until=until, on_sample=on_sample, verbose=verbose, run=run,
-            )
-        except KeyboardInterrupt:
-            # Deliberately swallowed rather than re-raised: Ctrl-C is how a run
-            # is meant to end, and the recording is the whole point of it.
-            reason = "interrupted"
-        finally:
-            # A second Ctrl-C — and students will press it — must not cost the
-            # data by escaping from the cleanup, and must not leave the arm in
-            # a mode where a push moves it and nothing is watching.
-            try:
-                if verbose:
-                    print(f"[xarm7] free drive ended: {reason}")
-                self._free_drive_release(verbose)
-                if previous_sensitivity:
-                    self.arm.set_teach_sensitivity(int(previous_sensitivity))
-            except KeyboardInterrupt:
-                self._free_drive_release(verbose)
+        except BaseException:
+            # No run started, so nothing else will put the setting back.
+            self._restore_teach_sensitivity(state)
+            raise
 
-        return self._free_drive_trajectory(run, mask, rate, reason, verbose)
+        state["thread"] = threading.Thread(
+            target=self._free_drive_thread,
+            args=(state,),
+            name="xarm7-free-drive",
+            daemon=True,
+        )
+        # Registered before the thread runs and dropped by `_free_drive_halt`:
+        # an arm left in teaching mode is pushable by anything, so it is worth
+        # locking even on the way out of a script that crashed.
+        self._free_drive_run = state
+        atexit.register(self._free_drive_halt)
+        state["thread"].start()
+
+    def end_free_drive(self):
+        """End the run `free_drive` started, lock the arm, return the recording.
+
+        The arm is back under position control by the time this returns: out of
+        teaching mode, holding where it stands, resisting a push instead of
+        yielding to it.
+
+        If the run ended with a watched joint off its lock, or with the arm
+        outside the safety guard, this is where that is put right — `confirm`
+        asks for hands off the robot, and then the arm moves on its own, slowly.
+        Decline and the arm is left where it is, which `Trajectory.reason`
+        records.
+
+        Returns the `Trajectory`: `t`, `q` and `qd` sampled once per tick, with
+        `reason` saying why the run ended. Raises RuntimeError if no run is
+        going, which includes a second call for the same run — the recording is
+        handed over once.
+        """
+        state = self._free_drive_halt()
+        if state is None:
+            raise RuntimeError(
+                "there is no free drive run to end: free_drive() starts one, "
+                "and end_free_drive() collects it exactly once"
+            )
+
+        verbose = state["verbose"]
+        reason = state["reason"] or "stopped by end_free_drive()"
+        if verbose and not state["announced"]:
+            print(f"[xarm7] free drive ended: {reason}")
+        if state["recovery"] is not None:
+            reason = self._free_drive_put_back(state, reason)
+        return self._free_drive_trajectory(
+            state["run"], state["mask"], state["rate"], reason, verbose
+        )
+
+    def _free_drive_halt(self):
+        """Stop the watch loop and see that the arm is locked. Returns the run.
+
+        `end_free_drive` is the usual way in. `close()` and the interpreter
+        shutting down come through here too, which is what stops a forgotten
+        run from leaving an arm that anything can push. Returns None when there
+        is no run to stop, and does not raise: it is called from paths that are
+        already on their way out.
+        """
+        state = self._free_drive_run
+        if state is None:
+            return None
+        self._free_drive_run = None
+        atexit.unregister(self._free_drive_halt)
+
+        state["stop"].set()
+        thread = state["thread"]
+        if thread.ident is None:
+            # `free_drive` was interrupted between freeing the arm and starting
+            # the thread: nobody to wait for, and nobody else to lock the arm.
+            ours = True
+        else:
+            thread.join(JOIN_TIMEOUT)
+            ours = thread.is_alive()
+            if ours:
+                # Stuck in a call to the controller. The thread is a daemon so
+                # it cannot hold the interpreter open, but the arm is still
+                # free, and locking it is this thread's problem now.
+                print(
+                    "[xarm7] the free drive watch loop has not stopped after "
+                    f"{JOIN_TIMEOUT:g} s; locking the arm from here instead. "
+                    "The recording is whatever had been sampled by now."
+                )
+                if state["reason"] is None:
+                    state["reason"] = "the watch loop stopped responding"
+        if ours:
+            self._free_drive_release()
+            self._restore_teach_sensitivity(state)
+        return state
+
+    def _restore_teach_sensitivity(self, state):
+        """Put back the teaching sensitivity a run borrowed, at most once."""
+        previous, state["sensitivity"] = state["sensitivity"], None
+        if not previous:
+            return
+        try:
+            self.arm.set_teach_sensitivity(int(previous))
+        except Exception as err:  # a run ending must not fail over a setting
+            print(f"[xarm7] could not restore the teach sensitivity: {err}")
+
+    def _free_drive_thread(self, state):
+        """Run the watch loop, then hand the arm back. The thread's whole life.
+
+        Nothing is allowed to escape from here. This is the top of a thread, so
+        an exception would be printed and then lost, leaving the arm in
+        teaching mode with nothing watching it. Whatever happens, the arm goes
+        back under position control and the reason is kept for `end_free_drive`
+        to report.
+        """
+        try:
+            state["reason"] = self._free_drive_loop(state)
+        except BaseException as err:  # noqa: BLE001 — see above
+            state["reason"] = f"the watch loop failed: {err!r}"
+            print(
+                "[xarm7] the free drive watch loop failed\n"
+                f"{traceback.format_exc()}"
+            )
+        finally:
+            self._free_drive_release()
+            self._restore_teach_sensitivity(state)
+            recovery = state["recovery"]
+            if recovery is not None and recovery["kind"] == "guard":
+                # Not narration: the arm has just gone stiff in somebody's
+                # hands, and they need to know why whatever `verbose` says.
+                state["announced"] = True
+                print(f"[xarm7] WARNING: free drive stopped: {state['reason']}")
+                print(
+                    "        the arm is locked where it stands; end_free_drive() "
+                    "will ask you to stand clear, step it back inside, and "
+                    "return the recording"
+                )
+            elif state["verbose"] and not state["stop"].is_set():
+                # The run ended on its own and whoever started it is off doing
+                # something else: say so, and say what is waiting for them.
+                state["announced"] = True
+                print(f"[xarm7] free drive ended: {state['reason']}")
+                if state["recovery"] is None:
+                    print(
+                        "        the arm is locked where it stands; "
+                        "end_free_drive() returns the recording"
+                    )
+                else:
+                    print(
+                        "        the arm is locked where it stands; "
+                        "end_free_drive() will ask you to stand clear, put "
+                        "that right, and return the recording"
+                    )
 
     def _report_tick(self):
         """Something that changes once per report packet, and what it is.
@@ -1207,31 +1406,37 @@ class RealXArm7(RobotInterface):
             return "count", count
         return "state", tuple(self.joint_values)
 
-    def _free_drive_banner(self, mask, duration, tolerance, rate, until):
+    def _free_drive_banner(self, mask, duration, tolerance, rate):
         """Say what the run is about to do. Cheap to print, expensive to
         discover halfway through a lab."""
         watched = np.flatnonzero(~mask).tolist()
         print("[xarm7] free drive (joint teaching mode): every joint is free")
+        print("        push the arm around; end_free_drive() locks it and "
+              "returns the recording")
         if watched:
             names = ", ".join(self.joint_names[i] for i in watched)
             print(
                 f"        watching {names} — pushed more than "
-                f"{np.degrees(tolerance):.1f} deg off and the run stops to put "
-                "them back"
+                f"{np.degrees(tolerance):.1f} deg off and the run stops there, "
+                "for end_free_drive() to put them back"
             )
         ends = "no time limit" if np.isinf(duration) else f"{duration:g} s"
-        stops = ["Ctrl-C"]
-        if until is not None:
-            stops.insert(0, "the caller's `until`")
-        print(
-            f"        {ends}, sampling at {rate:.0f} Hz; "
-            f"{' or '.join(stops)} ends it early"
-        )
+        print(f"        {ends}, sampling at {rate:.0f} Hz")
 
-    def _free_drive_loop(self, *, mask, duration, period, tolerance,
-                         recover_speed, q_latched, confirm, until, on_sample,
-                         verbose, run):
-        """Sample the arm and watch the locked joints. Returns why it ended."""
+    def _free_drive_loop(self, state):
+        """Sample the arm and watch the locked joints. Returns why it ended.
+
+        This runs on the watch thread, and it reads the arm and stops the arm —
+        it never moves it. Whatever needs undoing afterwards is left in
+        `state["recovery"]` for `end_free_drive` to do, where there is somebody
+        to ask first.
+        """
+        run = state["run"]
+        mask, q_latched = state["mask"], state["q_latched"]
+        duration, period = state["duration"], state["period"]
+        tolerance, stop = state["tolerance"], state["stop"]
+        on_sample, verbose = state["on_sample"], state["verbose"]
+
         warn_at = tolerance * LOCKED_WARN_FRACTION
         # Nothing watched is the default, and then the drift check has nothing
         # to compare: the loop is there to record and to check the guard.
@@ -1240,16 +1445,16 @@ class RealXArm7(RobotInterface):
         next_tick = started + period
         last = started
         last_tick = None
-        resumed_at = -np.inf  # the first trip is nobody's repeat
-        repeats = 0
         # `free_drive` refuses to start from a pose the guard rejects, so the
         # latched configuration is a known-good place to retreat to until a
         # sample replaces it.
         q_safe = q_latched
 
         while True:
+            if stop.is_set():
+                return "stopped by end_free_drive()"
             now = time.monotonic()
-            run["teaching"] = now - started - run["paused"]
+            run["teaching"] = now - started
             if run["teaching"] >= duration:
                 return "duration elapsed"
             if now - last > STALL_ABORT:
@@ -1278,20 +1483,17 @@ class RealXArm7(RobotInterface):
             run["qd"].append(self.joint_velocities)
             if on_sample is not None and on_sample(now - started, q.copy()):
                 return "stopped by the caller"
-            if until is not None and until():
-                return getattr(until, "reason", "stopped by `until`")
 
             # Checked whether or not anyone is watching the terminal: this is
             # the one thing in the run that ends it rather than reporting it.
             violation = None if self._guard is None else self._guard.check(q)
             if violation is not None:
-                if verbose:
-                    print(f"[xarm7] unsafe pose: {violation}")
-                return self._free_drive_retreat(
-                    violation=violation, q_safe=q_safe,
-                    recover_speed=recover_speed, confirm=confirm,
-                    verbose=verbose,
-                )
+                # A violation always ends the run: teaching would resume one
+                # tick from the boundary and trip again immediately.
+                state["recovery"] = {
+                    "kind": "guard", "violation": violation, "q_safe": q_safe,
+                }
+                return f"unsafe pose: {violation}"
             q_safe = q
 
             if not watching:
@@ -1309,42 +1511,21 @@ class RealXArm7(RobotInterface):
             worst = int(np.argmax(drift))
 
             if drift[worst] > tolerance:
-                if now - resumed_at < REPEAT_WINDOW:
-                    repeats += 1
-                else:
-                    repeats = 0
-                if repeats >= REPEAT_LIMIT:
-                    # Putting it back and having it come straight off again is
-                    # not someone leaning on the arm, it is a joint this pose
-                    # cannot hold — carry on and the person only ever sees
-                    # prompts. The arm is left stiff, off the lock, and said so.
-                    return (
-                        f"{self.joint_names[worst]} came off its lock again "
-                        f"within {REPEAT_WINDOW:.0f} s, {REPEAT_LIMIT} times "
-                        "over: it is not holding at this pose"
-                    )
-                paused_from = time.monotonic()
-                ended = self._free_drive_recover(
-                    worst=worst, drift=float(drift[worst]), mask=mask,
-                    q_latched=q_latched, recover_speed=recover_speed,
-                    confirm=confirm, verbose=verbose,
-                )
-                run["paused"] += time.monotonic() - paused_from
                 run["interruptions"] += 1
-                if ended is not None:
-                    return ended
-                # The clocks all restart: the pause was not a stalled loop, and
-                # the samples either side of it are seconds apart.
-                resumed_at = last = time.monotonic()
-                next_tick = resumed_at + period
-                continue
+                state["recovery"] = {
+                    "kind": "watch", "joint": worst, "drift": float(drift[worst]),
+                }
+                return (
+                    f"{self.joint_names[worst]} was pushed "
+                    f"{np.degrees(drift[worst]):.1f} deg off its lock"
+                )
 
             if verbose and drift[worst] > warn_at:
                 self._free_drive_warn(
                     run,
                     f"{self.joint_names[worst]} is locked and has been "
                     f"pushed {np.degrees(drift[worst]):.1f} deg off it — "
-                    "ease off, or the run will stop to put it back",
+                    "ease off, or the run will stop",
                 )
 
             next_tick += period
@@ -1355,65 +1536,56 @@ class RealXArm7(RobotInterface):
                 run["overruns"] += 1
                 next_tick = time.monotonic()
 
-    def _free_drive_recover(self, *, worst, drift, mask, q_latched,
-                            recover_speed, confirm, verbose):
-        """Stiffen, get the hands clear, put the watched joints back.
+    def _free_drive_put_back(self, state, reason):
+        """Undo whatever ended the run: a watched joint off its lock, or a pose
+        the guard won't allow. Returns `reason`, said in full.
 
-        Returns None to carry on teaching, or why the run is over.
+        Called from `end_free_drive`, on the caller's own thread, which is the
+        whole point of leaving it until now: the arm is about to move on its
+        own, and here there is somebody at the terminal to tell first. It is in
+        position control and stiff where it stands by then, which is what makes
+        "take your hands off" a safe instruction rather than an alarming one.
+
+        The step back inside the guard is not a checked path: it starts where
+        the guard says the arm may not be, so `check_path` would refuse the
+        move for the very reason it is being made. What makes it safe is that
+        the arm has just come along it, a sampling period ago.
         """
-        name = self.joint_names[worst]
-        # Position control first, and before anyone is asked anything: it
-        # stiffens the arm exactly where it stands, which is what makes "take
-        # your hands off" a safe instruction rather than an alarming one.
-        self._ensure_mode(MODE_POSITION)
+        recovery, state["recovery"] = state["recovery"], None
+        confirm = state["confirm"]
+        speed = state["recover_speed"]
+        verbose = state["verbose"]
+
+        if recovery["kind"] == "watch":
+            name = self.joint_names[recovery["joint"]]
+            if not confirm(
+                f"\n[xarm7] {name} is locked, and it was pushed "
+                f"{np.degrees(recovery['drift']):.1f} deg off its lock.\n"
+                f"        TAKE YOUR HANDS OFF THE ROBOT — it is about to move "
+                f"on its own to put {name} back."
+            ):
+                return f"{reason}; the put-back was declined, so it is still off it"
+
+            target = self.joint_values
+            target[~state["mask"]] = state["q_latched"][~state["mask"]]
+            try:
+                reached = self.set_joint_targets(target, speed=speed)
+            except (ValueError, SafetyError, XArmError) as err:
+                # Most likely the free joints have been driven somewhere the
+                # guard won't allow, which this move cannot undo — it only
+                # moves the watched ones.
+                return f"{reason}; {name} could not be put back on its lock: {err}"
+            if not reached:
+                return f"{reason}; the move putting {name} back did not finish"
+            if verbose:
+                print(f"[xarm7] {name} is back on its lock")
+            return reason
+
+        violation = recovery["violation"]
         if not confirm(
-            f"\n[xarm7] {name} is locked, and it has been pushed "
-            f"{np.degrees(drift):.1f} deg off its lock.\n"
-            f"        TAKE YOUR HANDS OFF THE ROBOT — it is about to move on "
-            f"its own to put {name} back."
-        ):
-            return f"{name} drifted off its lock and the recovery was declined"
-
-        target = self.joint_values
-        target[~mask] = q_latched[~mask]
-        try:
-            reached = self.set_joint_targets(target, speed=recover_speed)
-        except (ValueError, SafetyError, XArmError) as err:
-            # Most likely the free joints have been driven somewhere the guard
-            # won't allow, which the recovery move cannot undo — it only moves
-            # the watched ones.
-            return f"{name} could not be put back on its lock: {err}"
-        if not reached:
-            return f"the move putting {name} back on its lock did not finish"
-
-        if verbose:
-            print(f"[xarm7] {name} is back on its lock; free drive resuming\n")
-        self._ensure_mode(MODE_TEACH)
-        return None
-
-    def _free_drive_retreat(self, *, violation, q_safe, recover_speed, confirm,
-                            verbose):
-        """Stop the run at the boundary and step the arm back inside it.
-
-        The retreat is the last tick's push undone — a few milliseconds of hand
-        movement at the sampling rate, so the arm is a millimetre or two past a
-        box face, and a link pair is still the margin short of touching. That
-        path is not checked: it starts where the guard says the arm may not be,
-        so `check_path` would refuse the move for the very reason it is being
-        made. What makes it safe is that the arm has just come along it.
-
-        Returns why the run is over. A violation always ends it: teaching would
-        resume one tick from the boundary and trip again immediately.
-        """
-        # Position control first, as in `_free_drive_recover`: it stiffens the
-        # arm where it stands, which is what stops the hand carrying it any
-        # further while anyone is being asked anything.
-        self._ensure_mode(MODE_POSITION)
-        reason = f"unsafe pose: {violation}"
-        if not confirm(
-            "\n[xarm7] the arm has reached the edge of what the guard allows:"
+            "\n[xarm7] the arm reached the edge of what the guard allows:"
             f"\n        {violation}"
-            "\n        Free drive has stopped and the arm is holding still."
+            "\n        Free drive stopped there and the arm is holding still."
             "\n        TAKE YOUR HANDS OFF THE ROBOT — it is about to move on "
             "its own to step back inside."
         ):
@@ -1423,9 +1595,8 @@ class RealXArm7(RobotInterface):
                 f"{reason}; the step back inside was declined, so the arm is "
                 "left outside the guard and later commands will be refused"
             )
-
         try:
-            reached = self._move_joints(q_safe, speed=recover_speed)
+            reached = self._move_joints(recovery["q_safe"], speed=speed)
         except (ValueError, XArmError) as err:
             return f"{reason}; the arm could not be stepped back inside: {err}"
         if not reached:
@@ -1443,15 +1614,17 @@ class RealXArm7(RobotInterface):
         run["warned_at"] = now
         print(f"[xarm7] {what}")
 
-    def _free_drive_release(self, verbose):
+    def _free_drive_release(self):
         """Hand the arm back: out of teaching mode, into position control.
 
         Teaching mode holds the arm up but yields to anything that pushes it,
         so leaving a run in it would leave the arm movable by hand with nothing
-        watching where it went. This runs on every path out of a run, including
-        a second Ctrl-C.
+        watching where it went. This runs on every path out of a run: the watch
+        thread's own way out, and `_free_drive_halt` giving up on a thread that
+        has stopped answering. Neither fault below is narration, so both print
+        whatever `verbose` says.
         """
-        if verbose and self.arm.has_err_warn:
+        if self.arm.has_err_warn:
             print(
                 "[xarm7] the controller has latched an error; call "
                 f"clear_errors() before moving again (code={self.arm.error_code})"
@@ -1459,8 +1632,7 @@ class RealXArm7(RobotInterface):
         try:
             self._ensure_mode(MODE_POSITION)
         except XArmError as err:
-            if verbose:
-                print(f"[xarm7] could not return to position control: {err}")
+            print(f"[xarm7] could not return to position control: {err}")
 
     def _free_drive_trajectory(self, run, mask, rate, reason, verbose):
         """Assemble the recording, and work out whether `qd` is real.
@@ -1491,11 +1663,6 @@ class RealXArm7(RobotInterface):
         report_rate = float("nan")
         if run["ticks"] and run["teaching"] > 0.0:
             report_rate = run["ticks"] / run["teaching"]
-        if verbose and run["interruptions"]:
-            print(
-                f"[xarm7] {run['interruptions']} interruption(s), so t has that "
-                "many gaps in it; np.diff(t) finds them."
-            )
 
         return Trajectory(
             t=t, q=q, qd=qd, joint_names=list(self.joint_names), free=mask,

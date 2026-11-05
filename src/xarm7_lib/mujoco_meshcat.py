@@ -37,8 +37,10 @@ _FLOOR_OPACITY = 0.55
 _WALL_COLOR = 0xD08B2C
 _WALL_OPACITY = 0.12
 
-# three.js builds cylinders along +Y; MuJoCo's axis is +Z.
-_Y_TO_Z = np.array(
+# three.js builds cylinders along +Y; MuJoCo's axis is +Z. Public, because
+# anything drawing its own cylinder into this scene needs the same fix-up —
+# see `visualize.segment_transform`.
+Y_TO_Z = np.array(
     [
         [1.0, 0.0, 0.0, 0.0],
         [0.0, 0.0, -1.0, 0.0],
@@ -61,7 +63,10 @@ class MeshcatVisualizer:
     ----------
     model, data : the MuJoCo model and the state to render.
     zmq_url : connect to an existing meshcat server instead of starting one.
-    open_browser : open the scene in a browser tab on construction.
+    open_browser : open the scene in a browser tab on construction. False
+        publishes and serves the scene as usual but opens nothing, leaving the
+        tab for a later `open()` — so whatever else is going to be drawn can be
+        put in first and the tab comes up on a finished scene.
     geom_groups : which MuJoCo geom groups to draw.
     prefix : path the scene is published under, so other objects can coexist.
     """
@@ -92,14 +97,36 @@ class MeshcatVisualizer:
         self._moving = [gid for gid in self._geoms if model.geom_bodyid[gid] != 0]
         self._paths = {gid: f"{prefix}/geom_{gid}" for gid in self._geoms}
 
+        self._opened = False
         self._load()
         self.sync(force=True)
         if open_browser:
-            self.viewer.open()
+            self.open()
 
     @property
     def url(self):
         return self.viewer.url()
+
+    @property
+    def opened(self):
+        """Whether a browser tab has been opened on this scene from here.
+
+        Says nothing about whether anyone is still looking at it: the tab can
+        be closed again, and meshcat does not tell us.
+        """
+        return self._opened
+
+    def open(self):
+        """Open the scene in a browser tab, once.
+
+        Idempotent, so the callers that defer the tab can ask for it without
+        keeping track of who asked first. Returns the URL either way.
+        """
+        if not self._opened:
+            self._opened = True
+            with self.lock:
+                self.viewer.open()
+        return self.url
 
     def _load(self):
         with self.lock:
@@ -142,13 +169,13 @@ class MeshcatVisualizer:
 
         if gtype == T.mjGEOM_CYLINDER:
             return [
-                ("", g.Cylinder(2.0 * float(size[1]), float(size[0])), _Y_TO_Z),
+                ("", g.Cylinder(2.0 * float(size[1]), float(size[0])), Y_TO_Z),
             ]
 
         if gtype == T.mjGEOM_CAPSULE:
             radius, half = float(size[0]), float(size[1])
             return [
-                ("cylinder", g.Cylinder(2.0 * half, radius), _Y_TO_Z),
+                ("cylinder", g.Cylinder(2.0 * half, radius), Y_TO_Z),
                 ("cap_pos", g.Sphere(radius), _translation([0.0, 0.0, half])),
                 ("cap_neg", g.Sphere(radius), _translation([0.0, 0.0, -half])),
             ]

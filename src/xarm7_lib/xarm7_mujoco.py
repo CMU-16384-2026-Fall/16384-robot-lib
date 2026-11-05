@@ -72,7 +72,9 @@ import time
 import mujoco
 import numpy as np
 
+from . import mjscene
 from .api import RobotInterface
+from .mjscene import ARM_JOINTS
 from .gripper import (
     FULL_TRAVEL_TIME,
     GRIPPER_CLOSED,
@@ -82,8 +84,6 @@ from .gripper import (
 )
 from .mujoco_meshcat import MeshcatVisualizer
 from .safety import DEFAULT_BOX, DEFAULT_MARGIN, SafetyGuard
-
-ARM_JOINTS = tuple(f"joint{i}" for i in range(1, 8))
 VELOCITY_LIMIT = 3.14  # rad/s; the MJCF carries no joint velocity limits
 
 DEFAULT_SPEED = 0.3  # rad/s
@@ -93,6 +93,7 @@ _VELOCITY_TOLERANCE = 1e-2  # rad/s
 _STRIBECK_VELOCITY = 1e-2  # rad/s, smooths the Coulomb friction sign()
 
 SERVO_TIMEOUT = 0.1  # s without a new servo command before the arm coasts down
+_STOP_TIMEOUT = 2.0  # s to let the arm come to rest after a move times out
 
 # The jaws creep the last fraction of a millimetre into whatever stopped them
 # well below `_VELOCITY_TOLERANCE`, so a grip that reads as finished the
@@ -119,9 +120,7 @@ _FACE_PROXIMITY = 0.15  # m
 # the MJCF has no floor of its own — so it stays whatever the arm is doing.
 _FLOOR_FACE = "zmin"
 
-_GRIPPER_BODIES = ("gripper", "finger", "knuckle")
 _GRIPPER_DRIVER = "driver"  # the joints the gripper's one actuator drives
-_HIDDEN_GROUP = 3  # outside the groups the visualizer draws
 
 _MODE_HOLD = "hold"
 _MODE_POSITION = "position"
@@ -140,6 +139,9 @@ class SimulatedXArm7(RobotInterface):
         `keyframe="home"` instead to start from the MJCF's home pose.
     keyframe : name or index of an MJCF keyframe to reset into.
     visualize : publish the scene to meshcat and open it in a browser tab.
+    open_browser : open that tab on construction. False still publishes and
+        serves the scene — the URL is printed — but waits for `viz.open()`,
+        which is how the tab can be left until the scene is finished.
     real_time : run the sim in a background thread paced to wall time. When
         False the sim only advances inside `step()` (or while a blocking call
         waits on it), which makes runs deterministic and as fast as the CPU
@@ -172,6 +174,7 @@ class SimulatedXArm7(RobotInterface):
         q0=None,
         keyframe=None,
         visualize=False,
+        open_browser=True,
         real_time=True,
         gravity=True,
         feedforward=True,
@@ -180,15 +183,11 @@ class SimulatedXArm7(RobotInterface):
         safety_margin=DEFAULT_MARGIN,
         guard=True,
         gripper=True,
+        zmq_url=None,
     ):
         super().__init__()
 
-        if mjcf_path is None:
-            from robot_descriptions.loaders.mujoco import load_robot_description
-
-            self.model = load_robot_description("xarm7_mj_description")
-        else:
-            self.model = mujoco.MjModel.from_xml_path(str(mjcf_path))
+        self.model = mjscene.load_arm_model(mjcf_path)
 
         if dt is not None:
             self.model.opt.timestep = float(dt)
@@ -252,9 +251,10 @@ class SimulatedXArm7(RobotInterface):
         self._viz_period = 1.0 / viz_rate if viz_rate else None
         self._last_viz = -np.inf
         if visualize:
-            self.viz = MeshcatVisualizer(self.model, self.data)
+            self.viz = MeshcatVisualizer(
+                self.model, self.data, zmq_url=zmq_url, open_browser=open_browser
+            )
             self._draw_safety_box()
-            print(f"Meshcat: {self.viz.url}")
 
         if real_time:
             self._thread = threading.Thread(
@@ -316,6 +316,10 @@ class SimulatedXArm7(RobotInterface):
         silently clamping it would have the arm end up somewhere it was never
         asked to go.
 
+        If `timeout` elapses first, the arm is stopped where it is: a move
+        nobody is waiting for any more should not carry on unattended. Waiting
+        for it to come to rest can take the call slightly past `timeout`.
+
         Returns True if the arm settled on the target, False if `wait` was
         False, if `timeout` elapsed first, or if the guard stopped the arm at
         the safety boundary short of the target — `last_violation` says which.
@@ -355,12 +359,26 @@ class SimulatedXArm7(RobotInterface):
         if not wait:
             return False
         if not self.wait_for_motion(timeout=timeout):
+            self._stop_timed_out(goal)
             return False
         # Settling isn't arriving: the guard parks the arm at the boundary and
         # it settles there perfectly happily.
         with self._lock:
             reached = self.data.qpos[self._qadr]
         return bool(np.max(np.abs(reached - goal)) <= _POSITION_TOLERANCE)
+
+    def _stop_timed_out(self, goal):
+        """Stop a move whose wait ran out, and wait for the arm to come to rest.
+
+        Leaves the arm alone if a newer command has replaced the move, since
+        that command is what the arm should be doing now. Every move gets its
+        own `goal` array, so comparing identity says whether this one is current.
+        """
+        with self._lock:
+            if self._goal is not goal or self._mode not in (_MODE_POSITION, _MODE_HOLD):
+                return
+            self.stop(wait=False)
+        self.wait_for_motion(timeout=_STOP_TIMEOUT)
 
     def set_velocity(self, speeds, duration=0, wait=True):
         """Command joint velocities, rad/s (7,).
@@ -637,27 +655,7 @@ class SimulatedXArm7(RobotInterface):
     # Setup
     # ------------------------------------------------------------------
     def _index_arm(self):
-        """Locate the arm's joints, DOFs and actuators (the MJCF also carries
-        a gripper, which this API doesn't expose)."""
-        jid, qadr, vadr, act = [], [], [], []
-        for name in ARM_JOINTS:
-            j = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, name)
-            if j < 0:
-                raise ValueError(f"joint {name!r} not found in the model")
-            jid.append(j)
-            qadr.append(self.model.jnt_qposadr[j])
-            vadr.append(self.model.jnt_dofadr[j])
-
-            driving = [
-                a
-                for a in range(self.model.nu)
-                if self.model.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_JOINT
-                and self.model.actuator_trnid[a, 0] == j
-            ]
-            if len(driving) != 1:
-                raise ValueError(f"expected exactly one actuator for {name!r}")
-            act.append(driving[0])
-        return tuple(np.asarray(v) for v in (jid, qadr, vadr, act))
+        return mjscene.index_arm(self.model)
 
     def _index_gripper(self):
         """Locate the gripper: its actuator, the joints it drives, and the
@@ -702,32 +700,21 @@ class SimulatedXArm7(RobotInterface):
             )
 
     def _base_frame(self):
-        """The arm's base frame in the world, as a 4x4.
+        return mjscene.base_frame(self.model, self.data, self._jid[0])
 
-        The frame every joint configuration is written in — and so the frame
-        the safety box is written in — is the one joint1 turns in, which an
-        MJCF is free to put anywhere in its world. Menagerie's xarm7 mounts
-        `link_base` at z = 120 mm, so the two frames are not the same one and
-        anything given in base coordinates has to be carried across.
-        """
-        body = self.model.body_parentid[self.model.jnt_bodyid[self._jid[0]]]
-        frame = np.eye(4)
-        frame[:3, :3] = self.data.xmat[body].reshape(3, 3)
-        frame[:3, 3] = self.data.xpos[body]
-        return frame
+    @property
+    def base_frame(self):
+        """The arm's base frame in the world, as a 4x4 — see `mjscene.base_frame`."""
+        return self._base_frame()
+
+    @property
+    def guard(self):
+        """The `SafetyGuard` checking this arm's setpoints, or None."""
+        return self._guard
 
     def _draw_safety_box(self):
-        """Show the box in the viewer, if there is a viewer and a box."""
-        if self.viz is None:
-            return
-        box = self._guard.box if self._guard is not None else None
-        if box is None:
-            self.viz.clear_safety_box()
-        else:
-            # In base coordinates, like the guard's own box — the picture would
-            # otherwise sit 120 mm under the arm and libel safe poses.
-            self.viz.draw_safety_box(box, frame=self._base_frame())
-            self._update_safety_faces()
+        mjscene.draw_box(self.viz, self._guard, self._base_frame())
+        self._update_safety_faces()
 
     def _update_safety_faces(self):
         """Leave drawn only the floor and the faces the arm is getting close to.
@@ -735,42 +722,14 @@ class SimulatedXArm7(RobotInterface):
         Run off the joint angles MuJoCo is actually at rather than off the
         setpoint the guard checks, because this is about the arm in the
         picture: a face should appear as the arm you can see approaches it.
-
-        Measuring the six gaps costs around 150 us, a tenth of a physics tick,
-        which is why this goes on the viewer's clock and not the simulation's.
         """
-        if self.viz is None or self._guard is None:
-            return
-        clearances = self._guard.box_clearances(self.data.qpos[self._qadr])
-        near = [face for face, gap in clearances.items() if gap <= _FACE_PROXIMITY]
-        self.viz.show_safety_faces(near + [_FLOOR_FACE])
+        mjscene.update_faces(self.viz, self._guard, self.data.qpos[self._qadr])
 
     def _find_gripper_geoms(self):
-        """Geoms belonging to the MJCF's gripper, by the bodies they hang off."""
-        geoms = []
-        for geom in range(self.model.ngeom):
-            body = self.model.geom_bodyid[geom]
-            name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, body) or ""
-            if any(part in name for part in _GRIPPER_BODIES):
-                geoms.append(geom)
-        return geoms
+        return mjscene.find_gripper_geoms(self.model)
 
     def _remove_gripper(self):
-        """Take the gripper out of the contact set and out of the picture.
-
-        For `gripper=False`, which says there is nothing bolted on: the guard
-        is built without the gripper too, so leaving the MJCF's one collidable
-        would have the simulator jam on a part that is not supposed to be there
-        and jam silently, with the guard having nothing to say about it. Only
-        the geometry goes; the mass stays, standing in for whatever really is
-        on the flange.
-        """
-        for geom in self._gripper_geoms:
-            self.model.geom_contype[geom] = 0
-            self.model.geom_conaffinity[geom] = 0
-            # MuJoCo's own way of saying "don't draw this", which the meshcat
-            # visualizer follows too.
-            self.model.geom_group[geom] = _HIDDEN_GROUP
+        mjscene.hide_gripper(self.model, self._gripper_geoms)
 
     def _reset_state(self, q0, keyframe):
         if keyframe is not None:

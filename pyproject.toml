@@ -15,12 +15,23 @@ dependencies = [
     # provides both the `pinocchio` and `coal` modules used by safety.py
     "pin>=4.1",
     "robot_descriptions",
+    "scipy",
     "xacrodoc",
     "xarm-python-sdk",
 ]
+
+[project.optional-dependencies]
+camera = ["opencv-python"]
+dev = ["pytest"]
 
 [project.urls]
 Homepage = "https://github.com/tooflesswulf/16384-prototype-lib"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The hand-eye calibration a TA files with
+# `python -m xarm7_lib.calibrate_handeye`, so that a non-editable install
+# carries it too. One per camera, named by serial number.
+[tool.setuptools.package-data]
+xarm7_lib = ["data/handeye/*.json"]

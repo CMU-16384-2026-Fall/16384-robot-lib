@@ -6,25 +6,36 @@ the controller can do: its one hand-guiding mode — joint teaching,
 `set_mode(2)` — frees all seven joints at once and gravity-compensates the arm,
 and there is no way to tell it to hold some of them.
 
+A run is two calls. `free_drive()` releases the arm and returns at once,
+leaving a thread sampling and watching it; `end_free_drive()` ends the run,
+locks the arm and hands back the recording. So the waiting is the caller's, and
+they can wait however they like:
+
+    robot.free_drive()
+    input("push the arm around, then press Enter: ")
+    traj = robot.end_free_drive()
+
 `watch=` is for the joints that are meant to stay put anyway. They are not
 locked, they are *watched*. The arm still sits in joint teaching mode with
 everything free, and the loop in `xarm7_real.py` reads the joint positions and
 compares the watched ones against the values latched when the run started. Past
-`tolerance` on any of them the run interrupts itself: back to position control, which stiffens the
-arm where it stands, a prompt asking the person to let go, then a slow move
-that puts the watched joints back on their latched values, then back to
-teaching. The recording continues afterwards with a gap in it.
+`tolerance` on any of them the run ends itself: back to position control, which
+stiffens the arm where it stands. Nothing moves then — the watch loop never
+drives the arm, because the person waiting at `input()` has no way to be asked
+to let go of it first. The put-back is `end_free_drive`'s job, where there is
+somebody to prompt.
 
 That is the whole trick, and it is worth being clear about what it buys and
-what it does not. It buys a lock that is *restored* rather than *held*: between
-the moment a joint starts to move and the moment the loop notices, that joint is
-free, and it will have moved by up to `tolerance` plus whatever a report period
-of lag allows. What it avoids is fighting the controller's own servo — the
-previous attempt at this was an admittance loop streaming setpoints in servo
-mode, which needed a gravity model, a torque sign convention, per-joint damping
-above a stability floor set by servo gains the controller does not publish, and
-tuning per arm. Joint teaching needs none of that: the controller does the
-gravity compensation with its own identified model of itself.
+what it does not. It buys a lock that is *reported* and then restored, rather
+than held: between the moment a joint starts to move and the moment the loop
+notices, that joint is free, and it will have moved by up to `tolerance` plus
+whatever a report period of lag allows. What it avoids is fighting the
+controller's own servo — the previous attempt at this was an admittance loop
+streaming setpoints in servo mode, which needed a gravity model, a torque sign
+convention, per-joint damping above a stability floor set by servo gains the
+controller does not publish, and tuning per arm. Joint teaching needs none of
+that: the controller does the gravity compensation with its own identified
+model of itself.
 
 Nothing here needs a robot — the constants you tune, the mask arithmetic, the
 trajectory the loop hands back — so it can be read and changed without one.
@@ -36,10 +47,7 @@ after it has been parked outside it.
 """
 
 import dataclasses
-import io
 import os
-import select
-import sys
 
 import numpy as np
 
@@ -66,13 +74,10 @@ STALL_ABORT = 0.5  # s gap in the loop after which the run ends
 # is nothing enforcing it. Ending the run is what puts the arm back into
 # position control, where the joints are held rather than watched.
 
-# A recovery that is undone again within this long is not the person pushing,
-# it is the pose failing to hold — a joint the controller's own compensation
-# leaves drifting under a load the model doesn't know about, say. Repeat it
-# this many times in a row and the run ends and says so, rather than prompting
-# forever.
-REPEAT_WINDOW = 1.0  # s of teaching after a recovery
-REPEAT_LIMIT = 3
+# How long `end_free_drive` waits for the watch loop to notice it is over
+# before giving up on it and locking the arm itself. A tick is milliseconds, so
+# anything near this means the thread is stuck in a call to the controller.
+JOIN_TIMEOUT = 5.0  # s
 
 # The 16-384 lab setup. Joints 1, 4 and 7 are the free ones, and the four
 # between them are posed so that all three sit on axes gravity has no moment
@@ -152,171 +157,21 @@ def watch_mask(watch, nq=7):
     return ~watched
 
 
-# Watching the terminal without owning it. The condition `stop_on_enter`
-# hands back is asked once a tick by the watch loop, and it *peeks* at stdin
-# with `select` rather than reading it: nothing is waiting on stdin between
-# ticks, and nothing at all is once the run is over.
-#
-# A reader thread is the obvious way to do this and the wrong one. A thread
-# blocked in `readline` goes on owning stdin after the run that started it has
-# ended, there is no portable way to call it back, and in an interactive
-# session the next thing typed at the prompt disappears into it instead of
-# reaching Python.
-_STDIN_EOF = False
-_STDIN_BUFFER = bytearray()
-
-
-def _stdin_fd():
-    """stdin's file descriptor, or None if it hasn't got one.
-
-    A notebook kernel or an IDE console replaces `sys.stdin` with an object
-    that has no descriptor to select on. Worth saying plainly rather than
-    crashing over.
-    """
-    try:
-        fd = sys.stdin.fileno()
-    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
-        return None
-    return fd if fd >= 0 else None
-
-
-def _stdin_waiting(fd):
-    """Whether stdin has anything to read this instant.
-
-    Raises if `select` cannot answer for this kind of descriptor, which on
-    Windows is most of them.
-    """
-    return bool(select.select([fd], [], [], 0.0)[0])
-
-
-def _stdin_take_line(fd):
-    """True if a whole line has been typed since this was last asked.
-
-    Consumes that line, so one Enter cannot both stop a run and answer a
-    prompt. Reads the descriptor rather than `sys.stdin`, which would block
-    on a partial line and would hide what it had read in a buffer of its own
-    where a later `input()` could not reach it.
-    """
-    global _STDIN_EOF
-    while not _STDIN_EOF:
-        try:
-            if not _stdin_waiting(fd):
-                break
-            chunk = os.read(fd, 4096)
-        except (OSError, ValueError):
-            _STDIN_EOF = True
-            break
-        if not chunk:
-            _STDIN_EOF = True
-            break
-        _STDIN_BUFFER.extend(chunk)
-
-    if b"\n" not in _STDIN_BUFFER:
-        return False
-    del _STDIN_BUFFER[: _STDIN_BUFFER.index(b"\n") + 1]
-    return True
-
-
-def drain_terminal():
-    """Throw away anything typed but not yet read.
-
-    For a prompt that must not be answered by a newline from earlier — "take
-    your hands off the robot" above all.
-    """
-    fd = _stdin_fd()
-    if fd is None:
-        return
-    while _stdin_take_line(fd):
-        pass
-    _STDIN_BUFFER.clear()
-
-
-def read_line(prompt=""):
-    """Prompt for a line at the terminal, ignoring anything typed before now."""
-    drain_terminal()
-    return input(prompt)
-
-
-def stop_on_enter(announce=True):
-    """A `free_drive(until=)` condition that fires when Enter is pressed.
-
-        robot.free_drive(None, until=stop_on_enter())
-
-    Returns a callable the watch loop asks once a tick. It peeks at the
-    terminal instead of reading it, so the arm goes on being sampled and
-    watched while it waits — and so the run leaves nothing behind holding
-    stdin, which in an interactive session would swallow the next thing typed
-    at the prompt. Ctrl-C still ends a run too; this is for the student who
-    shouldn't have to reach for it.
-
-    Enter pressed at a prompt the run puts up — the hands-off warning — does
-    not also stop the run: that prompt ignores anything typed before it.
-
-    Anything typed before the condition is made is dropped, so a run started
-    by pressing Enter is not stopped by the same keystroke.
-
-    `announce` prints the one-line instruction. Pass False if your own banner
-    already says it. `reason` on the returned object is what
-    `Trajectory.reason` will say.
-    """
-    fd = _stdin_fd()
-    if fd is None:
-        unusable = "stdin has no file descriptor here"
-    else:
-        try:
-            _stdin_waiting(fd)
-        except (OSError, ValueError):
-            unusable = "stdin cannot be polled on this platform"
-        else:
-            _stdin_take_line(fd)
-            unusable = "stdin is closed" if _STDIN_EOF else None
-
-    if unusable is not None:
-        # Say so now: with `duration=None` as well, nothing would be left to
-        # end the run.
-        print(
-            f"[xarm7] {unusable}, so Enter will never be seen — this run needs "
-            "its duration, another stop condition, or Ctrl-C to end"
-        )
-
-        class _NeverStops:
-            reason = "stopped by Enter at the terminal"
-
-            def __call__(self):
-                return False
-
-            def __repr__(self):
-                return "stop_on_enter() [the terminal cannot be watched]"
-
-        return _NeverStops()
-
-    if announce:
-        print("[xarm7] press Enter to stop the run")
-
-    class _EnterStop:
-        reason = "stopped by Enter at the terminal"
-
-        def __call__(self):
-            return _stdin_take_line(fd)
-
-        def __repr__(self):
-            return "stop_on_enter()"
-
-    return _EnterStop()
-
-
 def hands_off_prompt(message):
     """Ask at the terminal, and wait. The default for `free_drive(confirm=)`.
 
-    Returns True to carry on, False to end the run — which is what a closed
-    stdin means, since a run that cannot ask anyone to let go of the arm must
-    not start moving it.
+    Only ever called from `end_free_drive`, on the caller's own thread, so this
+    is the only thing reading stdin and a plain `input` is enough.
+
+    Returns True to carry on, False to leave the arm where it is — which is
+    what a closed stdin means, since a prompt nobody can answer must not be
+    taken for a person with their hands clear.
     """
     print(message)
     try:
-        read_line("        press Enter when your hands are clear: ")
+        input("        press Enter when your hands are clear: ")
     except EOFError:
-        print("        (nothing on stdin to answer with; ending the run)")
+        print("        (nothing on stdin to answer with; not moving the arm)")
         return False
     return True
 
@@ -330,13 +185,12 @@ class Trajectory:
     so `q[k]` and `qd[k]` are the arm at `t[k]`, and `q` is what a forward
     kinematics or Jacobian check should be run against.
 
-    `interruptions` is how many times a watched joint drifted past tolerance and
-    the run stopped to put it back — always zero for a run that watched nothing,
-    which is the default. Nothing is sampled while that happens, so
-    each one leaves a **gap in `t`** — consecutive samples either side of a gap
-    are seconds apart and the arm moved under its own power in between. If
-    `interruptions` is zero the sampling is uniform and there is nothing to
-    worry about; if it isn't, `np.diff(t)` finds the seams.
+    `interruptions` is how many times a watched joint drifted past tolerance —
+    at most one, since that is what ends the run, and always zero for a run
+    that watched nothing, which is the default. The sampling itself is uniform
+    either way: the arm is never moved under its own power while a run is
+    recording, so there are no gaps in `t`. The put-back happens in
+    `end_free_drive`, after the last sample.
 
     `qd_source` says where the velocities came from. "report" is the
     controller's own realtime joint speeds. "difference" means those weren't

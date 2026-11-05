@@ -7,3 +7,17 @@ ip.txt
 build/
 dist/
 *.egg-info/
+
+light_stick*
+
+# A bench's hand-eye calibration belongs to that bench: the TA who runs
+# `calibrate_handeye` writes it into the installation on that machine, and it
+# means nothing on any other.
+src/xarm7_lib/data/handeye/
+
+# Output of `python -m xarm7_lib.calibrate_handeye board`, regenerable and
+# sized for a particular printer.
+charuco_board.*
+
+# Scratch output from the calibration and detection tools.
+debug/
