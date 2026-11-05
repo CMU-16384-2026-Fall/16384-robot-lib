@@ -346,6 +346,10 @@ class RealXArm7(RobotInterface):
         bug in the caller, and starting it anyway would just mean stopping
         part-way somewhere it was never asked to be.
 
+        If `timeout` elapses first, the arm is stopped where it is: a move
+        nobody is waiting for any more should not carry on unattended. Waiting
+        for it to come to rest can take the call slightly past `timeout`.
+
         Returns True if the arm settled on the target, False if `wait` was
         False, if `timeout` elapsed first, or if the move was cancelled while
         waiting — by `stop()`, by another command, or by the emergency stop.
@@ -371,7 +375,7 @@ class RealXArm7(RobotInterface):
 
         self._ensure_mode(MODE_POSITION)
         with self._lock:
-            self._begin_command()
+            generation = self._begin_command()
         # The SDK's own blocking wait knows when the controller's motion queue
         # has drained, so it is the first thing to ask — but it is not the last
         # word: it gives up the moment the *reported* mode isn't 0, which can
@@ -387,7 +391,10 @@ class RealXArm7(RobotInterface):
                 wait=wait,
                 timeout=timeout,
             )
-        if code in (_WAIT_FINISH_TIMEOUT, _STOPPED):
+        if code == _STOPPED:
+            return False
+        if code == _WAIT_FINISH_TIMEOUT:
+            self._stop_timed_out(generation)
             return False
         self._check(code, "set_servo_angle")
 
@@ -397,10 +404,25 @@ class RealXArm7(RobotInterface):
         if timeout is not None:
             remaining = float(timeout) - (time.monotonic() - started)
             if remaining <= 0.0:
+                self._stop_timed_out(generation)
                 return False
         if not self.wait_for_motion(timeout=remaining):
+            self._stop_timed_out(generation)
             return False
         return bool(np.max(np.abs(self.joint_values - goal)) <= _POSITION_TOLERANCE)
+
+    def _stop_timed_out(self, generation):
+        """Stop a move whose wait ran out, and wait for the arm to come to rest.
+
+        Leaves the arm alone if a newer command has replaced the move, since
+        that command is what the arm should be doing now, or if the connection
+        has gone, since there is nothing left to tell it.
+        """
+        with self._lock:
+            if self._generation != generation or not self.arm.connected:
+                return
+            self.stop(wait=False)
+        self.wait_for_motion(timeout=_STOP_TIMEOUT)
 
     def set_velocity(self, speeds, duration=0, wait=True):
         """Command joint velocities, rad/s (7,).

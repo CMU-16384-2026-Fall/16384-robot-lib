@@ -34,6 +34,7 @@ class RobotInterface:
             speed: The speed at which to move the joints.
             wait: If True, block until the robot reaches the target.
             timeout: The maximum time to wait for the robot to reach the target.
+                If it elapses, the robot is stopped where it is.
 
         Returns:
             True if the robot reached the target, False otherwise.

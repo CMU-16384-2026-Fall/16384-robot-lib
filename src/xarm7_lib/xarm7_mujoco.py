@@ -93,6 +93,7 @@ _VELOCITY_TOLERANCE = 1e-2  # rad/s
 _STRIBECK_VELOCITY = 1e-2  # rad/s, smooths the Coulomb friction sign()
 
 SERVO_TIMEOUT = 0.1  # s without a new servo command before the arm coasts down
+_STOP_TIMEOUT = 2.0  # s to let the arm come to rest after a move times out
 
 # The jaws creep the last fraction of a millimetre into whatever stopped them
 # well below `_VELOCITY_TOLERANCE`, so a grip that reads as finished the
@@ -315,6 +316,10 @@ class SimulatedXArm7(RobotInterface):
         silently clamping it would have the arm end up somewhere it was never
         asked to go.
 
+        If `timeout` elapses first, the arm is stopped where it is: a move
+        nobody is waiting for any more should not carry on unattended. Waiting
+        for it to come to rest can take the call slightly past `timeout`.
+
         Returns True if the arm settled on the target, False if `wait` was
         False, if `timeout` elapsed first, or if the guard stopped the arm at
         the safety boundary short of the target — `last_violation` says which.
@@ -354,12 +359,26 @@ class SimulatedXArm7(RobotInterface):
         if not wait:
             return False
         if not self.wait_for_motion(timeout=timeout):
+            self._stop_timed_out(goal)
             return False
         # Settling isn't arriving: the guard parks the arm at the boundary and
         # it settles there perfectly happily.
         with self._lock:
             reached = self.data.qpos[self._qadr]
         return bool(np.max(np.abs(reached - goal)) <= _POSITION_TOLERANCE)
+
+    def _stop_timed_out(self, goal):
+        """Stop a move whose wait ran out, and wait for the arm to come to rest.
+
+        Leaves the arm alone if a newer command has replaced the move, since
+        that command is what the arm should be doing now. Every move gets its
+        own `goal` array, so comparing identity says whether this one is current.
+        """
+        with self._lock:
+            if self._goal is not goal or self._mode not in (_MODE_POSITION, _MODE_HOLD):
+                return
+            self.stop(wait=False)
+        self.wait_for_motion(timeout=_STOP_TIMEOUT)
 
     def set_velocity(self, speeds, duration=0, wait=True):
         """Command joint velocities, rad/s (7,).
