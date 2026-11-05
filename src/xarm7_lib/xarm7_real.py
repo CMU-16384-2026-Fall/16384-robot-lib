@@ -1127,7 +1127,8 @@ class RealXArm7(RobotInterface):
             verbose: narrate the run: the banner, why it ended, and a warning
                 as a watched joint nears its limit. Off by default, since
                 `Trajectory.reason` says why a run ended. The guard is checked
-                either way, and faults are printed either way.
+                either way, and a guard stop and faults print a warning either
+                way.
 
         Returns:
             None. `end_free_drive` returns the `Trajectory`.
@@ -1360,7 +1361,18 @@ class RealXArm7(RobotInterface):
         finally:
             self._free_drive_release()
             self._restore_teach_sensitivity(state)
-            if state["verbose"] and not state["stop"].is_set():
+            recovery = state["recovery"]
+            if recovery is not None and recovery["kind"] == "guard":
+                # Not narration: the arm has just gone stiff in somebody's
+                # hands, and they need to know why whatever `verbose` says.
+                state["announced"] = True
+                print(f"[xarm7] WARNING: free drive stopped: {state['reason']}")
+                print(
+                    "        the arm is locked where it stands; end_free_drive() "
+                    "will ask you to stand clear, step it back inside, and "
+                    "return the recording"
+                )
+            elif state["verbose"] and not state["stop"].is_set():
                 # The run ended on its own and whoever started it is off doing
                 # something else: say so, and say what is waiting for them.
                 state["announced"] = True
