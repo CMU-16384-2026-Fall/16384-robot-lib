@@ -1,14 +1,10 @@
 """Measure where the ZED is, in the robot's coordinates. A TA runs this once per bench.
 
-    python -m xarm7_lib.calibrate_handeye board          # the board to print and stick on
     python -m xarm7_lib.calibrate_handeye run --dry-run  # solve, report, write nothing
     python -m xarm7_lib.calibrate_handeye run            # ... and file the result
-    python -m xarm7_lib.calibrate_handeye verify         # check a filed one, live
-    python -m xarm7_lib.calibrate_handeye self-test      # the solver, no hardware
+    python -m xarm7_lib.calibrate_handeye register-tag   # record the table tag for a filed one
 
-    python -m xarm7_lib.calibrate_handeye tag            # the tag to fix to the table
-    python -m xarm7_lib.calibrate_handeye register-tag   # record it for a filed calibration
-    python -m xarm7_lib.calibrate_handeye check          # has the camera moved?
+The board and the table tag are printed with `python -m xarm7_lib.fiducials`.
 
 A ChArUco board goes on the gripper. The arm takes it through a spread of
 poses, the fixed camera watches, and `handeye.solve`/`handeye.refine` recover
@@ -43,11 +39,9 @@ Each has a check here, because none of them shows up as an error.
 
 **The board printed at the wrong scale.** A print dialog set to "fit to page"
 scales the squares by a few percent, and the calibration then comes out wrong
-by that same few percent with residuals that look perfect -- the solver has no
-way to know the board is not the size it was told. So `board` writes a PDF
-whose page is a standard paper size with the board on it at exact scale,
-prints the spec *onto the board itself*, and tells you to caliper a square
-before trusting it.
+by that same few percent with residuals that look perfect. `fiducials.py`
+writes the board as a PDF at exact scale with its spec printed on it, and `run`
+says which board it is being told about before it starts.
 
 **The model and the controller disagreeing about the flange.** Forward
 kinematics here comes from `xarm7_description`, the same model `safety.py`
@@ -64,48 +58,41 @@ deliberately rotates the wrist about all three of its axes in turn, and
 """
 
 import argparse
-import json
 import os
 import pathlib
 import shlex
-import struct
 import sys
 import time
-import zlib
 
 import cv2
 import numpy as np
 
+from .fiducials import (
+    add_board_arguments,
+    add_tag_identity_arguments,
+    charuco_board,
+    spec_from_args,
+)
 from .handeye import (
-    ERROR_RADIUS,
     INSTALLED_DIR,
     USER_DIR,
-    BoardSpec,
     HandEye,
     HandEyeError,
     Intrinsics,
     Observation,
-    TagReference,
     find_filed,
     fit_board_pose,
     fit_camera_shift,
     filename,
-    invert,
     leave_one_out,
-    load_handeye,
     pose,
     refine,
-    reprojection_errors,
-    rotation_angle,
     solve,
 )
 from .tag_recovery import (
-    TAG_DICTIONARY,
     TAG_ID,
     TAG_LENGTH,
     TAG_RESOLUTION,
-    aruco_dictionary,
-    capture_tag,
     record_reference,
 )
 
@@ -156,22 +143,6 @@ MIN_CORNERS = 8
 GOOD_RMS_PX = 0.5
 GOOD_SPREAD = 0.005  # m of leave-one-out wander
 
-# The marker is printed inside the square, so its size is a fraction of the
-# square rather than a length of its own: the white quiet zone the detector
-# needs around a marker has to stay proportional when the board is resized.
-# Three quarters is what OpenCV's own samples use.
-MARKER_RATIO = 0.75
-DEFAULT_SQUARE_LENGTH = 0.020  # m
-
-DEFAULT_BOARD = BoardSpec(
-    squares_x=5,
-    squares_y=7,
-    square_length=DEFAULT_SQUARE_LENGTH,
-    marker_length=DEFAULT_SQUARE_LENGTH * MARKER_RATIO,
-)
-DEFAULT_DPI = 600
-DEFAULT_MARGIN = 10.0  # mm of white around the printed board
-DEFAULT_TAG_MARGIN = 20.0  # mm around the table tag, which also holds its caption
 # Under this the corners stop being findable to the precision recovery relies on.
 # On renders, 45 mm at 1.5 m is 24 px and fine at 30 degrees above the table, and
 # 14 px and three times worse at 20 degrees.
@@ -303,222 +274,8 @@ def check_kinematics(kinematics, arm, tolerance=FK_TOLERANCE):
 
 
 # ----------------------------------------------------------------------
-# The board
+# Seeing the board
 # ----------------------------------------------------------------------
-
-
-def charuco_board(spec):
-    """Build the OpenCV board for a `BoardSpec`, with the geometry cross-checked.
-
-    `BoardSpec.object_points` computes the corner layout in plain numpy so that
-    reading a calibration back needs no OpenCV. That makes it a second
-    implementation of something OpenCV already knows, so it is checked against
-    OpenCV's here -- the one place both are available. A mismatch would be a
-    silent corner-ordering bug, which is the kind that produces a confident
-    wrong answer.
-    """
-    board = cv2.aruco.CharucoBoard(
-        (spec.squares_x, spec.squares_y),
-        spec.square_length,
-        spec.marker_length,
-        aruco_dictionary(spec.dictionary),
-    )
-    if spec.legacy:
-        # Boards generated by OpenCV before 4.6 have the marker grid shifted by
-        # one square. Only for a board printed from an older install.
-        board.setLegacyPattern(True)
-
-    theirs = np.asarray(board.getChessboardCorners(), dtype=float)
-    ours = spec.object_points()
-    if theirs.shape != ours.shape or not np.allclose(theirs, ours, atol=1e-6):
-        raise HandEyeError(
-            "BoardSpec.object_points disagrees with OpenCV's "
-            "getChessboardCorners for this board, so the corner ids would not "
-            "line up with the geometry. This is a library bug, not a setup "
-            "problem."
-        )
-    return board
-
-
-def board_image(spec, dpi=DEFAULT_DPI, margin=DEFAULT_MARGIN, caption=True):
-    """Render the board for printing. Reports `(image, dpi)`.
-
-    The squares come out `spec.square_length` across when the result is printed
-    at the dpi reported back, which is the only reason to care about dpi here.
-    That is not quite the `dpi` asked for: a square has to be a whole number of
-    pixels, so the resolution is nudged to the nearest one that makes it so and
-    the exact physical size is preserved instead. Printing at the reported dpi
-    is what `write_board_png` and `write_board_pdf` arrange, so nothing has to
-    be done about it.
-
-    Rounding the square rather than the whole board is what keeps every square
-    identical -- and OpenCV lays the marker bits out inside each square with
-    integer pixel arithmetic, so a square that is a fractional number of pixels
-    across can overflow its cell and abort the render outright.
-
-    With `caption`, the spec is drawn in the bottom margin, so the physical
-    board says what it is. That line is what lets a TA holding the board tell
-    whether it is the board `run` is being told about -- and the sizes are
-    there to be checked against a caliper, because a board scaled by the print
-    dialog is the one error that leaves no trace in the residuals.
-    """
-    square_px = max(1, int(round(spec.square_length * dpi / 0.0254)))
-    dpi = square_px / spec.square_length * 0.0254
-    pixels_per_metre = dpi / 0.0254
-
-    width = spec.squares_x * square_px
-    height = spec.squares_y * square_px
-    # marginSize=0 because the margin is added below, where it is in
-    # millimetres rather than whatever fraction of the image OpenCV picks.
-    squares = charuco_board(spec).generateImage(
-        (width, height), marginSize=0, borderBits=1
-    )
-
-    pad = int(round(margin / 1000.0 * pixels_per_metre))
-    band = 0
-    text = spec.describe()
-    scale = thickness = baseline = 0
-    if caption:
-        # Aim for roughly 4 mm of cap height, then shrink if the line would run
-        # off the sheet. The caption is allowed the full width including the
-        # margins, because on a small board it would otherwise shrink to
-        # something a caliper-wielding TA cannot read.
-        room = width + 2 * pad
-        scale = max(0.3, 4.0 / 1000.0 * pixels_per_metre / 22.0)
-        thickness = max(1, int(round(scale * 2)))
-        (text_width, text_height), baseline = cv2.getTextSize(
-            text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
-        )
-        if text_width > room:
-            scale *= room / text_width
-            thickness = max(1, int(round(scale * 2)))
-            (text_width, text_height), baseline = cv2.getTextSize(
-                text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness
-            )
-        band = text_height + baseline + pad
-
-    canvas = np.full((height + 2 * pad + band, width + 2 * pad), 255, dtype=np.uint8)
-    canvas[pad:pad + height, pad:pad + width] = squares
-    if caption:
-        cv2.putText(
-            canvas,
-            text,
-            (max(0, (canvas.shape[1] - text_width) // 2), height + 2 * pad + text_height),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            scale,
-            0,
-            thickness,
-            cv2.LINE_AA,
-        )
-    return canvas, dpi
-
-
-PAPER_SIZES = (
-    # name, width, height, in mm. Tried in this order; the first the board fits
-    # on is the page the PDF gets, so the page matches the paper actually in the
-    # tray and nothing in the print dialog is tempted to rescale it.
-    ("Letter", 215.9, 279.4),
-    ("A4", 210.0, 297.0),
-    ("Legal", 215.9, 355.6),
-    ("Tabloid", 279.4, 431.8),
-    ("A3", 297.0, 420.0),
-)
-
-
-def write_board_png(path, image, dpi):
-    """Write the board as a PNG that says how big it is.
-
-    OpenCV writes no `pHYs` chunk, and a PNG without one has no physical size:
-    every viewer falls back to 72 dpi, so a 600 dpi board claims to be eight
-    times its real width and "100%" prints it eight times too big. The chunk is
-    nine bytes and goes straight after IHDR, so it is added here rather than
-    taking on an imaging dependency for it.
-    """
-    ok, buffer = cv2.imencode(".png", image)
-    if not ok:
-        raise HandEyeError(f"could not encode {path}")
-    data = buffer.tobytes()
-
-    # 8-byte signature, then IHDR: 4 length + 4 type + 13 data + 4 crc.
-    end_of_ihdr = 8 + 25
-    if data[8 + 4:8 + 8] != b"IHDR":
-        raise HandEyeError("encoded PNG does not start with IHDR, which is a bug")
-    pixels_per_metre = int(round(dpi / 0.0254))
-    body = b"pHYs" + struct.pack(">IIB", pixels_per_metre, pixels_per_metre, 1)
-    chunk = struct.pack(">I", len(body) - 4) + body + struct.pack(">I", zlib.crc32(body))
-
-    path.write_bytes(data[:end_of_ihdr] + chunk + data[end_of_ihdr:])
-
-
-def write_board_pdf(path, image, dpi):
-    """Write the board as a PDF page at exact scale, and report the page size.
-
-    This is the format to print. A PDF carries the board's size in points
-    rather than in metadata a viewer may ignore, and the page is a standard
-    paper size with the board centred on it, so "actual size" and "100%" and
-    "no scaling" all mean the same thing and "fit to page" has nothing to
-    shrink. Returns the paper name, or None if the board needed a page of its
-    own because it fits no standard size.
-
-    Written by hand because the alternative is a PDF library in the
-    dependencies of a robot arm package. The whole file is one grayscale image
-    XObject on one page, which is about as small as a PDF gets.
-    """
-    height, width = image.shape[:2]
-    board_mm = (width / dpi * 25.4, height / dpi * 25.4)
-
-    paper = next(
-        (name for name, w, h in PAPER_SIZES if board_mm[0] <= w and board_mm[1] <= h),
-        None,
-    )
-    if paper is None:
-        page_mm = board_mm
-    else:
-        page_mm = next((w, h) for name, w, h in PAPER_SIZES if name == paper)
-
-    # PDF user space is 1/72 inch, which is what "72 dpi" has always meant.
-    to_points = 72.0 / 25.4
-    page = (page_mm[0] * to_points, page_mm[1] * to_points)
-    drawn = (board_mm[0] * to_points, board_mm[1] * to_points)
-    origin = ((page[0] - drawn[0]) / 2.0, (page[1] - drawn[1]) / 2.0)
-
-    samples = zlib.compress(np.ascontiguousarray(image).tobytes(), 9)
-    content = (
-        f"q {drawn[0]:.4f} 0 0 {drawn[1]:.4f} {origin[0]:.4f} {origin[1]:.4f} cm "
-        "/Im0 Do Q\n"
-    ).encode("ascii")
-
-    objects = [
-        b"<< /Type /Catalog /Pages 2 0 R >>",
-        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        (
-            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {page[0]:.4f} {page[1]:.4f}] "
-            "/Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>"
-        ).encode("ascii"),
-        b"<< /Length %d >>\nstream\n" % len(content) + content + b"endstream",
-        (
-            f"<< /Type /XObject /Subtype /Image /Width {width} /Height {height} "
-            "/ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode "
-            f"/Length {len(samples)} >>\nstream\n"
-        ).encode("ascii") + samples + b"\nendstream",
-    ]
-
-    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
-    offsets = []
-    for number, body in enumerate(objects, start=1):
-        offsets.append(len(out))
-        out += b"%d 0 obj\n" % number + body + b"\nendobj\n"
-
-    start_xref = len(out)
-    out += b"xref\n0 %d\n" % (len(objects) + 1)
-    out += b"0000000000 65535 f \n"
-    for offset in offsets:
-        out += b"%010d 00000 n \n" % offset
-    out += b"trailer\n<< /Size %d /Root 1 0 R >>\n" % (len(objects) + 1)
-    out += b"startxref\n%d\n%%%%EOF\n" % start_xref
-
-    path.write_bytes(bytes(out))
-    return paper
 
 
 class BoardDetector:
@@ -654,13 +411,11 @@ class Preview:
         reason = str(error).strip().splitlines()[-1] if str(error).strip() else error
         print(f"\n  no preview window ({reason}); carrying on without one\n")
 
-    def show(self, image, corners=None, extra=None, predicted=None, note=()):
+    def show(self, image, corners=None, extra=None, note=()):
         """Draw one frame. Returns the key pressed in the window, or -1.
 
-        `corners` are the detections the solver will use, `extra` the ones it
-        cannot (seen in one eye only), and `predicted` where the calibration
-        says the corners should be -- which is the whole of what `verify` has
-        to say, drawn on the thing it is talking about.
+        `corners` are the detections the solver will use, and `extra` the ones
+        it cannot (seen in one eye only).
 
         Everything is drawn *after* the frame is scaled down, so the markers
         and the caption stay the same size on screen whatever
@@ -672,21 +427,14 @@ class Preview:
             return self.key
         canvas = image if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
         canvas = cv2.resize(canvas, None, fx=self.scale, fy=self.scale)
-        for points, colour, radius in (
-            (extra, (0, 180, 255), 3),
-            (predicted, (255, 0, 255), 6),
-            (corners, (0, 255, 0), 3),
-        ):
+        for points, colour in ((extra, (0, 180, 255)), (corners, (0, 255, 0))):
             if points is None:
                 continue
-            # Open circles for the prediction, filled for a measurement: where
-            # the two disagree the pair reads as a target and a miss.
-            thickness = 1 if points is predicted else -1
             for u, v in np.asarray(points, dtype=float).reshape(-1, 2) * self.scale:
                 if not (np.isfinite(u) and np.isfinite(v)):
                     continue
-                cv2.circle(canvas, (int(round(u)), int(round(v))), radius,
-                           colour, thickness, cv2.LINE_AA)
+                cv2.circle(canvas, (int(round(u)), int(round(v))), 3,
+                           colour, -1, cv2.LINE_AA)
         self._caption(canvas, note)
         try:
             cv2.imshow(WINDOW, canvas)
@@ -716,22 +464,6 @@ class Preview:
             cv2.putText(canvas, line, (int(12 * k), index * step),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45 + 0.25 * k,
                         (255, 255, 255), 1, cv2.LINE_AA)
-
-    def hold(self, seconds):
-        """Keep the last frame up, and the window responsive, for a while.
-
-        `waitKey` is the GUI's own event pump, so one call is both the wait and
-        the thing that stops the window going grey. Returns the key pressed.
-        """
-        self.key = -1
-        if not self.enabled:
-            time.sleep(seconds)
-            return self.key
-        try:
-            self.key = self._key(cv2.waitKey(max(1, int(seconds * 1000))))
-        except cv2.error as error:
-            self._give_up(error)
-        return self.key
 
     @property
     def closed(self):
@@ -878,66 +610,6 @@ def _report(T_base_cam, T_flange_board, stats, spread=None):
         )
     else:
         print("  this looks good: the corners fit and no single pose is holding it up.")
-
-
-# ----------------------------------------------------------------------
-# board
-# ----------------------------------------------------------------------
-
-
-def cmd_board(args):
-    spec = _spec_from_args(args)
-    # Not args.dpi: board_image nudges it to whatever keeps a square a whole
-    # number of pixels, and it is the nudged one that makes the squares come
-    # out the size the spec says.
-    image, dpi = board_image(
-        spec, dpi=args.dpi, margin=args.margin, caption=not args.no_caption
-    )
-
-    output = pathlib.Path(args.output)
-    paper = None
-    if output.suffix.lower() == ".pdf":
-        paper = write_board_pdf(output, image, dpi)
-    else:
-        write_board_png(output, image, dpi)
-
-    width = spec.squares_x * spec.square_length * 1000
-    height = spec.squares_y * spec.square_length * 1000
-    sheet = (image.shape[1] / dpi * 25.4, image.shape[0] / dpi * 25.4)
-    print(f"wrote {output}  ({image.shape[1]}x{image.shape[0]} px at {dpi:.0f} dpi)")
-    print(f"  {spec.describe()}")
-    print(f"  board area {width:.1f} x {height:.1f} mm, {spec.n_corners} corners")
-    print(f"  printed size {sheet[0]:.1f} x {sheet[1]:.1f} mm including the margin")
-    if paper is not None:
-        print(f"  on one {paper} page, centred")
-    elif output.suffix.lower() == ".pdf":
-        print(
-            "  on a page of its own: this board fits no standard paper size, so "
-            "the\n  print dialog will offer to scale it. Don't let it — print it "
-            "on larger\n  paper, or use a smaller --square-length."
-        )
-
-    print(
-        "\nPrint it at 100% — 'actual size', not 'fit to page' and not 'shrink to\n"
-        "printable area'. Then measure one square with a caliper and check it "
-        f"against\n{spec.square_length * 1000:.1f} mm.\n"
-        "A board scaled by the print dialog gives a calibration that is wrong "
-        "by that\nsame scale, with residuals that look perfect. The sizes "
-        "printed on the board\nare there so you can check them.\n"
-    )
-    if paper is None and output.suffix.lower() != ".pdf":
-        print(
-            "This is a PNG, which print dialogs scale to the paper by default. "
-            "It now\ncarries its real size, so 100% is the right size — but "
-            f"`-o {output.stem}.pdf` gives\nyou a page that is already the "
-            "right size, which is harder to get wrong.\n"
-        )
-    print(
-        "Mount it flat on the gripper — a board that flexes is a board whose "
-        "corners are\nin the wrong place. It may not move relative to the "
-        "flange after this point."
-    )
-    return 0
 
 
 # ----------------------------------------------------------------------
@@ -1175,7 +847,7 @@ def _promote_command(written, serial):
 
 def cmd_run(args):
     _require_ip(args)
-    spec = _spec_from_args(args)
+    spec = spec_from_args(args)
     detector = BoardDetector(spec)
 
     print(f"board: {spec.describe()}")
@@ -1297,7 +969,7 @@ def _reference_after_run(args):
             "  ! no table tag recorded, so a knocked camera on this bench will not "
             "be noticed\n    or recovered from. If there is a tag and the arm is "
             "in front of it, move the arm\n    and run `register-tag`. If there "
-            "is none, the `tag` command prints one."
+            "is none, `python -m xarm7_lib.fiducials tag`\n    prints one."
         )
     else:
         _report_reference(reference)
@@ -1336,7 +1008,7 @@ def _report_reference(reference):
         print(
             "  ! that is small enough to be unreliable. Move the tag closer to "
             "the camera, prop\n    it up to face the camera rather than lying "
-            "flat, or print a bigger one with\n    `tag --length 70`."
+            "flat, or print a bigger one with\n    `python -m xarm7_lib.fiducials tag --length 70`."
         )
 
 
@@ -1372,10 +1044,6 @@ def _file(handeye, args):
         )
     else:
         print("\nThis account now gets it from `load_handeye()`.")
-    print(
-        "Check it before you walk away:\n"
-        "    python -m xarm7_lib.calibrate_handeye verify"
-    )
     if not args.system and not args.output:
         # The one thing left that this process cannot do itself, since it is not
         # running as the account that owns the installation. Printed last so it
@@ -1392,197 +1060,8 @@ def _file(handeye, args):
 
 
 # ----------------------------------------------------------------------
-# verify
+# register-tag
 # ----------------------------------------------------------------------
-
-
-def cmd_verify(args):
-    _require_ip(args)
-    handeye = (
-        HandEye.load(args.file) if args.file else load_handeye(serial=args.serial)
-    )
-    print(f"{handeye!r}")
-    print(f"  from     {handeye.source}")
-    print(f"  measured {handeye.created} against {handeye.board.describe()}")
-    if handeye.stats:
-        print(f"  fitted   {handeye.stats.get('poses')} poses, "
-              f"{handeye.stats.get('rms_px', float('nan')):.3f} px RMS")
-
-    detector = BoardDetector(handeye.board)
-    kinematics = _Kinematics()
-
-    print("\nconnecting...")
-    # guard=False: this only ever reads the arm's position, so there is nothing
-    # to check, and skipping the collision meshes makes it connect in a second.
-    with _open_arm(args, guard=False) as arm:
-        with _open_camera(args) as camera:
-            if handeye.serial and camera.serial and camera.serial != handeye.serial:
-                raise HandEyeError(
-                    f"this calibration belongs to SN{handeye.serial} but the "
-                    f"attached camera is SN{camera.serial}. They are not "
-                    "interchangeable — the calibration is of one camera on one "
-                    "bench."
-                )
-            if handeye.resolution and handeye.resolution != args.resolution:
-                raise HandEyeError(
-                    f"the calibration was made at {handeye.resolution} and this "
-                    f"is {args.resolution}. The intrinsics differ between "
-                    f"modes, so pass --resolution {handeye.resolution}."
-                )
-
-            print(
-                "\nMove the arm by hand or from another terminal and watch the "
-                "error. These are\nposes the fit never saw, which is the only "
-                "check that catches a calibration that\nis self-consistent and "
-                "wrong. Ctrl-C to stop.\n"
-            )
-            print(
-                f"  {'position':>12}  {'rotation':>9}  {'corners':>7}  "
-                f"{'reprojection':>12}"
-            )
-
-            worst = 0.0
-            preview = Preview(
-                camera.size, enabled=not args.no_window, scale=args.display_scale
-            )
-            try:
-                while True:
-                    measured = arm.joint_values
-                    flange = kinematics.flange_pose(measured)
-                    observation = observe(camera, detector, flange, args.frames)
-                    if observation is None:
-                        _stream(camera, preview, 0.5, note=["board not in view"])
-                        continue
-
-                    seen = fit_board_pose(
-                        observation, handeye.intrinsics, detector.object_points
-                    )
-                    predicted = handeye.board_pose(flange)
-                    position = np.linalg.norm(seen[:3, 3] - predicted[:3, 3])
-                    rotation = np.degrees(
-                        rotation_angle(seen[:3, :3], predicted[:3, :3])
-                    )
-                    errors = reprojection_errors(
-                        handeye.T_base_cam,
-                        handeye.T_flange_board,
-                        [observation],
-                        handeye.intrinsics,
-                        detector.object_points,
-                    )
-                    worst = max(worst, position)
-                    rms = float(np.sqrt(np.mean(errors ** 2)))
-                    print(
-                        f"  {position * 1000:9.1f} mm  {rotation:7.2f}°  "
-                        f"{len(observation):7d}  {rms:9.2f} px"
-                    )
-                    # Magenta is where the calibration says the corners are,
-                    # green where they actually are. Overlapping rings mean it
-                    # is right, and no table of residuals says it as plainly.
-                    live, _ = camera.read_rectified()
-                    in_camera = (
-                        detector.object_points @ predicted[:3, :3].T + predicted[:3, 3]
-                    )
-                    preview.show(
-                        live,
-                        corners=observation.left,
-                        predicted=handeye.intrinsics.project(in_camera, "left"),
-                        note=[
-                            f"{position * 1000:.1f} mm and {rotation:.2f}° off "
-                            "the prediction",
-                            f"{len(observation)} corners, {rms:.2f} px  "
-                            "(magenta: predicted, green: measured)",
-                        ],
-                    )
-                    if preview.hold(args.period) in (ord("q"), 27) or preview.closed:
-                        break
-            except KeyboardInterrupt:
-                print()
-            finally:
-                preview.close()
-                print(f"\n  worst position error seen: {worst * 1000:.1f} mm")
-    return 0
-
-
-# ----------------------------------------------------------------------
-# The table tag
-# ----------------------------------------------------------------------
-
-
-def tag_image(tag_id=TAG_ID, length=TAG_LENGTH, dictionary=TAG_DICTIONARY,
-              dpi=DEFAULT_DPI, margin=DEFAULT_TAG_MARGIN):
-    """Render the tag for printing. Reports `(image, dpi)`, as `board_image` does.
-
-    The margin is part of the tag: the detector needs white around the black
-    square to find it, so it is not to be trimmed off. Six cells across, with
-    the border, and a whole number of pixels per cell so that every edge is sharp.
-    """
-    marker = aruco_dictionary(dictionary)
-    cells = marker.markerSize + 2
-    cell_px = max(1, int(round(length / cells * dpi / 0.0254)))
-    side = cells * cell_px
-    dpi = side / length * 0.0254
-    # Room for the quiet zone and the caption below it, which grows with the tag.
-    pad = max(int(round(margin / 1000.0 * dpi / 0.0254)), int(np.ceil(2.7 * cell_px)))
-
-    canvas = np.full((side + 2 * pad, side + 2 * pad), 255, dtype=np.uint8)
-    canvas[pad:pad + side, pad:pad + side] = cv2.aruco.generateImageMarker(
-        marker, tag_id, side, borderBits=1
-    )
-
-    # In the margin, and clear of the one cell of white the detector needs around
-    # the square. Sized by the stroke it will really be drawn with, which widens
-    # the text, and shrunk until the longer line fits inside the page.
-    lines = [
-        f"id {tag_id}  {dictionary}  {length * 1000:.1f} mm",
-        "FIXED - DO NOT MOVE",
-    ]
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    room = int(0.9 * canvas.shape[1])
-    scale = cv2.getFontScaleFromHeight(font, int(0.16 * pad), 1)
-    while True:
-        thickness = max(1, int(round(scale * 1.5)))
-        sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
-        if max(width for width, _ in sizes) <= room:
-            break
-        scale *= 0.95
-    y = pad + side + cell_px + int(0.2 * pad)
-    for line, (width, height) in zip(lines, sizes):
-        cv2.putText(
-            canvas, line, ((canvas.shape[1] - width) // 2, y),
-            font, scale, 0, thickness, cv2.LINE_AA,
-        )
-        y += int(1.6 * height)
-    return canvas, dpi
-
-
-def cmd_tag(args):
-    length = args.length / 1000.0
-    image, dpi = tag_image(args.id, length, args.dict, args.dpi, args.margin)
-
-    output = pathlib.Path(args.output)
-    if output.suffix.lower() == ".pdf":
-        write_board_pdf(output, image, dpi)
-    else:
-        write_board_png(output, image, dpi)
-
-    print(f"wrote {output}  ({image.shape[1]}x{image.shape[0]} px at {dpi:.0f} dpi)")
-    print(f"  id {args.id}, {args.dict}, black square {args.length:.1f} mm")
-    print(
-        "\nPrint it at 100%, and fix it to the table so that it cannot shift "
-        "or lift:\n"
-        "  - flat, and not on anything that gets moved. If it moves, the camera "
-        "looks like it\n    moved, and the correction is wrong without anything "
-        "saying so.\n"
-        "  - keep the white margin. The detector needs it.\n"
-        "  - as near the middle of where students work as you can without the "
-        "arm covering it.\n    The correction is good near the tag and gets "
-        "worse with distance from it.\n"
-        "  - as face-on to the camera as you can manage. 45 mm suits about 1.25 m; "
-        "beyond that,\n    print it with --length 70.\n"
-        "\nThen record it: `run` does it at the end of a calibration, and "
-        "`register-tag` adds it\nto a calibration already filed."
-    )
-    return 0
 
 
 def cmd_register_tag(args):
@@ -1627,355 +1106,16 @@ def cmd_register_tag(args):
     print(
         "\nThis vouches for the calibration as it stands: from here on, the "
         "camera being where\nit is now is what counts as it not having moved. "
-        "If it may have been knocked since it\nwas calibrated, run `verify` first."
+        "If it may have been knocked since it\nwas calibrated, recalibrate with "
+        "`run` instead."
     )
     handeye.tag = reference
     return _file(handeye, args)
 
 
-def cmd_check(args):
-    """Say whether the camera has moved. Changes nothing."""
-    with _open_tag_camera(args) as camera:
-        serial = camera.serial or args.serial
-        if serial is None:
-            raise HandEyeError(
-                "the camera's serial number could not be read. Pass --serial."
-            )
-        handeye = find_filed(serial)
-        reference = handeye.tag
-        print(f"{handeye!r}")
-        print(f"  from {handeye.source}, measured {handeye.created}")
-        if reference is None:
-            raise HandEyeError(
-                "this calibration has no table tag recorded, so there is nothing "
-                "to compare against. `register-tag` adds one."
-            )
-        if reference.resolution != camera.resolution:
-            raise HandEyeError(
-                f"the tag was recorded at {reference.resolution} and this library "
-                f"now reads it at {camera.resolution}. Run `register-tag` again."
-            )
-        sighting = capture_tag(camera, reference.tag_id, reference.dictionary)
-    if sighting is None:
-        print(f"\ntag {reference.tag_id} is not in view: nothing can be said.")
-        return 1
-
-    shift = fit_camera_shift(reference, *sighting)
-    print(f"\n  compared with the reference from {reference.created}")
-    print(f"    tag moved      {shift.bearing:.3f} deg in the picture")
-    print(f"    rotated        {shift.rotation:.3f} deg")
-    print(f"    range changed  {shift.range_change * 1000:+.1f} mm")
-    print(f"    corners fit    {shift.rms_px:.2f} px")
-    print(
-        f"    a correction would be good to about {shift.error_at_tag * 1000:.1f} mm "
-        f"at the tag and\n    {shift.error_away * 1000:.1f} mm "
-        f"{ERROR_RADIUS:.1f} m from it"
-    )
-    if shift.too_far:
-        print("\n  MOVED TOO FAR TO CORRECT: load_handeye() will refuse. Recalibrate.")
-    elif shift.moved:
-        print("\n  MOVED: load_handeye() will correct for it and warn. Recalibrate.")
-    else:
-        print("\n  not moved")
-    return 1 if shift.moved or shift.too_far else 0
-
-
-# ----------------------------------------------------------------------
-# self-test
-# ----------------------------------------------------------------------
-
-
-def _look_at(position, target):
-    """A camera pose that puts `target` in the middle of the view.
-
-    The camera frame is x right, y down, z forward, so this builds the rotation
-    from the viewing direction and whichever way is down in the base frame.
-    """
-    position = np.asarray(position, dtype=float)
-    forward = np.asarray(target, dtype=float) - position
-    forward /= np.linalg.norm(forward)
-    down = np.array([0.0, 0.0, -1.0])
-    down = down - np.dot(down, forward) * forward
-    down /= np.linalg.norm(down)
-    return pose(np.stack([np.cross(down, forward), down, forward], axis=1), position)
-
-
-def _self_test_recovery(rng):
-    """A knocked camera with a known answer. Returns a list of what went wrong.
-
-    Corrects a calibration for a bump and checks that a point away from the tag
-    still lands where it really is, so a shift composed the wrong way round, or
-    applied in the wrong frame, misses by centimetres.
-    """
-    intrinsics = Intrinsics(fx=1400.0, fy=1400.0, cx=1104.0, cy=621.0, baseline=0.12)
-    half = TAG_LENGTH / 2
-    # Tag frame to camera: 1.25 m out and leaning away by about 40 degrees.
-    T_cam_tag = pose([np.radians(130.0), 0.0, 0.0], [0.05, -0.08, 1.25])
-    corners = np.array(
-        [[-half, half, 0], [half, half, 0], [half, -half, 0], [-half, -half, 0.0]]
-    )
-    corners = corners @ T_cam_tag[:3, :3].T + T_cam_tag[:3, 3]
-
-    def noisy(points, eye):
-        return intrinsics.project(points, eye) + rng.normal(0, 0.03, (4, 2))
-
-    reference = TagReference(
-        tag_id=TAG_ID,
-        dictionary=TAG_DICTIONARY,
-        length=TAG_LENGTH,
-        resolution=TAG_RESOLUTION,
-        intrinsics=intrinsics,
-        left=noisy(corners, "left").tolist(),
-        right=noisy(corners, "right").tolist(),
-        created="self-test",
-    )
-    T_base_cam = _look_at([1.0, -0.7, 0.8], [0.4, 0.0, 0.0])
-    handeye = HandEye(
-        T_base_cam, np.eye(4), intrinsics, DEFAULT_BOARD, serial="selftest",
-        tag=reference,
-    )
-
-    failures = []
-    still = fit_camera_shift(
-        reference, noisy(corners, "left"), noisy(corners, "right")
-    )
-    if still.moved:
-        failures.append(f"recovery saw a still camera move {still.describe()}")
-
-    # The camera turned 2 degrees and slid 3 mm.
-    bump = pose([0.02, -0.025, 0.01], [0.002, 0.001, -0.002])
-    now = (corners - bump[:3, 3]) @ bump[:3, :3]
-    shift = fit_camera_shift(reference, noisy(now, "left"), noisy(now, "right"))
-    if not shift.moved:
-        failures.append(f"recovery missed a bump, measuring only {shift.describe()}")
-
-    near = T_cam_tag[:3, 3] + np.array([0.15, 0.1, 0.0])
-    seen_now = (near - bump[:3, 3]) @ bump[:3, :3]
-    truth = T_base_cam[:3, :3] @ near + T_base_cam[:3, 3]
-    corrected = handeye.corrected(shift).points_to_base(seen_now)[0]
-    uncorrected = handeye.points_to_base(seen_now)[0]
-    error = 1000 * np.linalg.norm(corrected - truth)
-    before = 1000 * np.linalg.norm(uncorrected - truth)
-    print(
-        f"\nrecovery: a 2 deg bump is {before:.1f} mm wrong uncorrected, "
-        f"{error:.1f} mm corrected"
-    )
-    if error > 3.0:
-        failures.append(f"recovery is {error:.1f} mm off after correcting a bump")
-
-    back = HandEye.from_dict(json.loads(json.dumps(handeye.corrected(shift).to_dict())))
-    if back.shift is not None or np.abs(back.T_base_cam - T_base_cam).max() > 1e-9:
-        failures.append("saving a corrected calibration did not save the filed one")
-    return failures
-
-
-def cmd_self_test(args):
-    """Run the whole solver against a rig whose answer is known.
-
-    No camera and no arm: real forward kinematics, real board geometry, a
-    camera placed by hand, and corner noise. The one check that can be run
-    anywhere, and it covers the part most likely to be silently wrong -- the
-    conventions. Every transform here is composed in the same direction the
-    real routine composes it, so a flipped inverse fails this.
-
-    The thresholds are a regression check on the method, not a target. Over
-    twelve seeds at the defaults the camera comes back within 0.01-0.07 degrees
-    and 0.21-0.96 mm of truth, and the board within 0.08-0.24 degrees and
-    0.06-0.33 mm, so they are set at about twice the worst of that: the draw
-    alone should never fail this, while a mistake in the geometry misses by
-    degrees and centimetres rather than by tenths.
-
-    How much headroom that needs depends on the board. Orientation is recovered
-    from how the corners spread across the image, so a board a third the size
-    gives up roughly three times the angular precision -- the 30 mm board these
-    thresholds were first set against held the board's rotation under 0.07
-    degrees, where the 10 mm default reaches 0.24. Shrinking the default board
-    again means measuring the range again rather than assuming these still fit.
-    """
-    rng = np.random.default_rng(args.seed)
-    spec = _spec_from_args(args)
-    detector = BoardDetector(spec)
-    # Mounted by its middle, as a board on a gripper would be, so the test does
-    # not accidentally depend on the board frame sitting at a corner.
-    object_points = detector.object_points - detector.object_points.mean(axis=0)
-
-    kinematics = _Kinematics()
-    intrinsics = Intrinsics(fx=700.0, fy=700.0, cx=640.0, cy=360.0, baseline=0.12)
-
-    seed = np.array([0.0, -0.35, 0.0, 0.75, 0.0, 0.55, 0.0])
-    T_base_cam = _look_at([1.0, -0.7, 0.8], kinematics.flange_pose(seed)[:3, 3])
-    T_flange_board = pose([0.02, 0.03, 0.4], [0.0, 0.0, 0.085])
-
-    print(f"board: {spec.describe()}  ({spec.n_corners} corners)")
-    print(f"noise: {args.noise} px per corner per eye")
-    print(f"camera truth: {np.round(T_base_cam[:3, 3], 4)} m\n")
-
-    poses = generate_poses(seed, args.poses, rng=rng)
-    observations = []
-    for q in poses:
-        flange = kinematics.flange_pose(q)
-        T_cam_board = invert(T_base_cam) @ flange @ T_flange_board
-        in_camera = object_points @ T_cam_board[:3, :3].T + T_cam_board[:3, 3]
-        if np.any(in_camera[:, 2] < 0.2):
-            continue  # behind or on top of the camera; not a pose a bench has
-        observations.append(
-            Observation(
-                flange=flange,
-                ids=np.arange(len(object_points)),
-                left=intrinsics.project(in_camera, "left")
-                + rng.normal(0, args.noise, (len(object_points), 2)),
-                right=intrinsics.project(in_camera, "right")
-                + rng.normal(0, args.noise, (len(object_points), 2)),
-            )
-        )
-    print(f"{len(observations)} synthetic poses")
-
-    board_poses = [
-        fit_board_pose(observation, intrinsics, object_points)
-        for observation in observations
-    ]
-    guess_cam, guess_board = solve(
-        [observation.flange for observation in observations], board_poses
-    )
-    fitted_cam, fitted_board, stats = refine(
-        observations, intrinsics, object_points, guess_cam, guess_board
-    )
-    spread, _ = leave_one_out(
-        observations, intrinsics, object_points, fitted_cam, fitted_board
-    )
-
-    def compare(name, fitted, truth):
-        rotation = np.degrees(rotation_angle(fitted[:3, :3], truth[:3, :3]))
-        translation = 1000 * np.linalg.norm(fitted[:3, 3] - truth[:3, 3])
-        print(f"  {name:<24} {rotation:8.4f}°  {translation:8.3f} mm")
-        return rotation, translation
-
-    print(f"\n  {'':<24} {'rotation':>8}   {'position':>8}")
-    compare("closed form, camera", guess_cam, T_base_cam)
-    camera_rotation, camera_translation = compare("refined, camera", fitted_cam, T_base_cam)
-    board_rotation, board_translation = compare("refined, board", fitted_board, T_flange_board)
-
-    _report(fitted_cam, fitted_board, stats, spread)
-
-    # The storage round trip, in the same breath: a calibration that solves and
-    # then cannot be read back is no use.
-    handeye = HandEye(
-        fitted_cam, fitted_board, intrinsics, spec, serial="selftest", stats=stats
-    )
-    import tempfile
-
-    path = pathlib.Path(tempfile.mkdtemp()) / filename("selftest")
-    reloaded = HandEye.load(handeye.save(path))
-    round_trip = np.abs(reloaded.T_base_cam - fitted_cam).max()
-    probe = np.array([[0.1, 0.2, 1.0]])
-    reversed_probe = np.abs(
-        reloaded.points_to_camera(reloaded.points_to_base(probe)) - probe
-    ).max()
-
-    failures = _self_test_recovery(rng)
-    if camera_rotation > args.max_rotation:
-        failures.append(
-            f"camera rotation off by {camera_rotation:.4f}°, allowed {args.max_rotation}"
-        )
-    if camera_translation > args.max_translation:
-        failures.append(
-            f"camera position off by {camera_translation:.3f} mm, allowed "
-            f"{args.max_translation}"
-        )
-    if board_rotation > args.max_rotation or board_translation > args.max_translation:
-        failures.append(
-            f"board pose off by {board_rotation:.4f}° / {board_translation:.3f} mm"
-        )
-    if round_trip > 1e-9:
-        failures.append(f"storage round trip changed the transform by {round_trip}")
-    if reversed_probe > 1e-9:
-        failures.append(f"points_to_base/points_to_camera do not invert: {reversed_probe}")
-
-    if failures:
-        print("\nFAILED")
-        for failure in failures:
-            print(f"  - {failure}")
-        return 1
-    print(
-        f"\nPASSED  camera recovered to {camera_rotation:.4f}° and "
-        f"{camera_translation:.3f} mm; storage round trips exactly."
-    )
-    return 0
-
-
 # ----------------------------------------------------------------------
 # Command line
 # ----------------------------------------------------------------------
-
-
-def _squares(value):
-    """`5x7`, as the board's square counts."""
-    try:
-        x, y = value.lower().split("x")
-        return int(x), int(y)
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            f"expected something like 5x7, got {value!r}"
-        ) from None
-
-
-def _spec_from_args(args):
-    square_length = args.square_length / 1000.0
-    # Scaled off the square unless asked for outright, so that changing
-    # --square-length alone gives a board in proportion rather than one whose
-    # markers overflow their squares.
-    marker_length = (
-        square_length * MARKER_RATIO
-        if args.marker_length is None
-        else args.marker_length / 1000.0
-    )
-    return BoardSpec(
-        squares_x=args.squares[0],
-        squares_y=args.squares[1],
-        square_length=square_length,
-        marker_length=marker_length,
-        dictionary=args.dict,
-        legacy=args.legacy,
-    )
-
-
-def _add_board_arguments(parser, default=DEFAULT_BOARD):
-    group = parser.add_argument_group("the board on the gripper")
-    group.add_argument(
-        "--squares",
-        type=_squares,
-        default=(default.squares_x, default.squares_y),
-        metavar="NxM",
-        help=f"squares across and down (default {default.squares_x}x{default.squares_y})",
-    )
-    group.add_argument(
-        "--square-length",
-        type=float,
-        default=default.square_length * 1000,
-        metavar="MM",
-        help=f"square side in mm (default {default.square_length * 1000:g})",
-    )
-    group.add_argument(
-        "--marker-length",
-        type=float,
-        default=None,
-        metavar="MM",
-        help=(
-            "marker side in mm, smaller than the square. Defaults to "
-            f"{MARKER_RATIO:g} of --square-length, which is "
-            f"{default.marker_length * 1000:g} mm for the default board"
-        ),
-    )
-    group.add_argument(
-        "--dict",
-        default=default.dictionary,
-        help=f"ArUco dictionary (default {default.dictionary})",
-    )
-    group.add_argument(
-        "--legacy",
-        action="store_true",
-        help="the board was generated by OpenCV before 4.6, whose marker grid is offset",
-    )
 
 
 def _add_hardware_arguments(parser):
@@ -2025,25 +1165,6 @@ def _add_destination_arguments(parser):
     return where
 
 
-def _add_tag_identity_arguments(parser):
-    group = parser.add_argument_group("the table tag")
-    group.add_argument(
-        "--id", type=int, default=TAG_ID, help=f"marker id (default {TAG_ID})"
-    )
-    group.add_argument(
-        "--length",
-        type=float,
-        default=TAG_LENGTH * 1000,
-        metavar="MM",
-        help=f"side of the black square (default {TAG_LENGTH * 1000:g})",
-    )
-    group.add_argument(
-        "--dict",
-        default=TAG_DICTIONARY,
-        help=f"ArUco dictionary (default {TAG_DICTIONARY})",
-    )
-
-
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="python -m xarm7_lib.calibrate_handeye",
@@ -2051,41 +1172,6 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     commands = parser.add_subparsers(dest="command", required=True)
-
-    board = commands.add_parser(
-        "board",
-        help="write the board to print and stick on the gripper",
-        description=(
-            "Render the ChArUco board at exact scale, with its own spec printed "
-            "on it. Print at 100% and caliper a square before trusting it."
-        ),
-    )
-    _add_board_arguments(board)
-    board.add_argument(
-        "-o",
-        "--output",
-        default="charuco_board.pdf",
-        help=(
-            "where to write it. A .pdf is a page at exact scale, which is what "
-            "to print; any other extension writes an image instead"
-        ),
-    )
-    board.add_argument(
-        "--dpi", type=int, default=DEFAULT_DPI, help=f"print resolution (default {DEFAULT_DPI})"
-    )
-    board.add_argument(
-        "--margin",
-        type=float,
-        default=DEFAULT_MARGIN,
-        metavar="MM",
-        help=f"white border in mm (default {DEFAULT_MARGIN:.0f})",
-    )
-    board.add_argument(
-        "--no-caption",
-        action="store_true",
-        help="leave the spec off the printout (don't: it is how you check the board)",
-    )
-    board.set_defaults(handler=cmd_board)
 
     run = commands.add_parser(
         "run",
@@ -2095,7 +1181,7 @@ def build_parser():
             "then run this. The sweep starts from wherever the arm already is."
         ),
     )
-    _add_board_arguments(run)
+    add_board_arguments(run)
     _add_hardware_arguments(run)
     sweep = run.add_argument_group("the sweep")
     sweep.add_argument(
@@ -2155,43 +1241,6 @@ def build_parser():
     where.add_argument("--station", help="a label for this bench, stored with the result")
     run.set_defaults(handler=cmd_run)
 
-    verify = commands.add_parser(
-        "verify",
-        help="check a filed calibration against what the camera sees now",
-        description=(
-            "Compare the board pose the camera measures against the one "
-            "forward kinematics predicts, live, at whatever poses you like."
-        ),
-    )
-    _add_hardware_arguments(verify)
-    verify.add_argument("--file", help="check this file instead of the filed one")
-    verify.add_argument(
-        "--period", type=float, default=0.5, help="seconds between readings"
-    )
-    verify.set_defaults(handler=cmd_verify)
-
-    tag = commands.add_parser(
-        "tag",
-        help="write the tag to print and fix to the table",
-        description=(
-            "Render the table tag at exact scale. With it recorded, load_handeye() "
-            "notices a knocked camera, corrects for it, and warns."
-        ),
-    )
-    _add_tag_identity_arguments(tag)
-    tag.add_argument(
-        "-o", "--output", default="reference_tag.pdf",
-        help="where to write it. A .pdf is a page at exact scale, which is what to print",
-    )
-    tag.add_argument(
-        "--dpi", type=int, default=DEFAULT_DPI, help=f"print resolution (default {DEFAULT_DPI})"
-    )
-    tag.add_argument(
-        "--margin", type=float, default=DEFAULT_TAG_MARGIN, metavar="MM",
-        help=f"white border in mm, which the detector needs (default {DEFAULT_TAG_MARGIN:.0f})",
-    )
-    tag.set_defaults(handler=cmd_tag)
-
     register = commands.add_parser(
         "register-tag",
         help="record the table tag for a calibration already filed",
@@ -2200,7 +1249,7 @@ def build_parser():
             "tag existed, or one whose tag has been replaced."
         ),
     )
-    _add_tag_identity_arguments(register)
+    add_tag_identity_arguments(register)
     register.add_argument("--serial", help="which camera, if several are attached")
     register.add_argument(
         "--force",
@@ -2209,37 +1258,6 @@ def build_parser():
     )
     _add_destination_arguments(register)
     register.set_defaults(handler=cmd_register_tag)
-
-    check = commands.add_parser(
-        "check",
-        help="say whether the camera has moved since the tag was recorded",
-        description="Compare the table tag with its reference. Writes nothing.",
-    )
-    check.add_argument("--serial", help="which camera, if several are attached")
-    check.set_defaults(handler=cmd_check)
-
-    self_test = commands.add_parser(
-        "self-test",
-        help="run the solver against a known answer; no camera, no arm",
-        description=(
-            "Synthetic rig with real kinematics and real board geometry. Checks "
-            "the solver, the conventions and the storage round trip."
-        ),
-    )
-    _add_board_arguments(self_test)
-    self_test.add_argument("--poses", type=int, default=16)
-    self_test.add_argument(
-        "--noise", type=float, default=0.3, metavar="PX", help="corner noise, px"
-    )
-    self_test.add_argument("--seed", type=int, default=7)
-    # Roughly twice the worst seen over ten seeds at the defaults (0.044 deg,
-    # 0.75 mm) -- see SELF_TEST_TOLERANCE. Loose enough not to be a coin flip
-    # on the draw, tight enough that a broken convention cannot pass.
-    # Twice the worst seen over twelve seeds at the default board; see
-    # cmd_self_test's docstring for why this tracks the board's size.
-    self_test.add_argument("--max-rotation", type=float, default=0.50, metavar="DEG")
-    self_test.add_argument("--max-translation", type=float, default=2.0, metavar="MM")
-    self_test.set_defaults(handler=cmd_self_test)
 
     return parser
 

@@ -293,7 +293,7 @@ camera is, and where the board ended up on the flange.
 **1. Print the board.**
 
 ```bash
-python -m xarm7_lib.calibrate_handeye board
+python -m xarm7_lib.fiducials board
 ```
 
 That writes `charuco_board.pdf`: the board at exact scale, centred on a sheet
@@ -387,20 +387,9 @@ anywhere. Leaving it under `~/.config` is also how a TA tries a candidate
 without disturbing the class's copy: `$XARM7_HANDEYE`, then `~/.config`, then
 the installation, first hit winning.
 
-**5. Check it.**
-
-```bash
-python -m xarm7_lib.calibrate_handeye verify
-```
-
-Compares the board pose the camera measures against the one forward kinematics
-predicts, live, while you move the arm by hand. The window draws both: magenta
-rings where the calibration says the corners are, green dots where they
-actually are. Rings sitting on dots is a good calibration, and the gap between
-them is the error the table is reporting. Do this at poses the fit never
-saw — it is the only check that catches a calibration that is self-consistent
-and wrong. A tape measure to the camera is worth one more minute: the reported
-position should be where the camera physically is, to within a few centimetres.
+**5. Check it.** A tape measure to the camera is worth one more minute: the
+reported position should be where the camera physically is, to within a few
+centimetres.
 
 ## If the camera gets knocked
 
@@ -433,7 +422,7 @@ the camera. Further than that, make it bigger with `--length 70`, and pass the
 same size to `register-tag --length 70` or `run --tag-length 70`.
 
 ```bash
-python -m xarm7_lib.calibrate_handeye tag
+python -m xarm7_lib.fiducials tag
 ```
 
 Print `reference_tag.pdf` at 100% and fix it to the table:
@@ -453,17 +442,9 @@ Print `reference_tag.pdf` at 100% and fix it to the table:
 python -m xarm7_lib.calibrate_handeye register-tag
 ```
 
-Recording it vouches for the calibration as it stands, so run `verify` first if
-the camera may have been knocked since it was calibrated. Like `run`, this files
+Recording it vouches for the calibration as it stands, so recalibrate with `run`
+instead if the camera may have been knocked since it was calibrated. Like `run`, this files
 under `~/.config` and prints the `sudo` line that moves it into the installation.
-
-**Checking on it.**
-
-```bash
-python -m xarm7_lib.calibrate_handeye check
-```
-
-Prints how far the camera has moved, without changing anything.
 
 **How it behaves.**
 
@@ -505,8 +486,8 @@ a metre from the tag is:
 Uncorrected, the same bumps are 16-112 mm out. These are renders, not a real ZED,
 so treat them as a best case. The errors quoted in the warning are the fit's own
 estimate and run low on a small tag or a poor image, which is why it says a few
-times that. The thresholds were set on renders too: run `check` a few times on a
-bench as the camera warms up, and if a camera nobody touched reports `MOVED`,
+times that. The thresholds were set on renders too: call `load_handeye()` a few times on a
+bench as the camera warms up, and if a camera nobody touched warns that it moved,
 raise `MOVED_BEARING` and `MOVED_RANGE` in `handeye.py`.
 
 ## What goes wrong quietly
@@ -523,16 +504,6 @@ Three things, none of which announces itself:
   differing only in position leave the camera's orientation unconstrained. The
   generated sweep turns each wrist joint in turn for this reason, and the
   leave-one-out number is what exposes it.
-
-The solver itself can be checked without a camera or an arm:
-
-```bash
-python -m xarm7_lib.calibrate_handeye self-test
-```
-
-A synthetic bench with a known answer, real kinematics and real board geometry.
-It recovers the camera to about 0.03° and 0.5 mm, and fails loudly if any
-transform is composed the wrong way round.
 
 # The picture
 

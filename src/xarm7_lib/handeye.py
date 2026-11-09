@@ -304,7 +304,7 @@ class BoardSpec:
         This reproduces `cv2.aruco.CharucoBoard.getChessboardCorners()` --
         origin at the board's corner, x fastest, z zero -- deliberately rather
         than calling it, so that reading a calibration back needs no OpenCV.
-        `calibrate_handeye.py` checks the two against each other.
+        `fiducials.charuco_board` checks the two against each other.
         """
         i, j = np.meshgrid(
             np.arange(1, self.squares_x), np.arange(1, self.squares_y), indexing="xy"
@@ -1007,8 +1007,7 @@ class HandEye:
     def board_pose(self, flange_pose):
         """Where the board should be in the camera frame at a given flange pose.
 
-        `X^-1 B Y` -- the prediction that `calibrate_handeye.py verify`
-        compares against what the camera actually sees.
+        `X^-1 B Y`, to compare against what the camera actually sees.
         """
         return self.T_cam_base @ _as_pose(flange_pose, "flange pose") @ self.T_flange_board
 
@@ -1277,9 +1276,9 @@ def load_handeye(serial=None):
     `calibrate_handeye run` writes by default, before a `sudo mv` promotes it
     into the installation.
 
-    If the bench has a table tag recorded (`calibrate_handeye tag`), a call with
-    no arguments also opens the camera for about a second and checks it has not
-    moved. If it has, this returns a corrected calibration and prints a warning
+    If the bench has a table tag recorded (`calibrate_handeye register-tag`),
+    a call with no arguments also opens the camera for about a second and checks
+    it has not moved. If it has, this returns a corrected calibration and prints a warning
     for a TA. So call it before opening the camera yourself: only one thing can
     have the camera open at a time. A call naming a `serial`, or one using
     `$XARM7_HANDEYE`, never opens the camera. It uses the last correction
