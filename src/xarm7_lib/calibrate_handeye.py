@@ -740,6 +740,8 @@ def _capture_automatic(arm, camera, detector, kinematics, args, preview):
                 camera, detector, kinematics.flange_pose(measured), args.frames,
                 preview=preview, note=[label],
             )
+            _debug_pose(index, arm, camera, detector, kinematics, q, measured,
+                        observation)  # DEBUG (temporary)
             if observation is not None:
                 print(f"      {len(observation)} corners")
                 observations.append(observation)
@@ -827,6 +829,8 @@ def _capture_manual(arm, camera, detector, kinematics, args, preview):
                 camera, detector, kinematics.flange_pose(measured), args.frames,
                 preview=preview, note=[f"pose {index}"],
             )
+            _debug_pose(index, arm, camera, detector, kinematics, None, measured,
+                        observation)  # DEBUG (temporary)
             if observation is not None:
                 print(f"      {len(observation)} corners")
                 observations.append(observation)
@@ -873,6 +877,207 @@ def _promote_command(written, serial):
     )
 
 
+# ----------------------------------------------------------------------
+# DEBUG (temporary): records everything `run` sees, to chase the
+# "points are at or behind the camera plane" failure. Remove once fixed.
+# ----------------------------------------------------------------------
+
+
+_DEBUG = None
+
+
+class _DebugLog:
+    """Writes `handeye_debug/<timestamp>/` in the working directory.
+
+    meta.json        camera calibration, rectification, intrinsics, arm offsets
+    pose_NN.npz      joints, FK flange, controller TCP, corners, stereo board fit
+    pose_NN_*.png    rectified left/right of one frame grabbed right after observing
+    pose_NN_raw_*.jpg  the same frame unrectified
+    solve.npz        board poses, flange poses, closed-form guess, per-pose checks
+    traceback.txt    if solving failed
+    """
+
+    def __init__(self, root="handeye_debug"):
+        self.dir = pathlib.Path(root) / time.strftime("%Y%m%d-%H%M%S")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        print(f"  DEBUG: recording to {self.dir.resolve()}")
+
+    def _json(self, name, data):
+        import json
+
+        (self.dir / name).write_text(json.dumps(data, indent=2, default=_debug_plain))
+
+    def meta(self, args, spec, arm, camera, intrinsics):
+        calibration = camera.calibration
+        R1, R2, P1, P2, Q = calibration.rectify()
+        try:
+            profile = camera._session.profile()
+        except Exception as error:  # noqa: BLE001 -- debug only
+            profile = repr(error)
+        self._json("meta.json", {
+            "args": vars(args),
+            "board": spec.to_dict() if hasattr(spec, "to_dict") else repr(spec),
+            "object_points": spec.object_points(),
+            "camera": {
+                "serial": camera.serial,
+                "resolution": camera.resolution,
+                "size": camera.size,
+                "calibration_image_size": calibration.image_size,
+                "fisheye": calibration.fisheye,
+                "baseline": calibration.baseline,
+                "K1": calibration.K1, "D1": calibration.D1,
+                "K2": calibration.K2, "D2": calibration.D2,
+                "R1": R1, "R2": R2, "P1": P1, "P2": P2, "Q": Q,
+                "profile": profile,
+            },
+            "intrinsics": intrinsics.to_dict(),
+            "arm": {
+                "joint_values": arm.joint_values,
+                "position": arm.arm.position,
+                "tcp_offset": arm.arm.tcp_offset,
+                "world_offset": arm.arm.world_offset,
+            },
+        })
+
+    def pose(self, index, arm, camera, detector, intrinsics, kinematics,
+             commanded, measured, observation):
+        flange = kinematics.flange_pose(measured)
+        controller = np.asarray(arm.arm.position, dtype=float)
+        offset = tool_offset(arm)
+        tool_model = flange[:3, 3] + flange[:3, :3] @ offset
+        fk_error = float(np.linalg.norm(controller[:3] / 1000.0 - tool_model))
+
+        raw_left, raw_right = camera.read()
+        rect_left, rect_right = camera.calibration.rectify_images(raw_left, raw_right)
+        tag = f"pose_{index:02d}"
+        cv2.imwrite(str(self.dir / f"{tag}_left.png"), rect_left)
+        cv2.imwrite(str(self.dir / f"{tag}_right.png"), rect_right)
+        cv2.imwrite(str(self.dir / f"{tag}_raw_left.jpg"), raw_left,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+        cv2.imwrite(str(self.dir / f"{tag}_raw_right.jpg"), raw_right,
+                    [cv2.IMWRITE_JPEG_QUALITY, 95])
+
+        record = dict(
+            commanded=np.asarray(commanded if commanded is not None else measured, float),
+            measured=np.asarray(measured, float),
+            flange=flange,
+            controller_position=controller,
+            tcp_offset=offset,
+            fk_error_m=fk_error,
+        )
+        line = f"      DEBUG fk-vs-controller {fk_error * 1000:.1f} mm"
+        if observation is not None:
+            measured_points = intrinsics.triangulate(observation.left, observation.right)
+            known = detector.object_points[observation.ids]
+            board = fit_board_pose(observation, intrinsics, detector.object_points)
+            fitted = known @ board[:3, :3].T + board[:3, 3]
+            geometry_rms = float(np.sqrt(np.mean(np.sum((measured_points - fitted) ** 2, 1))))
+            # Mean pairwise distance, measured over known: 1.0 if the stereo scale
+            # (baseline, focal length, printed size) is right.
+            def spread(p):
+                return float(np.mean(np.linalg.norm(p[:, None] - p[None], axis=2)))
+            scale = spread(measured_points) / spread(known)
+            record.update(
+                ids=observation.ids, left=observation.left, right=observation.right,
+                triangulated=measured_points, T_cam_board=board,
+                geometry_rms_m=geometry_rms, scale_ratio=scale,
+                row_error_px=observation.left[:, 1] - observation.right[:, 1],
+            )
+            line += (
+                f", board at z={board[2, 3]:.3f} m, geometry rms "
+                f"{geometry_rms * 1000:.2f} mm, scale {scale:.4f}, row error "
+                f"{np.max(np.abs(record['row_error_px'])):.2f} px"
+            )
+        np.savez(self.dir / f"{tag}.npz", **record)
+        print(line)
+
+    def solve(self, observations, board_poses, guess_cam, guess_board,
+              intrinsics, object_points):
+        from .handeye import invert, rotation_angle
+
+        flanges = np.array([o.flange for o in observations])
+        boards = np.array(board_poses)
+        # Rotation angle is invariant under conjugation, so for every pair of
+        # poses the board's relative rotation seen by the camera must equal the
+        # flange's relative rotation from FK. A mismatch here is the data, not
+        # the solver.
+        pairs = []
+        for i in range(len(boards)):
+            for j in range(i + 1, len(boards)):
+                cam = rotation_angle((boards[i] @ invert(boards[j]))[:3, :3], np.eye(3))
+                base = rotation_angle((flanges[i] @ invert(flanges[j]))[:3, :3], np.eye(3))
+                pairs.append((i, j, np.degrees(cam), np.degrees(base)))
+        pairs = np.array(pairs)
+        mismatch = np.abs(pairs[:, 2] - pairs[:, 3])
+        # Same check for the other convention, in case B or A is inverted.
+        swapped = []
+        for i in range(len(boards)):
+            for j in range(i + 1, len(boards)):
+                cam = rotation_angle((invert(boards[i]) @ boards[j])[:3, :3], np.eye(3))
+                base = rotation_angle((invert(flanges[i]) @ flanges[j])[:3, :3], np.eye(3))
+                swapped.append(abs(np.degrees(cam) - np.degrees(base)))
+        print(
+            f"  DEBUG pairwise rotation, camera vs FK: median {np.median(mismatch):.3f} deg, "
+            f"max {np.max(mismatch):.3f} deg over {len(pairs)} pairs "
+            f"(other convention: median {np.median(swapped):.3f} deg)"
+        )
+
+        T_cam_base = invert(guess_cam)
+        depth = []
+        print("  DEBUG closed-form guess vs each measured board pose:")
+        for k, (observation, measured) in enumerate(zip(observations, board_poses)):
+            predicted = T_cam_base @ observation.flange @ guess_board
+            corners = object_points[observation.ids] @ predicted[:3, :3].T + predicted[:3, 3]
+            depth.append(float(corners[:, 2].min()))
+            angle = np.degrees(rotation_angle(predicted[:3, :3], measured[:3, :3]))
+            offset = np.linalg.norm(predicted[:3, 3] - measured[:3, 3])
+            print(
+                f"    pose {k + 1:2d}: measured z {measured[2, 3]:+.3f} m, predicted z "
+                f"{predicted[2, 3]:+.3f} m, min corner z {depth[-1]:+.3f} m, off by "
+                f"{angle:.1f} deg / {offset * 1000:.0f} mm"
+            )
+        np.savez(
+            self.dir / "solve.npz",
+            flange_poses=flanges, board_poses=boards,
+            guess_T_base_cam=guess_cam, guess_T_flange_board=guess_board,
+            pair_rotation_deg=pairs, pair_rotation_deg_swapped_mismatch=np.array(swapped),
+            predicted_min_depth=np.array(depth),
+            ids=np.array([o.ids for o in observations], dtype=object),
+            left=np.array([o.left for o in observations], dtype=object),
+            right=np.array([o.right for o in observations], dtype=object),
+        )
+
+    def failure(self):
+        import traceback
+
+        (self.dir / "traceback.txt").write_text(traceback.format_exc())
+        print(f"  DEBUG: traceback written to {self.dir / 'traceback.txt'}")
+
+
+def _debug_plain(value):
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, (tuple, set)):
+        return list(value)
+    return repr(value)
+
+
+def _debug_pose(index, arm, camera, detector, kinematics, commanded, measured,
+                observation):
+    if _DEBUG is None:
+        return
+    try:
+        _DEBUG.pose(index, arm, camera, detector, _DEBUG.intrinsics, kinematics,
+                    commanded, measured, observation)
+    except Exception as error:  # noqa: BLE001 -- recording must not cost the run
+        print(f"      DEBUG: could not record pose {index}: {error!r}")
+
+
+# ---------------------------------------------------------------- end DEBUG
+
+
 def cmd_run(args):
     _require_ip(args)
     spec = spec_from_args(args)
@@ -908,6 +1113,15 @@ def cmd_run(args):
             print(f"  SN{serial} at {camera.size[0]}x{camera.size[1]}, {lens} lens")
             intrinsics = Intrinsics.from_stereo(camera.calibration)
 
+            # DEBUG (temporary)
+            global _DEBUG
+            _DEBUG = _DebugLog()
+            _DEBUG.intrinsics = intrinsics
+            try:
+                _DEBUG.meta(args, spec, arm, camera, intrinsics)
+            except Exception as error:  # noqa: BLE001
+                print(f"  DEBUG: could not record meta: {error!r}")
+
             preview = Preview(
                 camera.size, enabled=not args.no_window, scale=args.display_scale
             )
@@ -938,13 +1152,23 @@ def cmd_run(args):
     T_base_cam, T_flange_board = solve(
         [observation.flange for observation in observations], board_poses
     )
-    T_base_cam, T_flange_board, stats = refine(
-        observations,
-        intrinsics,
-        detector.object_points,
-        T_base_cam,
-        T_flange_board,
-    )
+    # DEBUG (temporary)
+    try:
+        _DEBUG.solve(observations, board_poses, T_base_cam, T_flange_board,
+                     intrinsics, detector.object_points)
+    except Exception as error:  # noqa: BLE001
+        print(f"  DEBUG: could not record the solve: {error!r}")
+    try:
+        T_base_cam, T_flange_board, stats = refine(
+            observations,
+            intrinsics,
+            detector.object_points,
+            T_base_cam,
+            T_flange_board,
+        )
+    except Exception:
+        _DEBUG.failure()  # DEBUG (temporary)
+        raise
 
     spread = None
     if len(observations) >= 4 and not args.no_leave_one_out:
