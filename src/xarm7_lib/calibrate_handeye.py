@@ -90,10 +90,11 @@ from .handeye import (
     solve,
 )
 from .tag_recovery import (
-    TAG_ID,
+    TAG_DICTIONARY,
     TAG_LENGTH,
     TAG_RESOLUTION,
     record_reference,
+    survey_tags,
 )
 
 # The model the forward kinematics comes from, and the two frames taken off it.
@@ -1262,23 +1263,70 @@ def cmd_run(args):
         print("  --dry-run: nothing written.")
         return 0
 
-    handeye.tag = _reference_after_run(args)
+    handeye.tag = _reference_after_run(args, spec)
     return _file(handeye, args)
 
 
-def _reference_after_run(args):
+def _choose_tag(camera, requested, dictionary, board):
+    """The id of the table tag to record: `requested`, or the one tag in view.
+
+    Each bench has its own tag, and the camera can often see a neighbour's as
+    well, so this refuses rather than guess when it sees more than one -- or the
+    same id twice, which is two benches printed from the same default. The
+    board's own markers share the dictionary and are left out. Returns None if
+    no tag is in view at all.
+    """
+    board_ids = {int(i) for i in np.asarray(charuco_board(board).getIds()).ravel()}
+    if requested is not None and requested in board_ids:
+        raise HandEyeError(
+            f"id {requested} is one of the calibration board's own markers "
+            f"(0-{max(board_ids)}), so it cannot also be the table tag. Print the "
+            "tag with an id above that."
+        )
+    survey = survey_tags(camera, dictionary, ignore=board_ids)
+    shared = sorted(marker for marker, copies in survey.items() if copies > 1)
+    if requested is not None:
+        if requested in shared:
+            raise HandEyeError(
+                f"tag {requested} is in view twice, so one of them is another "
+                "bench's. Cover the one that is not this bench's and try again."
+            )
+        return requested
+    if shared:
+        raise HandEyeError(
+            f"tag {', '.join(map(str, shared))} is in view more than once, so two "
+            "benches share an id. Cover the one that is not this bench's, and "
+            "reprint one of them with a different --id."
+        )
+    if len(survey) > 1:
+        raise HandEyeError(
+            f"{len(survey)} table tags are in view (ids "
+            f"{', '.join(map(str, survey))}), and the one recorded has to be this "
+            "bench's own. Cover the others and try again, or pass --id."
+        )
+    return next(iter(survey), None)
+
+
+def _reference_after_run(args, board):
     """Record the table tag for a calibration just measured, if it can be seen.
 
     Done here because this is the moment the calibration is known good. Nothing
     that goes wrong with it may cost the calibration just measured.
     """
-    print(f"\nlooking for table tag {TAG_ID}...")
+    print("\nlooking for the table tag...")
+    reference = None
     try:
         with _open_tag_camera(args) as camera:
-            reference = record_reference(camera, length=args.tag_length / 1000.0)
+            tag_id = _choose_tag(camera, args.tag_id, TAG_DICTIONARY, board)
+            if tag_id is not None:
+                print(f"  table tag in view: id {tag_id}")
+                reference = record_reference(
+                    camera, tag_id, TAG_DICTIONARY, args.tag_length / 1000.0
+                )
+    except HandEyeError as error:
+        print(f"  ! {error}")
     except Exception as error:
         print(f"  ! could not look for it: {error}")
-        reference = None
     if reference is None:
         print(
             "  ! no table tag recorded, so a knocked camera on this bench will not "
@@ -1393,16 +1441,30 @@ def cmd_register_tag(args):
         handeye = find_filed(serial)
         print(f"{handeye!r}")
         print(f"  from {handeye.source}, measured {handeye.created}")
-        print(f"recording tag {args.id} at {TAG_RESOLUTION}...")
+        tag_id = _choose_tag(camera, args.id, args.dict, handeye.board)
+        if tag_id is None:
+            raise HandEyeError(
+                f"no table tag ({args.dict}) in view. Check it is in the light "
+                "and clear of the arm."
+            )
+        print(f"\n  table tag in view: id {tag_id}\n")
+        print(f"recording tag {tag_id} at {TAG_RESOLUTION}...")
         reference = record_reference(
-            camera, args.id, args.dict, args.length / 1000.0
+            camera, tag_id, args.dict, args.length / 1000.0
         )
     if reference is None:
         raise HandEyeError(
-            f"tag {args.id} ({args.dict}) was not seen steadily in both eyes. "
+            f"tag {tag_id} ({args.dict}) was not seen steadily in both eyes. "
             "Check it is in view, in the light, and clear of the arm."
         )
     _report_reference(reference)
+    if handeye.tag is not None and handeye.tag.tag_id != reference.tag_id:
+        print(
+            f"  ! this replaces table tag {handeye.tag.tag_id}, recorded "
+            f"{handeye.tag.created}. If tag {handeye.tag.tag_id} is still on this "
+            "bench, the wrong tag\n    has been recorded: cover this one and run "
+            "it again."
+        )
 
     # Recording a new reference is how "the camera has moved" gets forgotten, so
     # it should not happen by accident on a camera that already has.
@@ -1540,6 +1602,15 @@ def build_parser():
         help="skip the refit-per-dropped-pose check, which is the slow part",
     )
     run.add_argument(
+        "--tag-id",
+        type=int,
+        default=None,
+        help=(
+            "the table tag to record at the end. By default, whichever one is in "
+            "view, as long as there is only one"
+        ),
+    )
+    run.add_argument(
         "--tag-length",
         type=float,
         default=TAG_LENGTH * 1000,
@@ -1566,7 +1637,12 @@ def build_parser():
             "tag existed, or one whose tag has been replaced."
         ),
     )
-    add_tag_identity_arguments(register)
+    add_tag_identity_arguments(
+        register,
+        default_id=None,
+        id_help="record this tag. By default, whichever one is in view, as long "
+        "as there is only one",
+    )
     register.add_argument("--serial", help="which camera, if several are attached")
     register.add_argument(
         "--force",

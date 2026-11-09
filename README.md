@@ -417,12 +417,15 @@ calibration and prints a warning for a TA:
 
 Students change nothing in their code.
 
-**Setting it up (TAs).** Print the tag. 45 mm suits a tag up to about 1.25 m from
-the camera. Further than that, make it bigger with `--length 70`, and pass the
-same size to `register-tag --length 70` or `run --tag-length 70`.
+**Setting it up (TAs).** Print the tag, with a different id on every bench, so a
+camera that can see a neighbour's tag cannot mistake it for its own. Ids 0-16 are
+the calibration board's markers and are refused; the default is 49, so counting
+down from there works (`--id 48`, `--id 47`, ...). 45 mm suits a tag up to about
+1.25 m from the camera. Further than that, make it bigger with `--length 70`,
+and pass the same size to `register-tag --length 70` or `run --tag-length 70`.
 
 ```bash
-python -m xarm7_lib.fiducials tag
+python -m xarm7_lib.fiducials tag --id 48
 ```
 
 Print `reference_tag.pdf` at 100% and fix it to the table:
@@ -441,6 +444,12 @@ Print `reference_tag.pdf` at 100% and fix it to the table:
 ```bash
 python -m xarm7_lib.calibrate_handeye register-tag
 ```
+
+Both record whichever tag is in view and print its id, so check it is this
+bench's. If more than one tag is in view, or the same id appears twice, they
+refuse and list what they saw: cover the other benches' tags and run it again,
+or pass `--id` (`--tag-id` for `run`) to pick one. Once recorded, only that id is
+ever looked for, and a check that sees it twice treats it as not in view.
 
 Recording it vouches for the calibration as it stands, so recalibrate with `run`
 instead if the camera may have been knocked since it was calibrated. Like `run`, this files

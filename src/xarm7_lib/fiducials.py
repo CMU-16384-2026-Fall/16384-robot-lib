@@ -377,6 +377,13 @@ def tag_image(tag_id=TAG_ID, length=TAG_LENGTH, dictionary=TAG_DICTIONARY,
 
 
 def cmd_tag(args):
+    board_ids = np.asarray(charuco_board(DEFAULT_BOARD).getIds()).ravel()
+    if args.dict == DEFAULT_BOARD.dictionary and args.id in board_ids:
+        raise HandEyeError(
+            f"id {args.id} is one of the calibration board's markers (0-"
+            f"{board_ids.max()}), and the board and the tag can be in view together. "
+            f"Use an id from {board_ids.max() + 1} up."
+        )
     length = args.length / 1000.0
     image, dpi = tag_image(args.id, length, args.dict, args.dpi, args.margin)
 
@@ -400,9 +407,12 @@ def cmd_tag(args):
         "worse with distance from it.\n"
         "  - as face-on to the camera as you can manage. 45 mm suits about 1.25 m; "
         "beyond that,\n    print it with --length 70.\n"
+        "  - a different id on every bench (--id 48, --id 47, ...), so that a "
+        "camera which can\n    see a neighbour's tag cannot mistake it for its own.\n"
         "\nThen record it: `python -m xarm7_lib.calibrate_handeye run` does it at "
         "the end of a\ncalibration, and `calibrate_handeye register-tag` adds it "
-        "to one already filed."
+        "to one already filed.\nBoth record whichever tag is in view and refuse if "
+        "there is more than one, so\ncover the other benches' tags while you do it."
     )
     return 0
 
@@ -482,10 +492,11 @@ def add_board_arguments(parser, default=DEFAULT_BOARD):
     )
 
 
-def add_tag_identity_arguments(parser):
+def add_tag_identity_arguments(parser, default_id=TAG_ID, id_help=None):
     group = parser.add_argument_group("the table tag")
     group.add_argument(
-        "--id", type=int, default=TAG_ID, help=f"marker id (default {TAG_ID})"
+        "--id", type=int, default=default_id,
+        help=id_help or f"marker id (default {default_id})",
     )
     group.add_argument(
         "--length",

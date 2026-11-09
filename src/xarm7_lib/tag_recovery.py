@@ -22,7 +22,9 @@ from .camera import ZedOpenCapture
 from .handeye import HandEyeError, Intrinsics, TagReference
 
 # The last id in the dictionary the ChArUco board uses, because the board's own
-# markers count up from 0 and may be in view at the same time.
+# markers count up from 0 and may be in view at the same time. Only the default
+# for printing one: every bench should have a different id, and recording takes
+# whichever tag is in view (see `survey_tags`).
 TAG_ID = 49
 TAG_DICTIONARY = "DICT_4X4_50"
 TAG_LENGTH = 0.045  # m, the side of the black square
@@ -70,17 +72,56 @@ def tag_detector(dictionary=TAG_DICTIONARY):
     return cv2.aruco.ArucoDetector(aruco_dictionary(dictionary), parameters)
 
 
-def find_tag(detector, image, tag_id):
-    """One tag's corners in one image, `(4, 2)` in TL TR BR BL order, or None."""
+def find_tags(detector, image):
+    """Every marker in one image, as `{id: [(4, 2) corners, ...]}`."""
     if image.ndim == 3:
         image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     corners, ids, _ = detector.detectMarkers(image)
+    found = {}
     if ids is None:
-        return None
-    for found, marker in zip(corners, np.asarray(ids).ravel()):
-        if int(marker) == tag_id:
-            return np.asarray(found, dtype=float).reshape(4, 2)
-    return None
+        return found
+    for marker_corners, marker in zip(corners, np.asarray(ids).ravel()):
+        found.setdefault(int(marker), []).append(
+            np.asarray(marker_corners, dtype=float).reshape(4, 2)
+        )
+    return found
+
+
+def find_tag(detector, image, tag_id):
+    """One tag's corners in one image, `(4, 2)` in TL TR BR BL order, or None.
+
+    None too when the id is in view twice. Two tags sharing an id are this
+    bench's and a neighbour's printed from the same default, and either one
+    could be the one that moved, so neither is worth measuring against.
+    """
+    copies = find_tags(detector, image).get(int(tag_id), [])
+    return copies[0] if len(copies) == 1 else None
+
+
+def survey_tags(camera, dictionary=TAG_DICTIONARY, ignore=(), frames=LOOK_FRAMES):
+    """Which tags are in view, as `{id: copies}`, read off the left eye.
+
+    For recording a reference without being told which tag to use: the bench's
+    own tag is whichever one the camera can see. Only an id seen in
+    `FRAME_QUORUM` of the frames counts, so a marker decoded once out of noise
+    is not one. `copies` is the most of that id seen in any single frame, and
+    more than one means two printed tags share it. `ignore` is for the
+    calibration board's markers, which come from the same dictionary.
+    """
+    detector = tag_detector(dictionary)
+    for _ in range(SETTLE_FRAMES):
+        camera.read_rectified()
+    ignore = {int(marker) for marker in ignore}
+    seen, copies = {}, {}
+    for _ in range(frames):
+        left, _ = camera.read_rectified()
+        for marker, found in find_tags(detector, left).items():
+            if marker in ignore:
+                continue
+            seen[marker] = seen.get(marker, 0) + 1
+            copies[marker] = max(copies.get(marker, 0), len(found))
+    needed = math.ceil(FRAME_QUORUM * frames)
+    return {marker: copies[marker] for marker in sorted(seen) if seen[marker] >= needed}
 
 
 def capture_tag(camera, tag_id, dictionary=TAG_DICTIONARY, frames=LOOK_FRAMES):
