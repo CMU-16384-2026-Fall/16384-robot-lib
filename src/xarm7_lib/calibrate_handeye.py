@@ -116,6 +116,14 @@ PREVIEW_SCALE = 0.5
 # controller's tolerance on purpose: this only decides when to stop drawing.
 ARRIVAL_TOLERANCE = 0.01  # rad
 MOVE_TIMEOUT = 30.0  # s, a backstop on the frame-pumping loop
+# How long the arm waits after each pose with its detections still in the
+# window. One frame is too brief to tell a good view from a near miss.
+DETECTION_HOLD = 0.5  # s
+
+# Automatic exposure, gain and white balance, switched on whenever this opens
+# the camera rather than inherited from whatever last had it, so a bench left
+# on fixed settings by some other script does not calibrate in the dark.
+CAMERA_CONTROLS = {"aec_agc": 1, "auto_white_balance": 1}
 
 # The generated sweep. The wrist joints carry the rotation, because turning the
 # wrist re-orients the board without walking it out of the camera's view; the
@@ -128,7 +136,7 @@ POSE_ATTEMPTS = 20  # candidates tried per pose before giving up on it
 
 DEFAULT_POSES = 18
 DEFAULT_FRAMES = 8  # frames averaged per pose
-DEFAULT_SETTLE = 0.6  # s after a move, for the arm to stop ringing
+DEFAULT_SETTLE = 1.5  # s after a move, for the arm to stop ringing
 DEFAULT_SPEED = 0.25  # rad/s between poses; no hurry, and it keeps the board still
 
 # A corner has to turn up in this fraction of the frames, in both eyes, to be
@@ -340,7 +348,8 @@ def observe(camera, detector, flange, frames=DEFAULT_FRAMES, preview=None, note=
     With a `preview`, the averaged detections are drawn on the last frame
     grabbed, including the ones only one eye saw. A pose that fails is drawn
     too, and before it is reported: the picture of a near miss is the useful
-    part, and it is gone by the time the arm has moved on.
+    part, and it is gone by the time the arm has moved on. The window then
+    holds that picture for `DETECTION_HOLD` before the arm goes anywhere.
     """
     grabbed = [camera.read_rectified() for _ in range(frames)]
     left, right = _average_detections(detector, grabbed)
@@ -357,6 +366,7 @@ def observe(camera, detector, flange, frames=DEFAULT_FRAMES, preview=None, note=
                 + (f", {len(lonely)} in the left only" if lonely else "")
             ],
         )
+        preview.hold(DETECTION_HOLD)
     if len(shared) < MIN_CORNERS:
         print(
             f"      skipped: {len(shared)} corners in both eyes "
@@ -464,6 +474,22 @@ class Preview:
             cv2.putText(canvas, line, (int(12 * k), index * step),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45 + 0.25 * k,
                         (255, 255, 255), 1, cv2.LINE_AA)
+
+    def hold(self, seconds):
+        """Keep the last frame up, and the window responsive, for a while.
+
+        `waitKey` is the GUI's own event pump, so one call is both the wait and
+        the thing that stops the window going grey. With no window there is
+        nothing to look at, so it returns at once. Returns the key pressed.
+        """
+        self.key = -1
+        if not self.enabled:
+            return self.key
+        try:
+            self.key = self._key(cv2.waitKey(max(1, int(seconds * 1000))))
+        except cv2.error as error:
+            self._give_up(error)
+        return self.key
 
     @property
     def closed(self):
@@ -641,7 +667,9 @@ def _open_arm(args, guard=True):
 def _open_camera(args):
     from .camera import ZedOpenCapture
 
-    return ZedOpenCapture(resolution=args.resolution, serial=args.serial)
+    return ZedOpenCapture(
+        resolution=args.resolution, serial=args.serial, controls=CAMERA_CONTROLS
+    )
 
 
 def _stream(camera, preview, seconds, note=()):
@@ -979,7 +1007,9 @@ def _reference_after_run(args):
 def _open_tag_camera(args):
     from .camera import ZedOpenCapture
 
-    return ZedOpenCapture(resolution=TAG_RESOLUTION, serial=args.serial)
+    return ZedOpenCapture(
+        resolution=TAG_RESOLUTION, serial=args.serial, controls=CAMERA_CONTROLS
+    )
 
 
 def _report_reference(reference):
