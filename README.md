@@ -655,9 +655,7 @@ by *opening* the camera, and the visualizer is already streaming it: asked
 instead of told, the library would open a camera that is busy, get nothing
 back, and go quiet about the one camera it is certainly looking through.
 Without a serial it falls back to probing the bus, which is right for a
-visualizer that owns no camera and fails for one that does. `handeye=` on
-`register_visualizer` hands a calibration over outright and skips the lookup
-either way.
+visualizer that owns no camera and fails for one that does.
 
 With `frame = "camera"` and no calibration filed on the bench, nothing is
 drawn, and the reason is printed once. That is deliberate: camera coordinates

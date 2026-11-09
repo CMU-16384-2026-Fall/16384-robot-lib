@@ -113,7 +113,7 @@ class Robot(RobotInterface):
             opener()
         return getattr(viewer, "url", None)
 
-    def register_visualizer(self, visualizer, rate=None, name=None, handeye=None):
+    def register_visualizer(self, visualizer, rate=None, name=None):
         """Draw `visualizer`'s idea of the scene beside the arm, on its own thread.
 
         The object needs a `poll()` — do the slow work there, it is called with
@@ -126,8 +126,7 @@ class Robot(RobotInterface):
         A visualizer drawing in camera coordinates should say which camera it
         is looking through, as a `serial` or a `camera` exposing one: that is
         how the calibration is found. Asking the camera instead means opening
-        it, and the detector already has it open. `handeye=` hands a
-        calibration over outright and skips the lookup.
+        it, and the detector already has it open.
 
         A tab held back by `open_browser=False` opens here, on the first
         registration: this is the thing it was waiting for.
@@ -152,7 +151,7 @@ class Robot(RobotInterface):
                 "it is still running and still readable"
             )
 
-        handle = VisualizerHandle(self, visualizer, label, rate=rate, handeye=handeye)
+        handle = VisualizerHandle(self, visualizer, label, rate=rate)
         self._visualizers.append(handle)
         if self._deferred_open:
             self.show()

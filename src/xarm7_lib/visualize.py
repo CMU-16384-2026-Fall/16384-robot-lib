@@ -315,17 +315,14 @@ class VisualizerHandle:
     again; `Robot.close` stops every one it handed out.
     """
 
-    def __init__(self, robot, visualizer, label, rate=None, handeye=None, start=True):
+    def __init__(self, robot, visualizer, label, rate=None, start=True):
         self.visualizer = visualizer
         self.name = label
         self.path = f"{VISUALIZER_PATH}/{label}"
         self.errors = 0
 
         self._robot = robot
-        # Told to us, versus found on disk: a refresh re-reads the file but must
-        # not throw away a calibration the caller handed over.
-        self._given_handeye = handeye
-        self._handeye = handeye
+        self._handeye = None
         self._handeye_failed = False
         self._frame = None  # the frame string the current transform was built for
         self._frame_transform = None
@@ -367,7 +364,7 @@ class VisualizerHandle:
         was running — a TA re-running `calibrate_handeye` is the only case that
         comes up in practice, which is why this is on demand and not polled.
         """
-        self._handeye = self._given_handeye
+        self._handeye = None
         self._handeye_failed = False
         self._frame = None
         self._frame_transform = None
