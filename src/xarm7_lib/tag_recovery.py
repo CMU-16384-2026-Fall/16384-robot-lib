@@ -1,7 +1,8 @@
 """Finding the table tag in the camera: the OpenCV side of recovering a knocked camera.
 
-`handeye.py` has the reasoning and the arithmetic, and imports this only when it
-is about to open a camera, so reading a calibration still needs no OpenCV.
+`handeye.py` has the reasoning and the arithmetic, and never imports this, so
+reading a calibration still needs no OpenCV. Recording the tag is
+`calibrate_handeye`'s; checking it is done by whatever streams the camera.
 
 The tag is read at 2K whatever the calibration was made at. A 45 mm tag at
 1.5 m, foreshortened by lying flat on the table, is as little as 11 px tall in
@@ -18,7 +19,6 @@ import time
 import cv2
 import numpy as np
 
-from .camera import ZedOpenCapture
 from .handeye import HandEyeError, Intrinsics, TagReference
 
 # The last id in the dictionary the ChArUco board uses, because the board's own
@@ -164,12 +164,6 @@ def capture_tag(camera, tag_id, dictionary=TAG_DICTIONARY, frames=LOOK_FRAMES):
     # MAD to a standard deviation, then the standard error of a median.
     scatter = 1.4826 * np.median(np.abs(np.asarray(lefts) - left))
     return left, right, float(1.25 * scatter / np.sqrt(len(lefts)))
-
-
-def look_for_tag(reference, serial=None):
-    """Open the camera and find a recorded tag. As `capture_tag` reports it."""
-    with ZedOpenCapture(resolution=reference.resolution, serial=serial) as camera:
-        return capture_tag(camera, reference.tag_id, reference.dictionary)
 
 
 def record_reference(camera, tag_id=TAG_ID, dictionary=TAG_DICTIONARY,

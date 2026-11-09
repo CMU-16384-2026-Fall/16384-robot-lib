@@ -393,10 +393,13 @@ centimetres.
 
 ## If the camera gets knocked
 
-A small tag fixed to the table lets a bench keep working after a bump. Once it
-is recorded, `load_handeye()` compares what the camera sees against the record
-each time it is called. If the camera has moved, it returns a corrected
-calibration and prints a warning for a TA:
+A small tag fixed to the table lets a bench keep working after a bump. It is
+recorded with the calibration, and the capstone's `LightsaberDetector`, which
+streams the camera, compares what it sees against that record whenever the tag
+is in view. At the dark exposure the sticks need it usually isn't, so students
+are told to shine a phone flashlight on it if the arm's aim looks off. If the
+camera has moved, the detector switches to a corrected calibration and prints a
+warning for a TA:
 
 ```
 [xarm7_lib] WARNING: THE CAMERA HAS MOVED
@@ -457,20 +460,16 @@ under `~/.config` and prints the `sudo` line that moves it into the installation
 
 **How it behaves.**
 
-| what `load_handeye()` finds | what happens |
+| what the detector sees | what happens |
 |---|---|
-| the tag moved less than 0.1° in the picture, and less than 10 mm in range | the calibration as filed, silently |
+| the tag moved less than 0.1° in the picture, and less than 10 mm in range | the calibration as filed |
 | more than that, or the camera turned more than 2° | a corrected calibration, and the warning above |
-| moved more than 10° or 50 mm in range, or the tag has changed shape | `HandEyeError`: this was repositioned, not knocked |
-| tag not in view, or the camera will not open | the last correction if there is one, or the filed calibration, and a note that nothing was checked |
+| moved more than 10° or 50 mm in range, or the tag has changed shape | `HandEyeError` from `query()`: this was repositioned, not knocked |
+| the tag not in view | the calibration as filed, unchecked |
 
-`load_handeye(serial=...)` and `$XARM7_HANDEYE` never open the camera, because
-the camera may be busy and there may not be one. They use the last correction
-this account measured, which is also how `register_visualizer` stays in step. A
-script that only ever calls those is never checked, so call `load_handeye()`
-once before opening the camera. Corrections are kept per account in
-`~/.config/xarm7_lib/handeye/SN<serial>.moved.json`, and recalibrating or
-re-recording the tag makes the old one stale.
+Nothing is saved: every run starts from the calibration as filed, and is
+corrected again when the tag is lit. `load_handeye()` itself only ever returns
+the calibration as filed; it never opens the camera.
 
 **How far to trust it.** It is a stopgap. The tag is read at 2K whatever the
 calibration was made at, because a tag this size is too small to read reliably
@@ -495,9 +494,10 @@ a metre from the tag is:
 Uncorrected, the same bumps are 16-112 mm out. These are renders, not a real ZED,
 so treat them as a best case. The errors quoted in the warning are the fit's own
 estimate and run low on a small tag or a poor image, which is why it says a few
-times that. The thresholds were set on renders too: call `load_handeye()` a few times on a
-bench as the camera warms up, and if a camera nobody touched warns that it moved,
-raise `MOVED_BEARING` and `MOVED_RANGE` in `handeye.py`.
+times that. The thresholds were set on renders too: light the tag in the
+light-stick live window (`python -m libcapstone.light_stick`) a few times as the
+camera warms up, and if a camera nobody touched warns that it moved, raise
+`MOVED_BEARING` and `MOVED_RANGE` in `handeye.py`.
 
 ## What goes wrong quietly
 

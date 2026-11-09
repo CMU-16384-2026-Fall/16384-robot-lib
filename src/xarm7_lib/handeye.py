@@ -75,8 +75,8 @@ When the camera gets knocked
 
 A bump invalidates `T_base_cam`, and re-measuring it needs a TA, a board and
 the arm. So a small tag taped to the table is recorded alongside the
-calibration (`TagReference`), and `load_handeye` compares what the camera sees
-now against that record. If the tag has moved in the picture, the camera has
+calibration (`TagReference`), and whatever streams the camera -- the capstone's
+`LightsaberDetector` -- compares what it sees now against that record. If the tag has moved in the picture, the camera has
 moved, and `T_base_cam @ D` carries on working in the meantime, where `D` is the
 camera's motion since the record -- `fit_camera_shift`.
 
@@ -178,10 +178,6 @@ MAX_TAG_RMS_PX = 1.5
 # How far from the tag `CameraShift.error_away` is quoted: about the size of the
 # area a student works in.
 ERROR_RADIUS = 0.5  # m
-
-# Warnings already printed by this process, so a loop that calls `load_handeye`
-# prints the same one once.
-_said = set()
 
 
 class HandEyeError(RuntimeError):
@@ -1124,65 +1120,16 @@ def search_paths(serial):
     return paths
 
 
-def _shift_path(handeye):
-    """Where this account keeps the correction for a knocked camera."""
-    return USER_DIR / f"SN{handeye.serial}.moved.json"
+def warn_moved(handeye, shift):
+    """The message the TA is meant to see, printed when a correction is put in use.
 
-
-def _stored_shift(handeye):
-    """The correction last measured for this calibration, or None.
-
-    Stamped with the calibration and the reference it was measured against, so
-    re-filing either makes it stale rather than wrongly applied.
+    Printed by whatever is watching the table tag -- the capstone's
+    `LightsaberDetector`, which streams the camera and so is the one thing that
+    can see the tag.
     """
-    if handeye.serial is None or handeye.tag is None:
-        return None
-    try:
-        data = json.loads(_shift_path(handeye).read_text())
-        if (
-            data["calibration"] == handeye.created
-            and data["reference"] == handeye.tag.created
-        ):
-            return CameraShift.from_dict(data["shift"])
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return None
-
-
-def _store_shift(handeye, shift):
-    """Remember a correction, so a caller that cannot look at the tag can use it.
-
-    A calibration read while something else is streaming the camera cannot
-    check for itself, and would otherwise disagree with the one read a moment
-    earlier. Best-effort: failing to write costs that, not the correction.
-    """
-    path = _shift_path(handeye)
-    try:
-        if shift is None:
-            path.unlink(missing_ok=True)
-        else:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({
-                "calibration": handeye.created,
-                "reference": handeye.tag.created,
-                "shift": shift.to_dict(),
-            }, indent=2) + "\n")
-    except OSError as error:
-        _say(f"could not update {path}: {error}")
-
-
-def _say(text):
-    """Print to stderr, once per process for the same words."""
-    if text not in _said:
-        _said.add(text)
-        print(f"[xarm7_lib] {text}", file=sys.stderr, flush=True)
-
-
-def _warn_moved(handeye, shift):
-    """The message the TA is meant to see. Printed whenever a correction is used."""
     bar = "=" * 72
-    _say(
-        f"WARNING: THE CAMERA HAS MOVED\n{bar}\n"
+    print(
+        f"[xarm7_lib] WARNING: THE CAMERA HAS MOVED\n{bar}\n"
         f"  Camera SN{handeye.serial} is not where it was when it was calibrated "
         f"on {handeye.created}.\n"
         f"  Measured from the table tag at {shift.measured}: moved "
@@ -1195,67 +1142,10 @@ def _warn_moved(handeye, shift):
         "      python -m xarm7_lib.calibrate_handeye run\n"
         "  If it was the tag that got moved rather than the camera, this\n"
         "  correction is wrong and the calibration still needs redoing.\n"
-        f"{bar}"
+        f"{bar}",
+        file=sys.stderr,
+        flush=True,
     )
-
-
-def _with_recovery(handeye, look):
-    """Apply whatever the table tag says about the filed calibration.
-
-    Args:
-        handeye: as filed.
-        look: whether to open the camera and check now. Otherwise, and when
-            looking fails, this falls back on the last correction measured.
-    """
-    if handeye.tag is None:
-        return handeye
-
-    if look:
-        # Whatever goes wrong while looking, the caller asked for a calibration
-        # and the filed one is still the best thing there is to give them.
-        reason = None
-        try:
-            from .tag_recovery import look_for_tag
-
-            sighting = look_for_tag(handeye.tag, handeye.serial)
-            if sighting is None:
-                reason = (
-                    f"table tag {handeye.tag.tag_id} is not in view, so nothing "
-                    "confirms the camera is still where it was calibrated. If "
-                    "the arm or something on the table is covering it, ignore "
-                    "this; if not, ask a TA."
-                )
-        except Exception as error:
-            reason = (
-                "could not check the camera against the table tag, so nothing "
-                f"confirms it is still where it was calibrated. ({error})"
-            )
-        if reason is not None:
-            _say(reason)
-        else:
-            shift = fit_camera_shift(handeye.tag, *sighting)
-            if shift.too_far:
-                raise HandEyeError(
-                    f"camera SN{handeye.serial} has moved too far to correct "
-                    f"({shift.describe()}, tag fits to {shift.rms_px:.1f} px). "
-                    "It looks repositioned rather than knocked, or the tag has "
-                    "been moved, and a transform corrected from this could send "
-                    "the arm somewhere badly wrong. Ask a TA to redo the "
-                    "calibration: python -m xarm7_lib.calibrate_handeye run"
-                )
-            if shift.moved:
-                _store_shift(handeye, shift)
-                _warn_moved(handeye, shift)
-                return handeye.corrected(shift)
-            # Back where it belongs, which is also how a stale one gets cleared.
-            _store_shift(handeye, None)
-            return handeye
-
-    shift = _stored_shift(handeye)
-    if shift is None:
-        return handeye
-    _warn_moved(handeye, shift)
-    return handeye.corrected(shift)
 
 
 def load_handeye(serial=None):
@@ -1276,13 +1166,10 @@ def load_handeye(serial=None):
     `calibrate_handeye run` writes by default, before a `sudo mv` promotes it
     into the installation.
 
-    If the bench has a table tag recorded (`calibrate_handeye register-tag`),
-    a call with no arguments also opens the camera for about a second and checks
-    it has not moved. If it has, this returns a corrected calibration and prints a warning
-    for a TA. So call it before opening the camera yourself: only one thing can
-    have the camera open at a time. A call naming a `serial`, or one using
-    `$XARM7_HANDEYE`, never opens the camera. It uses the last correction
-    measured by this account, if there is one.
+    This is the calibration as filed. It never opens the camera and never
+    corrects for a knocked one: the table tag recorded with it (`tag`) is
+    checked by whatever streams the camera, which in the capstone is
+    `LightsaberDetector` -- see `fit_camera_shift` and `HandEye.corrected`.
 
     Args:
         serial: Which camera's calibration. Read from the attached camera when
@@ -1293,10 +1180,8 @@ def load_handeye(serial=None):
         A `HandEye`.
 
     Raises:
-        HandEyeError: There is no calibration, or the camera has moved too far
-            for the tag to correct.
+        HandEyeError: There is no calibration.
     """
-    look = serial is None
     if serial is None:
         # `$XARM7_HANDEYE` names a file outright, so it needs no serial and so
         # no camera. Checked before anything is probed, because the point of it
@@ -1306,7 +1191,7 @@ def load_handeye(serial=None):
         if override:
             path = pathlib.Path(override).expanduser()
             if path.is_file():
-                return _with_recovery(HandEye.load(path), look=False)
+                return HandEye.load(path)
 
         # Imported here and not at the top of the module: finding the attached
         # camera needs OpenCV and the shim, and loading a calibration for a
@@ -1339,15 +1224,11 @@ def load_handeye(serial=None):
                 "on the camera's back panel."
             )
 
-    return _with_recovery(find_filed(serial), look=look)
+    return find_filed(serial)
 
 
 def find_filed(serial):
-    """A camera's calibration exactly as filed, with no tag and no correction.
-
-    For the tools that measure against the filed transform; a student wants
-    `load_handeye`.
-    """
+    """A camera's calibration as filed, by serial, without probing for one."""
     serial = str(serial)
     paths = search_paths(serial)
     for path in paths:

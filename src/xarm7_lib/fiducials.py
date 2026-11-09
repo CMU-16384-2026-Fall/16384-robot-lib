@@ -559,7 +559,7 @@ def build_parser():
         "tag",
         help="write the tag to print and fix to the table",
         description=(
-            "Render the table tag at exact scale. With it recorded, load_handeye() "
+            "Render the table tag at exact scale. With it recorded, the light-stick detector "
             "notices a knocked camera, corrects for it, and warns."
         ),
     )
