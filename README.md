@@ -277,12 +277,10 @@ handeye.points_to_camera(pts)  # base frame -> camera frame
 handeye.project(pts)           # base frame -> rectified pixels, for drawing
 ```
 
-If it raises `HandEyeError`, the station has not been calibrated, or its camera
-has moved too far to correct — that is a TA's job, not something to work around.
-
-Call it before you open the camera. It looks through the camera for about a
-second to check nothing has moved, and only one thing can have the camera open
-at a time (see [If the camera gets knocked](#if-the-camera-gets-knocked)).
+If it raises `HandEyeError`, the station has not been calibrated — that is a
+TA's job, not something to work around. It never opens the camera, and it is
+the calibration as filed: checking it against the table tag is the light-stick
+detector's job (see [If the camera gets knocked](#if-the-camera-gets-knocked)).
 
 ## Calibrating a bench (TAs)
 
@@ -463,8 +461,7 @@ under `~/.config` and prints the `sudo` line that moves it into the installation
 | what the detector sees | what happens |
 |---|---|
 | the tag moved less than 0.1° in the picture, and less than 10 mm in range | the calibration as filed |
-| more than that, or the camera turned more than 2° | a corrected calibration, and the warning above |
-| moved more than 10° or 50 mm in range, or the tag has changed shape | `HandEyeError` from `query()`: this was repositioned, not knocked |
+| more than that, or the camera turned more than 2° | a corrected calibration, and the warning above, however far it moved |
 | the tag not in view | the calibration as filed, unchecked |
 
 Nothing is saved: every run starts from the calibration as filed, and is

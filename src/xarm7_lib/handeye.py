@@ -167,13 +167,9 @@ MOVED_BEARING = 0.1  # degrees
 MOVED_ROTATION = 2.0  # degrees
 MOVED_RANGE = 0.010  # m
 
-# Above these it has not been knocked, it has been repositioned, and the idea
-# that it mostly turned on the spot no longer holds. A residual this large means
-# the four corners no longer form the shape they did, so it is not the same tag
-# or it is not lying flat any more.
-MAX_ROTATION = 10.0  # degrees
-MAX_RANGE = 0.050  # m
-MAX_TAG_RMS_PX = 1.5
+# There is no upper limit. However far the camera has moved, a correction is
+# used and the warning says how far off to expect it to be; a correction is a
+# stopgap until the bench is recalibrated, not a measurement.
 
 # How far from the tag `CameraShift.error_away` is quoted: about the size of the
 # area a student works in.
@@ -533,14 +529,6 @@ class CameraShift:
             self.bearing > MOVED_BEARING
             or self.rotation > MOVED_ROTATION
             or abs(self.range_change) > MOVED_RANGE
-        )
-
-    @property
-    def too_far(self):
-        return (
-            self.rotation > MAX_ROTATION
-            or abs(self.range_change) > MAX_RANGE
-            or self.rms_px > MAX_TAG_RMS_PX
         )
 
     def describe(self):
