@@ -1126,7 +1126,7 @@ def _add_hardware_arguments(parser):
         help="controller address, e.g. 192.168.1.185. Defaults to $ROBOT_IP.",
     )
     group.add_argument(
-        "--resolution", default="HD", help="2K, FHD, HD or VGA (default HD)"
+        "--resolution", default="2K", help="2K, FHD, HD or VGA (default HD)"
     )
     group.add_argument("--serial", help="which camera, if several are attached")
     group.add_argument(
