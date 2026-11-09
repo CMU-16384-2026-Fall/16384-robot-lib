@@ -277,8 +277,12 @@ handeye.points_to_camera(pts)  # base frame -> camera frame
 handeye.project(pts)           # base frame -> rectified pixels, for drawing
 ```
 
-If it raises `HandEyeError`, the station has not been calibrated — that is a
-TA's job, not something to work around.
+If it raises `HandEyeError`, the station has not been calibrated, or its camera
+has moved too far to correct — that is a TA's job, not something to work around.
+
+Call it before you open the camera. It looks through the camera for about a
+second to check nothing has moved, and only one thing can have the camera open
+at a time (see [If the camera gets knocked](#if-the-camera-gets-knocked)).
 
 ## Calibrating a bench (TAs)
 
@@ -397,6 +401,113 @@ them is the error the table is reporting. Do this at poses the fit never
 saw — it is the only check that catches a calibration that is self-consistent
 and wrong. A tape measure to the camera is worth one more minute: the reported
 position should be where the camera physically is, to within a few centimetres.
+
+## If the camera gets knocked
+
+A small tag fixed to the table lets a bench keep working after a bump. Once it
+is recorded, `load_handeye()` compares what the camera sees against the record
+each time it is called. If the camera has moved, it returns a corrected
+calibration and prints a warning for a TA:
+
+```
+[xarm7_lib] WARNING: THE CAMERA HAS MOVED
+========================================================================
+  Camera SN12345 is not where it was when it was calibrated on 2026-11-02T14:03:11.
+  Measured from the table tag at 2026-11-05T15:34:34: moved 1.96 deg, -2 mm in range.
+
+  Students: you can keep working. This run uses a corrected transform.
+  Expect errors of roughly 1 mm near the tag and 2 mm 0.5 m away
+  from it, and possibly a few times that.
+
+  TA: please redo the hand-eye calibration on this bench:
+      python -m xarm7_lib.calibrate_handeye run
+  If it was the tag that got moved rather than the camera, this
+  correction is wrong and the calibration still needs redoing.
+========================================================================
+```
+
+Students change nothing in their code.
+
+**Setting it up (TAs).** Print the tag. 45 mm suits a tag up to about 1.25 m from
+the camera. Further than that, make it bigger with `--length 70`, and pass the
+same size to `register-tag --length 70` or `run --tag-length 70`.
+
+```bash
+python -m xarm7_lib.calibrate_handeye tag
+```
+
+Print `reference_tag.pdf` at 100% and fix it to the table:
+
+- **Somewhere nothing moves it.** The camera cannot tell a tag that moved from
+  a camera that moved, and a moved tag gives a wrong correction with no error.
+- **Near the middle of where students work,** but where the arm will not cover
+  it. The correction is accurate near the tag and gets worse with distance.
+- **As face-on to the camera as you can manage.** Flat on the table it is
+  foreshortened, so propping it on a wedge towards the camera helps. `run` and
+  `register-tag` say so if it comes out too small.
+- **With its white margin intact.** The detector needs it.
+
+`run` records the tag when it finishes. For a calibration that is already filed:
+
+```bash
+python -m xarm7_lib.calibrate_handeye register-tag
+```
+
+Recording it vouches for the calibration as it stands, so run `verify` first if
+the camera may have been knocked since it was calibrated. Like `run`, this files
+under `~/.config` and prints the `sudo` line that moves it into the installation.
+
+**Checking on it.**
+
+```bash
+python -m xarm7_lib.calibrate_handeye check
+```
+
+Prints how far the camera has moved, without changing anything.
+
+**How it behaves.**
+
+| what `load_handeye()` finds | what happens |
+|---|---|
+| the tag moved less than 0.1° in the picture, and less than 10 mm in range | the calibration as filed, silently |
+| more than that, or the camera turned more than 2° | a corrected calibration, and the warning above |
+| moved more than 10° or 50 mm in range, or the tag has changed shape | `HandEyeError`: this was repositioned, not knocked |
+| tag not in view, or the camera will not open | the last correction if there is one, or the filed calibration, and a note that nothing was checked |
+
+`load_handeye(serial=...)` and `$XARM7_HANDEYE` never open the camera, because
+the camera may be busy and there may not be one. They use the last correction
+this account measured, which is also how `register_visualizer` stays in step. A
+script that only ever calls those is never checked, so call `load_handeye()`
+once before opening the camera. Corrections are kept per account in
+`~/.config/xarm7_lib/handeye/SN<serial>.moved.json`, and recalibrating or
+re-recording the tag makes the old one stale.
+
+**How far to trust it.** It is a stopgap. The tag is read at 2K whatever the
+calibration was made at, because a tag this size is too small to read reliably
+in HD. One small tag measures its direction and distance well and its own tilt
+badly, so the correction assumes a bump mostly turned the camera and slid it by
+no more than about a centimetre. A camera that really did slide further than
+that is corrected less well away from the tag: about 4 mm of extra error for
+every centimetre of sideways slide, half a metre from the tag at 1.25 m.
+
+Rendered through the real detector, for bumps of 1-5° and 2-15 mm, the error half
+a metre from the tag is:
+
+| tag, distance, height above the table | clean images | poor images |
+|---|---|---|
+| 45 mm, 1.0 m, 50° | about 1 mm | about 1 mm |
+| 45 mm, 1.25 m, 40° | 1-2 mm | 2-3 mm |
+| 45 mm, 1.5 m, 30° | 2-3 mm | 6-7 mm |
+| 45 mm, 1.5 m, 20° | 8-13 mm | 8-11 mm |
+| 70 mm, 1.5 m, 30° | 2-3 mm | 2-3 mm |
+| 70 mm, 1.5 m, 20° | 3-5 mm | 3-5 mm |
+
+Uncorrected, the same bumps are 16-112 mm out. These are renders, not a real ZED,
+so treat them as a best case. The errors quoted in the warning are the fit's own
+estimate and run low on a small tag or a poor image, which is why it says a few
+times that. The thresholds were set on renders too: run `check` a few times on a
+bench as the camera warms up, and if a camera nobody touched reports `MOVED`,
+raise `MOVED_BEARING` and `MOVED_RANGE` in `handeye.py`.
 
 ## What goes wrong quietly
 

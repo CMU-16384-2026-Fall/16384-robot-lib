@@ -68,12 +68,45 @@ up from the camera when the file is read. Deriving it needs
 to turn a point into base coordinates should not need OpenCV installed to do
 it. The five numbers are small, they belong to the calibration that was
 actually performed, and storing them makes the file self-sufficient.
+
+
+When the camera gets knocked
+----------------------------
+
+A bump invalidates `T_base_cam`, and re-measuring it needs a TA, a board and
+the arm. So a small tag taped to the table is recorded alongside the
+calibration (`TagReference`), and `load_handeye` compares what the camera sees
+now against that record. If the tag has moved in the picture, the camera has
+moved, and `T_base_cam @ D` carries on working in the meantime, where `D` is the
+camera's motion since the record -- `fit_camera_shift`.
+
+Two things shape that fit.
+
+It is differential. It never asks where the tag *is*, only how the same four
+corners, seen by the same camera, have moved. Nothing about the tag's printed
+size or the detector's bias on small markers enters, because both are in the
+reference too. The tag's pose in the base frame is never used.
+
+It is told that bumps mostly turn a camera. One small tag measures bearing and
+range well and its own tilt badly: 45 mm of tag at 1.25 m cannot distinguish a
+camera that turned from one that slid sideways along a sphere centred on the
+tag. Left alone, that weak direction is what the noise goes into, and it is
+worth a centimetre or more half a metre from the tag. A weak prior that the
+optical centre stayed put settles it (`SHIFT_SIGMA_T`), and it applies only
+across the line of sight, because range is something the stereo really does
+measure.
+
+So what comes back is a stopgap, accurate near the tag and less so away from
+it, and everything that uses one says so out loud until a TA re-runs the
+calibration. It also cannot tell a camera that moved from a tag that did.
 """
 
+import copy
 import dataclasses
 import json
 import os
 import pathlib
+import sys
 import time
 
 import numpy as np
@@ -108,6 +141,47 @@ INSTALLED_DIR = pathlib.Path(__file__).resolve().parent / "data" / "handeye"
 OUTLIER_KNEE = 2.0
 
 _FORMAT = 1  # of the stored file, in case the fields ever move
+
+# The measurement noise `fit_camera_shift` assumes at the least, after averaging.
+# Scatter measured across the frames raises it. Disparity gets more than a pixel
+# does because the two eyes drift against each other as the camera warms up,
+# which shifts the disparity and leaves the bearing alone.
+SHIFT_SIGMA_PX = 0.1
+SHIFT_SIGMA_DISPARITY = 0.3
+# How far the optical centre is taken to have slid sideways in a bump, in
+# metres. A camera pivoting on a mount 30 cm away moves about 5 mm per degree.
+SHIFT_SIGMA_T = 0.010
+
+# Below these it has not moved: not enough to matter, and small enough that
+# warm-up can do it. Getting this wrong does harm, because a correction applied
+# to a camera that never moved replaces a good calibration with noise.
+#
+# Bearing, where the tag's centre is in the picture, decides it, because it
+# averages four corners and has the whole focal length behind it. Total rotation
+# is no use for this: roll is measured across the width of a small tag, so it is
+# by far the noisiest part, and a still camera on poor images reads up to 0.9
+# degrees. So rotation only counts when it is more than noise can explain, which
+# catches a turn about the line to the tag, the one bump bearing cannot see.
+# Range is loose for the reason given at SHIFT_SIGMA_DISPARITY.
+MOVED_BEARING = 0.1  # degrees
+MOVED_ROTATION = 2.0  # degrees
+MOVED_RANGE = 0.010  # m
+
+# Above these it has not been knocked, it has been repositioned, and the idea
+# that it mostly turned on the spot no longer holds. A residual this large means
+# the four corners no longer form the shape they did, so it is not the same tag
+# or it is not lying flat any more.
+MAX_ROTATION = 10.0  # degrees
+MAX_RANGE = 0.050  # m
+MAX_TAG_RMS_PX = 1.5
+
+# How far from the tag `CameraShift.error_away` is quoted: about the size of the
+# area a student works in.
+ERROR_RADIUS = 0.5  # m
+
+# Warnings already printed by this process, so a loop that calls `load_handeye`
+# prints the same one once.
+_said = set()
 
 
 class HandEyeError(RuntimeError):
@@ -395,6 +469,167 @@ class Observation:
 
     def __len__(self):
         return len(self.ids)
+
+
+@dataclasses.dataclass(frozen=True)
+class TagReference:
+    """What the table tag looked like while the calibration was known good.
+
+    Rectified pixels, in TL TR BR BL order, at `resolution`. `intrinsics` are
+    this resolution's rather than the calibration's, because the two need not
+    match: a calibration may be made in HD, and a tag this small wants 2K.
+    `length` is what the tag was declared to be. It is kept for the record and
+    plays no part in the arithmetic.
+    """
+
+    tag_id: int
+    dictionary: str
+    length: float
+    resolution: str
+    intrinsics: Intrinsics
+    left: tuple
+    right: tuple
+    created: str
+
+    @property
+    def points(self):
+        """The four corners in the camera frame at the time, `(4, 3)` metres."""
+        return self.intrinsics.triangulate(self.left, self.right)
+
+    def to_dict(self):
+        data = dataclasses.asdict(self)
+        data["left"] = np.asarray(self.left).tolist()
+        data["right"] = np.asarray(self.right).tolist()
+        return data
+
+    @classmethod
+    def from_dict(cls, data):
+        fields = {field.name for field in dataclasses.fields(cls)}
+        values = {key: value for key, value in data.items() if key in fields}
+        values["intrinsics"] = Intrinsics.from_dict(data["intrinsics"])
+        return cls(**values)
+
+
+@dataclasses.dataclass(frozen=True)
+class CameraShift:
+    """How far the camera has moved since a `TagReference` was recorded.
+
+    `T_old_new` is the camera's new pose in its old frame, so
+    `T_base_cam @ T_old_new` is the corrected calibration. The two errors are
+    the one-sigma position error the fit expects, at the tag and `ERROR_RADIUS`
+    from it, in metres. They are a floor rather than a promise: corner bias
+    that changes with the view does not show up as scatter, and on renders of a
+    small tag on poor images the real error is two to four times this.
+    """
+
+    T_old_new: list
+    rotation: float  # degrees
+    bearing: float  # degrees, how far the tag's centre has moved in the picture
+    range_change: float  # m, positive for further from the tag
+    rms_px: float  # how well the four corners fit, left eye
+    error_at_tag: float
+    error_away: float
+    measured: str
+
+    @property
+    def moved(self):
+        return (
+            self.bearing > MOVED_BEARING
+            or self.rotation > MOVED_ROTATION
+            or abs(self.range_change) > MOVED_RANGE
+        )
+
+    @property
+    def too_far(self):
+        return (
+            self.rotation > MAX_ROTATION
+            or abs(self.range_change) > MAX_RANGE
+            or self.rms_px > MAX_TAG_RMS_PX
+        )
+
+    def describe(self):
+        return f"{self.rotation:.2f} deg, {self.range_change * 1000:+.0f} mm in range"
+
+    def to_dict(self):
+        return dataclasses.asdict(self)
+
+    @classmethod
+    def from_dict(cls, data):
+        fields = {field.name for field in dataclasses.fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in fields})
+
+
+def fit_camera_shift(reference, left, right, noise_px=0.0):
+    """How the camera has moved, from the tag's corners now. Returns a `CameraShift`.
+
+    `left` and `right` are the four corners in the same order and at the same
+    resolution as the reference. The module docstring has the reasoning; what
+    is fitted is the 6-DOF motion `D` such that the reference corners, seen from
+    the moved camera, land where they are now seen.
+
+    `noise_px` is how uncertain those corners really are, from `capture_tag`. It
+    sets how far the errors reported can be believed, and how much the fit leans
+    on the prior: on a poor image the tag's own tilt deserves less trust.
+    """
+    sigma_px = max(SHIFT_SIGMA_PX, float(noise_px))
+    sigma_disparity = max(SHIFT_SIGMA_DISPARITY, float(noise_px) * np.sqrt(2.0))
+    intrinsics = reference.intrinsics
+    left = np.asarray(left, dtype=float).reshape(4, 2)
+    right = np.asarray(right, dtype=float).reshape(4, 2)
+    points = reference.points
+    seen_disparity = left[:, 0] - right[:, 0]
+
+    centre = points.mean(axis=0)
+    ray = centre / np.linalg.norm(centre)
+    across = np.eye(3) - np.outer(ray, ray)
+    focal_baseline = intrinsics.fx * intrinsics.baseline
+
+    def in_new_camera(x, at):
+        # D^-1 p, with `at` in the old camera frame.
+        return (at - x[3:]) @ Rotation.from_rotvec(x[:3]).as_matrix()
+
+    def corner_error(x):
+        return intrinsics.project(in_new_camera(x, points), "left") - left
+
+    def residuals(x):
+        depth = in_new_camera(x, points)[:, 2]
+        return np.concatenate([
+            corner_error(x).ravel() / sigma_px,
+            (focal_baseline / depth - seen_disparity) / sigma_disparity,
+            across @ x[3:] / SHIFT_SIGMA_T,
+        ])
+
+    result = least_squares(residuals, np.zeros(6), xtol=1e-12, ftol=1e-12)
+    x = result.x
+    covariance = np.linalg.inv(result.jac.T @ result.jac)
+
+    def position_error(c):
+        # D c is about c + w x c + t, so that is what the covariance maps through.
+        skew = np.array(
+            [[0.0, -c[2], c[1]], [c[2], 0.0, -c[0]], [-c[1], c[0], 0.0]]
+        )
+        jacobian = np.hstack([-skew, np.eye(3)])
+        return float(np.sqrt(np.trace(jacobian @ covariance @ jacobian.T)))
+
+    _, _, frame = np.linalg.svd(ray.reshape(1, 3))
+    away = [
+        centre + ERROR_RADIUS * (np.cos(angle) * frame[1] + np.sin(angle) * frame[2])
+        for angle in np.linspace(0.0, 2.0 * np.pi, 8, endpoint=False)
+    ]
+
+    centre_now = in_new_camera(x, centre)
+    return CameraShift(
+        T_old_new=pose(x[:3], x[3:]).tolist(),
+        rotation=float(np.degrees(np.linalg.norm(x[:3]))),
+        bearing=float(np.degrees(np.arccos(np.clip(
+            ray @ centre_now / np.linalg.norm(centre_now), -1.0, 1.0
+        )))),
+        range_change=float(np.linalg.norm(centre_now) - np.linalg.norm(centre)),
+        rms_px=float(np.sqrt(np.mean(np.sum(corner_error(x) ** 2, axis=1)))),
+        error_at_tag=position_error(centre),
+        error_away=max(position_error(c) for c in away),
+        measured=time.strftime("%Y-%m-%dT%H:%M:%S"),
+    )
 
 
 # ----------------------------------------------------------------------
@@ -698,12 +933,19 @@ class HandEye:
     Everything else is here so the file can be audited years later: which
     camera, at what resolution, against which board, from how many poses, and
     how well it fitted.
+
+    `shift` is None for the calibration as filed. When it is set the camera has
+    been knocked, `T_base_cam` is the corrected transform, and
+    `T_base_cam_filed` is what the TA measured.
     """
 
     def __init__(self, T_base_cam, T_flange_board, intrinsics, board, serial=None,
                  resolution=None, station=None, stats=None, created=None,
-                 source=None):
+                 source=None, tag=None):
         self.T_base_cam = _as_pose(T_base_cam, "T_base_cam")
+        self.T_base_cam_filed = self.T_base_cam
+        self.tag = tag
+        self.shift = None
         self.T_flange_board = _as_pose(T_flange_board, "T_flange_board")
         self.intrinsics = intrinsics
         self.board = board
@@ -770,18 +1012,28 @@ class HandEye:
         """
         return self.T_cam_base @ _as_pose(flange_pose, "flange pose") @ self.T_flange_board
 
+    def corrected(self, shift):
+        """A copy for a camera that has moved by `shift` since this was filed."""
+        out = copy.copy(self)
+        out.T_base_cam = self.T_base_cam_filed @ np.asarray(shift.T_old_new)
+        out.shift = shift
+        return out
+
     # ------------------------------------------------------------------
     # Storage
     # ------------------------------------------------------------------
 
     def to_dict(self):
+        # The filed transform even on a corrected copy: a correction is a
+        # stopgap with its own file, and must not be saved as if it were measured.
         return {
             "format": _FORMAT,
             "created": self.created,
             "serial": self.serial,
             "resolution": self.resolution,
             "station": self.station,
-            "T_base_cam": self.T_base_cam.tolist(),
+            "tag": None if self.tag is None else self.tag.to_dict(),
+            "T_base_cam": self.T_base_cam_filed.tolist(),
             "T_flange_board": self.T_flange_board.tolist(),
             "intrinsics": self.intrinsics.to_dict(),
             "board": self.board.to_dict(),
@@ -809,6 +1061,7 @@ class HandEye:
                 stats=data.get("stats"),
                 created=data.get("created"),
                 source=source,
+                tag=TagReference.from_dict(data["tag"]) if data.get("tag") else None,
             )
         except (KeyError, TypeError, ValueError) as error:
             raise HandEyeError(f"calibration is missing or malformed: {error}") from error
@@ -844,9 +1097,10 @@ class HandEye:
         x, y, z = self.camera_position
         rms = self.stats.get("rms_px")
         quality = f" {rms:.2f}px" if rms is not None else ""
+        moved = "" if self.shift is None else " CORRECTED, camera has moved"
         return (
             f"<HandEye {serial} camera at ({x:.3f}, {y:.3f}, {z:.3f}) m"
-            f"{quality}>"
+            f"{quality}{moved}>"
         )
 
 
@@ -871,6 +1125,140 @@ def search_paths(serial):
     return paths
 
 
+def _shift_path(handeye):
+    """Where this account keeps the correction for a knocked camera."""
+    return USER_DIR / f"SN{handeye.serial}.moved.json"
+
+
+def _stored_shift(handeye):
+    """The correction last measured for this calibration, or None.
+
+    Stamped with the calibration and the reference it was measured against, so
+    re-filing either makes it stale rather than wrongly applied.
+    """
+    if handeye.serial is None or handeye.tag is None:
+        return None
+    try:
+        data = json.loads(_shift_path(handeye).read_text())
+        if (
+            data["calibration"] == handeye.created
+            and data["reference"] == handeye.tag.created
+        ):
+            return CameraShift.from_dict(data["shift"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def _store_shift(handeye, shift):
+    """Remember a correction, so a caller that cannot look at the tag can use it.
+
+    A calibration read while something else is streaming the camera cannot
+    check for itself, and would otherwise disagree with the one read a moment
+    earlier. Best-effort: failing to write costs that, not the correction.
+    """
+    path = _shift_path(handeye)
+    try:
+        if shift is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({
+                "calibration": handeye.created,
+                "reference": handeye.tag.created,
+                "shift": shift.to_dict(),
+            }, indent=2) + "\n")
+    except OSError as error:
+        _say(f"could not update {path}: {error}")
+
+
+def _say(text):
+    """Print to stderr, once per process for the same words."""
+    if text not in _said:
+        _said.add(text)
+        print(f"[xarm7_lib] {text}", file=sys.stderr, flush=True)
+
+
+def _warn_moved(handeye, shift):
+    """The message the TA is meant to see. Printed whenever a correction is used."""
+    bar = "=" * 72
+    _say(
+        f"WARNING: THE CAMERA HAS MOVED\n{bar}\n"
+        f"  Camera SN{handeye.serial} is not where it was when it was calibrated "
+        f"on {handeye.created}.\n"
+        f"  Measured from the table tag at {shift.measured}: moved "
+        f"{shift.describe()}.\n\n"
+        "  Students: you can keep working. This run uses a corrected transform.\n"
+        f"  Expect errors of roughly {shift.error_at_tag * 1000:.0f} mm near the tag "
+        f"and {shift.error_away * 1000:.0f} mm {ERROR_RADIUS:.1f} m away\n"
+        "  from it, and possibly a few times that.\n\n"
+        "  TA: please redo the hand-eye calibration on this bench:\n"
+        "      python -m xarm7_lib.calibrate_handeye run\n"
+        "  If it was the tag that got moved rather than the camera, this\n"
+        "  correction is wrong and the calibration still needs redoing.\n"
+        f"{bar}"
+    )
+
+
+def _with_recovery(handeye, look):
+    """Apply whatever the table tag says about the filed calibration.
+
+    Args:
+        handeye: as filed.
+        look: whether to open the camera and check now. Otherwise, and when
+            looking fails, this falls back on the last correction measured.
+    """
+    if handeye.tag is None:
+        return handeye
+
+    if look:
+        # Whatever goes wrong while looking, the caller asked for a calibration
+        # and the filed one is still the best thing there is to give them.
+        reason = None
+        try:
+            from .tag_recovery import look_for_tag
+
+            sighting = look_for_tag(handeye.tag, handeye.serial)
+            if sighting is None:
+                reason = (
+                    f"table tag {handeye.tag.tag_id} is not in view, so nothing "
+                    "confirms the camera is still where it was calibrated. If "
+                    "the arm or something on the table is covering it, ignore "
+                    "this; if not, ask a TA."
+                )
+        except Exception as error:
+            reason = (
+                "could not check the camera against the table tag, so nothing "
+                f"confirms it is still where it was calibrated. ({error})"
+            )
+        if reason is not None:
+            _say(reason)
+        else:
+            shift = fit_camera_shift(handeye.tag, *sighting)
+            if shift.too_far:
+                raise HandEyeError(
+                    f"camera SN{handeye.serial} has moved too far to correct "
+                    f"({shift.describe()}, tag fits to {shift.rms_px:.1f} px). "
+                    "It looks repositioned rather than knocked, or the tag has "
+                    "been moved, and a transform corrected from this could send "
+                    "the arm somewhere badly wrong. Ask a TA to redo the "
+                    "calibration: python -m xarm7_lib.calibrate_handeye run"
+                )
+            if shift.moved:
+                _store_shift(handeye, shift)
+                _warn_moved(handeye, shift)
+                return handeye.corrected(shift)
+            # Back where it belongs, which is also how a stale one gets cleared.
+            _store_shift(handeye, None)
+            return handeye
+
+    shift = _stored_shift(handeye)
+    if shift is None:
+        return handeye
+    _warn_moved(handeye, shift)
+    return handeye.corrected(shift)
+
+
 def load_handeye(serial=None):
     """This bench's camera-to-base calibration.
 
@@ -889,6 +1277,14 @@ def load_handeye(serial=None):
     `calibrate_handeye run` writes by default, before a `sudo mv` promotes it
     into the installation.
 
+    If the bench has a table tag recorded (`calibrate_handeye tag`), a call with
+    no arguments also opens the camera for about a second and checks it has not
+    moved. If it has, this returns a corrected calibration and prints a warning
+    for a TA. So call it before opening the camera yourself: only one thing can
+    have the camera open at a time. A call naming a `serial`, or one using
+    `$XARM7_HANDEYE`, never opens the camera. It uses the last correction
+    measured by this account, if there is one.
+
     Args:
         serial: Which camera's calibration. Read from the attached camera when
             omitted -- which needs the native shim, so pass it explicitly on a
@@ -896,7 +1292,12 @@ def load_handeye(serial=None):
 
     Returns:
         A `HandEye`.
+
+    Raises:
+        HandEyeError: There is no calibration, or the camera has moved too far
+            for the tag to correct.
     """
+    look = serial is None
     if serial is None:
         # `$XARM7_HANDEYE` names a file outright, so it needs no serial and so
         # no camera. Checked before anything is probed, because the point of it
@@ -906,7 +1307,7 @@ def load_handeye(serial=None):
         if override:
             path = pathlib.Path(override).expanduser()
             if path.is_file():
-                return HandEye.load(path)
+                return _with_recovery(HandEye.load(path), look=False)
 
         # Imported here and not at the top of the module: finding the attached
         # camera needs OpenCV and the shim, and loading a calibration for a
@@ -939,6 +1340,15 @@ def load_handeye(serial=None):
                 "on the camera's back panel."
             )
 
+    return _with_recovery(find_filed(serial), look=look)
+
+
+def find_filed(serial):
+    """A camera's calibration exactly as filed, with no tag and no correction.
+
+    For the tools that measure against the filed transform; a student wants
+    `load_handeye`.
+    """
     serial = str(serial)
     paths = search_paths(serial)
     for path in paths:

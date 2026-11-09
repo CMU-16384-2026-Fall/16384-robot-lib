@@ -18,6 +18,8 @@ src/xarm7_lib/data/handeye/
 # Output of `python -m xarm7_lib.calibrate_handeye board`, regenerable and
 # sized for a particular printer.
 charuco_board.*
+reference_tag.*
 
 # Scratch output from the calibration and detection tools.
 debug/
+docs/

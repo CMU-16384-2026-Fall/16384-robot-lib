@@ -6,6 +6,10 @@
     python -m xarm7_lib.calibrate_handeye verify         # check a filed one, live
     python -m xarm7_lib.calibrate_handeye self-test      # the solver, no hardware
 
+    python -m xarm7_lib.calibrate_handeye tag            # the tag to fix to the table
+    python -m xarm7_lib.calibrate_handeye register-tag   # record it for a filed calibration
+    python -m xarm7_lib.calibrate_handeye check          # has the camera moved?
+
 A ChArUco board goes on the gripper. The arm takes it through a spread of
 poses, the fixed camera watches, and `handeye.solve`/`handeye.refine` recover
 two transforms at once: where the camera is in the base frame, and where the
@@ -60,6 +64,7 @@ deliberately rotates the wrist about all three of its axes in turn, and
 """
 
 import argparse
+import json
 import os
 import pathlib
 import shlex
@@ -72,6 +77,7 @@ import cv2
 import numpy as np
 
 from .handeye import (
+    ERROR_RADIUS,
     INSTALLED_DIR,
     USER_DIR,
     BoardSpec,
@@ -79,7 +85,10 @@ from .handeye import (
     HandEyeError,
     Intrinsics,
     Observation,
+    TagReference,
+    find_filed,
     fit_board_pose,
+    fit_camera_shift,
     filename,
     invert,
     leave_one_out,
@@ -89,6 +98,15 @@ from .handeye import (
     reprojection_errors,
     rotation_angle,
     solve,
+)
+from .tag_recovery import (
+    TAG_DICTIONARY,
+    TAG_ID,
+    TAG_LENGTH,
+    TAG_RESOLUTION,
+    aruco_dictionary,
+    capture_tag,
+    record_reference,
 )
 
 # The model the forward kinematics comes from, and the two frames taken off it.
@@ -153,6 +171,11 @@ DEFAULT_BOARD = BoardSpec(
 )
 DEFAULT_DPI = 600
 DEFAULT_MARGIN = 10.0  # mm of white around the printed board
+DEFAULT_TAG_MARGIN = 20.0  # mm around the table tag, which also holds its caption
+# Under this the corners stop being findable to the precision recovery relies on.
+# On renders, 45 mm at 1.5 m is 24 px and fine at 30 degrees above the table, and
+# 14 px and three times worse at 20 degrees.
+MIN_TAG_SIDE_PX = 20
 
 
 # ----------------------------------------------------------------------
@@ -282,21 +305,6 @@ def check_kinematics(kinematics, arm, tolerance=FK_TOLERANCE):
 # ----------------------------------------------------------------------
 # The board
 # ----------------------------------------------------------------------
-
-
-def aruco_dictionary(name):
-    """One of OpenCV's predefined dictionaries, by name."""
-    code = getattr(cv2.aruco, name, None)
-    if not isinstance(code, int):
-        available = sorted(
-            attribute
-            for attribute in dir(cv2.aruco)
-            if attribute.startswith("DICT_")
-        )
-        raise HandEyeError(
-            f"unknown ArUco dictionary {name!r}. Available: {', '.join(available)}"
-        )
-    return cv2.aruco.getPredefinedDictionary(code)
 
 
 def charuco_board(spec):
@@ -1267,6 +1275,74 @@ def cmd_run(args):
         print("  --dry-run: nothing written.")
         return 0
 
+    handeye.tag = _reference_after_run(args)
+    return _file(handeye, args)
+
+
+def _reference_after_run(args):
+    """Record the table tag for a calibration just measured, if it can be seen.
+
+    Done here because this is the moment the calibration is known good. Nothing
+    that goes wrong with it may cost the calibration just measured.
+    """
+    print(f"\nlooking for table tag {TAG_ID}...")
+    try:
+        with _open_tag_camera(args) as camera:
+            reference = record_reference(camera, length=args.tag_length / 1000.0)
+    except Exception as error:
+        print(f"  ! could not look for it: {error}")
+        reference = None
+    if reference is None:
+        print(
+            "  ! no table tag recorded, so a knocked camera on this bench will not "
+            "be noticed\n    or recovered from. If there is a tag and the arm is "
+            "in front of it, move the arm\n    and run `register-tag`. If there "
+            "is none, the `tag` command prints one."
+        )
+    else:
+        _report_reference(reference)
+    return reference
+
+
+def _open_tag_camera(args):
+    from .camera import ZedOpenCapture
+
+    return ZedOpenCapture(resolution=TAG_RESOLUTION, serial=args.serial)
+
+
+def _report_reference(reference):
+    """Say what was recorded, and whether it looks like the tag that was printed."""
+    corners = reference.points
+    edge = float(
+        np.mean(np.linalg.norm(corners - np.roll(corners, 1, axis=0), axis=1))
+    )
+    centre = corners.mean(axis=0)
+    # The shortest side, because lying flat foreshortens one way, and that way
+    # decides how well the corners can be found.
+    side_px = float(np.min(np.linalg.norm(
+        np.asarray(reference.left) - np.roll(reference.left, 1, axis=0), axis=1
+    )))
+    print(
+        f"  table tag {reference.tag_id} recorded at {reference.resolution}: "
+        f"{np.linalg.norm(centre):.2f} m away, {side_px:.0f} px on its shortest side"
+    )
+    if abs(edge - reference.length) > 0.1 * reference.length:
+        print(
+            f"  ! it measures {edge * 1000:.1f} mm across, not the "
+            f"{reference.length * 1000:.1f} mm declared. Recovery does not depend "
+            "on the size, but\n    check this is the tag you meant."
+        )
+    if side_px < MIN_TAG_SIDE_PX:
+        print(
+            "  ! that is small enough to be unreliable. Move the tag closer to "
+            "the camera, prop\n    it up to face the camera rather than lying "
+            "flat, or print a bigger one with\n    `tag --length 70`."
+        )
+
+
+def _file(handeye, args):
+    """Write a calibration where it belongs, and say what to do next."""
+    serial = handeye.serial
     destination = _destination(args, serial)
     try:
         written = handeye.save(destination)
@@ -1428,6 +1504,183 @@ def cmd_verify(args):
 
 
 # ----------------------------------------------------------------------
+# The table tag
+# ----------------------------------------------------------------------
+
+
+def tag_image(tag_id=TAG_ID, length=TAG_LENGTH, dictionary=TAG_DICTIONARY,
+              dpi=DEFAULT_DPI, margin=DEFAULT_TAG_MARGIN):
+    """Render the tag for printing. Reports `(image, dpi)`, as `board_image` does.
+
+    The margin is part of the tag: the detector needs white around the black
+    square to find it, so it is not to be trimmed off. Six cells across, with
+    the border, and a whole number of pixels per cell so that every edge is sharp.
+    """
+    marker = aruco_dictionary(dictionary)
+    cells = marker.markerSize + 2
+    cell_px = max(1, int(round(length / cells * dpi / 0.0254)))
+    side = cells * cell_px
+    dpi = side / length * 0.0254
+    # Room for the quiet zone and the caption below it, which grows with the tag.
+    pad = max(int(round(margin / 1000.0 * dpi / 0.0254)), int(np.ceil(2.7 * cell_px)))
+
+    canvas = np.full((side + 2 * pad, side + 2 * pad), 255, dtype=np.uint8)
+    canvas[pad:pad + side, pad:pad + side] = cv2.aruco.generateImageMarker(
+        marker, tag_id, side, borderBits=1
+    )
+
+    # In the margin, and clear of the one cell of white the detector needs around
+    # the square. Sized by the stroke it will really be drawn with, which widens
+    # the text, and shrunk until the longer line fits inside the page.
+    lines = [
+        f"id {tag_id}  {dictionary}  {length * 1000:.1f} mm",
+        "FIXED - DO NOT MOVE",
+    ]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    room = int(0.9 * canvas.shape[1])
+    scale = cv2.getFontScaleFromHeight(font, int(0.16 * pad), 1)
+    while True:
+        thickness = max(1, int(round(scale * 1.5)))
+        sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
+        if max(width for width, _ in sizes) <= room:
+            break
+        scale *= 0.95
+    y = pad + side + cell_px + int(0.2 * pad)
+    for line, (width, height) in zip(lines, sizes):
+        cv2.putText(
+            canvas, line, ((canvas.shape[1] - width) // 2, y),
+            font, scale, 0, thickness, cv2.LINE_AA,
+        )
+        y += int(1.6 * height)
+    return canvas, dpi
+
+
+def cmd_tag(args):
+    length = args.length / 1000.0
+    image, dpi = tag_image(args.id, length, args.dict, args.dpi, args.margin)
+
+    output = pathlib.Path(args.output)
+    if output.suffix.lower() == ".pdf":
+        write_board_pdf(output, image, dpi)
+    else:
+        write_board_png(output, image, dpi)
+
+    print(f"wrote {output}  ({image.shape[1]}x{image.shape[0]} px at {dpi:.0f} dpi)")
+    print(f"  id {args.id}, {args.dict}, black square {args.length:.1f} mm")
+    print(
+        "\nPrint it at 100%, and fix it to the table so that it cannot shift "
+        "or lift:\n"
+        "  - flat, and not on anything that gets moved. If it moves, the camera "
+        "looks like it\n    moved, and the correction is wrong without anything "
+        "saying so.\n"
+        "  - keep the white margin. The detector needs it.\n"
+        "  - as near the middle of where students work as you can without the "
+        "arm covering it.\n    The correction is good near the tag and gets "
+        "worse with distance from it.\n"
+        "  - as face-on to the camera as you can manage. 45 mm suits about 1.25 m; "
+        "beyond that,\n    print it with --length 70.\n"
+        "\nThen record it: `run` does it at the end of a calibration, and "
+        "`register-tag` adds it\nto a calibration already filed."
+    )
+    return 0
+
+
+def cmd_register_tag(args):
+    """Add the table tag to a calibration already filed."""
+    with _open_tag_camera(args) as camera:
+        serial = camera.serial or args.serial
+        if serial is None:
+            raise HandEyeError(
+                "the camera's serial number could not be read, and it is what "
+                "the calibration is filed under. Pass --serial."
+            )
+        handeye = find_filed(serial)
+        print(f"{handeye!r}")
+        print(f"  from {handeye.source}, measured {handeye.created}")
+        print(f"recording tag {args.id} at {TAG_RESOLUTION}...")
+        reference = record_reference(
+            camera, args.id, args.dict, args.length / 1000.0
+        )
+    if reference is None:
+        raise HandEyeError(
+            f"tag {args.id} ({args.dict}) was not seen steadily in both eyes. "
+            "Check it is in view, in the light, and clear of the arm."
+        )
+    _report_reference(reference)
+
+    # Recording a new reference is how "the camera has moved" gets forgotten, so
+    # it should not happen by accident on a camera that already has.
+    if handeye.tag is not None and handeye.tag.tag_id == reference.tag_id and (
+        handeye.tag.resolution == reference.resolution
+    ):
+        shift = fit_camera_shift(handeye.tag, reference.left, reference.right)
+        if shift.moved and not args.force:
+            raise HandEyeError(
+                f"the camera has moved {shift.describe()} since the reference "
+                f"already filed here ({handeye.tag.created}), so this calibration "
+                "is no longer good and recording a new reference would hide that. "
+                "Redo the calibration with `run`, which records the tag as well. "
+                "If it was the tag that was moved and the camera is known to be "
+                "where it was, --force does it anyway."
+            )
+
+    print(
+        "\nThis vouches for the calibration as it stands: from here on, the "
+        "camera being where\nit is now is what counts as it not having moved. "
+        "If it may have been knocked since it\nwas calibrated, run `verify` first."
+    )
+    handeye.tag = reference
+    return _file(handeye, args)
+
+
+def cmd_check(args):
+    """Say whether the camera has moved. Changes nothing."""
+    with _open_tag_camera(args) as camera:
+        serial = camera.serial or args.serial
+        if serial is None:
+            raise HandEyeError(
+                "the camera's serial number could not be read. Pass --serial."
+            )
+        handeye = find_filed(serial)
+        reference = handeye.tag
+        print(f"{handeye!r}")
+        print(f"  from {handeye.source}, measured {handeye.created}")
+        if reference is None:
+            raise HandEyeError(
+                "this calibration has no table tag recorded, so there is nothing "
+                "to compare against. `register-tag` adds one."
+            )
+        if reference.resolution != camera.resolution:
+            raise HandEyeError(
+                f"the tag was recorded at {reference.resolution} and this library "
+                f"now reads it at {camera.resolution}. Run `register-tag` again."
+            )
+        sighting = capture_tag(camera, reference.tag_id, reference.dictionary)
+    if sighting is None:
+        print(f"\ntag {reference.tag_id} is not in view: nothing can be said.")
+        return 1
+
+    shift = fit_camera_shift(reference, *sighting)
+    print(f"\n  compared with the reference from {reference.created}")
+    print(f"    tag moved      {shift.bearing:.3f} deg in the picture")
+    print(f"    rotated        {shift.rotation:.3f} deg")
+    print(f"    range changed  {shift.range_change * 1000:+.1f} mm")
+    print(f"    corners fit    {shift.rms_px:.2f} px")
+    print(
+        f"    a correction would be good to about {shift.error_at_tag * 1000:.1f} mm "
+        f"at the tag and\n    {shift.error_away * 1000:.1f} mm "
+        f"{ERROR_RADIUS:.1f} m from it"
+    )
+    if shift.too_far:
+        print("\n  MOVED TOO FAR TO CORRECT: load_handeye() will refuse. Recalibrate.")
+    elif shift.moved:
+        print("\n  MOVED: load_handeye() will correct for it and warn. Recalibrate.")
+    else:
+        print("\n  not moved")
+    return 1 if shift.moved or shift.too_far else 0
+
+
+# ----------------------------------------------------------------------
 # self-test
 # ----------------------------------------------------------------------
 
@@ -1445,6 +1698,75 @@ def _look_at(position, target):
     down = down - np.dot(down, forward) * forward
     down /= np.linalg.norm(down)
     return pose(np.stack([np.cross(down, forward), down, forward], axis=1), position)
+
+
+def _self_test_recovery(rng):
+    """A knocked camera with a known answer. Returns a list of what went wrong.
+
+    Corrects a calibration for a bump and checks that a point away from the tag
+    still lands where it really is, so a shift composed the wrong way round, or
+    applied in the wrong frame, misses by centimetres.
+    """
+    intrinsics = Intrinsics(fx=1400.0, fy=1400.0, cx=1104.0, cy=621.0, baseline=0.12)
+    half = TAG_LENGTH / 2
+    # Tag frame to camera: 1.25 m out and leaning away by about 40 degrees.
+    T_cam_tag = pose([np.radians(130.0), 0.0, 0.0], [0.05, -0.08, 1.25])
+    corners = np.array(
+        [[-half, half, 0], [half, half, 0], [half, -half, 0], [-half, -half, 0.0]]
+    )
+    corners = corners @ T_cam_tag[:3, :3].T + T_cam_tag[:3, 3]
+
+    def noisy(points, eye):
+        return intrinsics.project(points, eye) + rng.normal(0, 0.03, (4, 2))
+
+    reference = TagReference(
+        tag_id=TAG_ID,
+        dictionary=TAG_DICTIONARY,
+        length=TAG_LENGTH,
+        resolution=TAG_RESOLUTION,
+        intrinsics=intrinsics,
+        left=noisy(corners, "left").tolist(),
+        right=noisy(corners, "right").tolist(),
+        created="self-test",
+    )
+    T_base_cam = _look_at([1.0, -0.7, 0.8], [0.4, 0.0, 0.0])
+    handeye = HandEye(
+        T_base_cam, np.eye(4), intrinsics, DEFAULT_BOARD, serial="selftest",
+        tag=reference,
+    )
+
+    failures = []
+    still = fit_camera_shift(
+        reference, noisy(corners, "left"), noisy(corners, "right")
+    )
+    if still.moved:
+        failures.append(f"recovery saw a still camera move {still.describe()}")
+
+    # The camera turned 2 degrees and slid 3 mm.
+    bump = pose([0.02, -0.025, 0.01], [0.002, 0.001, -0.002])
+    now = (corners - bump[:3, 3]) @ bump[:3, :3]
+    shift = fit_camera_shift(reference, noisy(now, "left"), noisy(now, "right"))
+    if not shift.moved:
+        failures.append(f"recovery missed a bump, measuring only {shift.describe()}")
+
+    near = T_cam_tag[:3, 3] + np.array([0.15, 0.1, 0.0])
+    seen_now = (near - bump[:3, 3]) @ bump[:3, :3]
+    truth = T_base_cam[:3, :3] @ near + T_base_cam[:3, 3]
+    corrected = handeye.corrected(shift).points_to_base(seen_now)[0]
+    uncorrected = handeye.points_to_base(seen_now)[0]
+    error = 1000 * np.linalg.norm(corrected - truth)
+    before = 1000 * np.linalg.norm(uncorrected - truth)
+    print(
+        f"\nrecovery: a 2 deg bump is {before:.1f} mm wrong uncorrected, "
+        f"{error:.1f} mm corrected"
+    )
+    if error > 3.0:
+        failures.append(f"recovery is {error:.1f} mm off after correcting a bump")
+
+    back = HandEye.from_dict(json.loads(json.dumps(handeye.corrected(shift).to_dict())))
+    if back.shift is not None or np.abs(back.T_base_cam - T_base_cam).max() > 1e-9:
+        failures.append("saving a corrected calibration did not save the filed one")
+    return failures
 
 
 def cmd_self_test(args):
@@ -1550,7 +1872,7 @@ def cmd_self_test(args):
         reloaded.points_to_camera(reloaded.points_to_base(probe)) - probe
     ).max()
 
-    failures = []
+    failures = _self_test_recovery(rng)
     if camera_rotation > args.max_rotation:
         failures.append(
             f"camera rotation off by {camera_rotation:.4f}°, allowed {args.max_rotation}"
@@ -1684,6 +2006,44 @@ def _add_hardware_arguments(parser):
     )
 
 
+def _add_destination_arguments(parser):
+    where = parser.add_argument_group("where the result goes")
+    where.add_argument("-o", "--output", help="write here instead")
+    where.add_argument(
+        "--user",
+        action="store_true",
+        help=f"write under {USER_DIR} — the default, and already implied",
+    )
+    where.add_argument(
+        "--system",
+        action="store_true",
+        help=(
+            f"write straight into the installation ({INSTALLED_DIR}) instead, "
+            "which needs write access to it"
+        ),
+    )
+    return where
+
+
+def _add_tag_identity_arguments(parser):
+    group = parser.add_argument_group("the table tag")
+    group.add_argument(
+        "--id", type=int, default=TAG_ID, help=f"marker id (default {TAG_ID})"
+    )
+    group.add_argument(
+        "--length",
+        type=float,
+        default=TAG_LENGTH * 1000,
+        metavar="MM",
+        help=f"side of the black square (default {TAG_LENGTH * 1000:g})",
+    )
+    group.add_argument(
+        "--dict",
+        default=TAG_DICTIONARY,
+        help=f"ArUco dictionary (default {TAG_DICTIONARY})",
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="python -m xarm7_lib.calibrate_handeye",
@@ -1776,25 +2136,21 @@ def build_parser():
         action="store_true",
         help="skip the refit-per-dropped-pose check, which is the slow part",
     )
-    where = run.add_argument_group("where the result goes")
+    run.add_argument(
+        "--tag-length",
+        type=float,
+        default=TAG_LENGTH * 1000,
+        metavar="MM",
+        help=(
+            "side of the table tag recorded at the end, if it is not the default "
+            f"{TAG_LENGTH * 1000:g}. Only a check that it is the tag you meant"
+        ),
+    )
+    where = _add_destination_arguments(run)
     where.add_argument(
         "--dry-run",
         action="store_true",
         help="solve and report, write nothing — the right first run on a bench",
-    )
-    where.add_argument("-o", "--output", help="write here instead")
-    where.add_argument(
-        "--user",
-        action="store_true",
-        help=f"write under {USER_DIR} — the default, and already implied",
-    )
-    where.add_argument(
-        "--system",
-        action="store_true",
-        help=(
-            f"write straight into the installation ({INSTALLED_DIR}) instead, "
-            "which needs write access to it"
-        ),
     )
     where.add_argument("--station", help="a label for this bench, stored with the result")
     run.set_defaults(handler=cmd_run)
@@ -1813,6 +2169,54 @@ def build_parser():
         "--period", type=float, default=0.5, help="seconds between readings"
     )
     verify.set_defaults(handler=cmd_verify)
+
+    tag = commands.add_parser(
+        "tag",
+        help="write the tag to print and fix to the table",
+        description=(
+            "Render the table tag at exact scale. With it recorded, load_handeye() "
+            "notices a knocked camera, corrects for it, and warns."
+        ),
+    )
+    _add_tag_identity_arguments(tag)
+    tag.add_argument(
+        "-o", "--output", default="reference_tag.pdf",
+        help="where to write it. A .pdf is a page at exact scale, which is what to print",
+    )
+    tag.add_argument(
+        "--dpi", type=int, default=DEFAULT_DPI, help=f"print resolution (default {DEFAULT_DPI})"
+    )
+    tag.add_argument(
+        "--margin", type=float, default=DEFAULT_TAG_MARGIN, metavar="MM",
+        help=f"white border in mm, which the detector needs (default {DEFAULT_TAG_MARGIN:.0f})",
+    )
+    tag.set_defaults(handler=cmd_tag)
+
+    register = commands.add_parser(
+        "register-tag",
+        help="record the table tag for a calibration already filed",
+        description=(
+            "`run` does this itself. This is for a calibration filed before the "
+            "tag existed, or one whose tag has been replaced."
+        ),
+    )
+    _add_tag_identity_arguments(register)
+    register.add_argument("--serial", help="which camera, if several are attached")
+    register.add_argument(
+        "--force",
+        action="store_true",
+        help="record it even though the existing reference says the camera has moved",
+    )
+    _add_destination_arguments(register)
+    register.set_defaults(handler=cmd_register_tag)
+
+    check = commands.add_parser(
+        "check",
+        help="say whether the camera has moved since the tag was recorded",
+        description="Compare the table tag with its reference. Writes nothing.",
+    )
+    check.add_argument("--serial", help="which camera, if several are attached")
+    check.set_defaults(handler=cmd_check)
 
     self_test = commands.add_parser(
         "self-test",
