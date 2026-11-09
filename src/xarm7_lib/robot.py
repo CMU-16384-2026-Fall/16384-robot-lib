@@ -48,8 +48,8 @@ class Robot(RobotInterface):
             self.robot = RealXArm7(ip, gripper=gripper, **safety)
             if visualize:
                 self._mirror = RobotMirror(
-                    self.robot, guard=self.robot.guard, zmq_url=zmq_url,
-                    open_browser=open_browser
+                    self.robot, guard=self.robot.guard, gripper=gripper,
+                    zmq_url=zmq_url, open_browser=open_browser
                 )
         else:
             self.robot = SimulatedXArm7(

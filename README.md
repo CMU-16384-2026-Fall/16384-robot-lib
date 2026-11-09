@@ -402,17 +402,9 @@ warning for a TA:
 ```
 [xarm7_lib] WARNING: THE CAMERA HAS MOVED
 ========================================================================
-  Camera SN12345 is not where it was when it was calibrated on 2026-11-02T14:03:11.
-  Measured from the table tag at 2026-11-05T15:34:34: moved 1.96 deg, -2 mm in range.
-
-  Students: you can keep working. This run uses a corrected transform.
-  Expect errors of roughly 1 mm near the tag and 2 mm 0.5 m away
-  from it, and possibly a few times that.
-
-  TA: please redo the hand-eye calibration on this bench:
-      python -m xarm7_lib.calibrate_handeye run
-  If it was the tag that got moved rather than the camera, this
-  correction is wrong and the calibration still needs redoing.
+  Camera has moved since its last calibration.
+  Measured from the table tag, 1.96 deg -2 mm.
+  You may keep working, but let a TA know to recalibrate bench3.
 ========================================================================
 ```
 

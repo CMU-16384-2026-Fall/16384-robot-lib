@@ -110,6 +110,10 @@ class RobotMirror:
     it: it is the pass that fills `geom_xpos`/`geom_xmat`, which is all the
     visualizer reads. `mj_forward` would also run collision, passive forces and
     actuation, thirty times a second, for nothing.
+
+    `gripper` draws the MJCF's gripper on the flange, at rest with its jaws
+    open. Its opening is not mirrored: on the real arm reading it is a modbus
+    round trip to the gripper, too slow to make thirty times a second.
     """
 
     def __init__(self, source, guard=None, mjcf_path=None, gripper=False,

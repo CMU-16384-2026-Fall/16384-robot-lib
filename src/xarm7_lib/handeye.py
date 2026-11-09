@@ -106,6 +106,7 @@ import dataclasses
 import json
 import os
 import pathlib
+import socket
 import sys
 import time
 
@@ -1118,18 +1119,11 @@ def warn_moved(handeye, shift):
     bar = "=" * 72
     print(
         f"[xarm7_lib] WARNING: THE CAMERA HAS MOVED\n{bar}\n"
-        f"  Camera SN{handeye.serial} is not where it was when it was calibrated "
-        f"on {handeye.created}.\n"
-        f"  Measured from the table tag at {shift.measured}: moved "
-        f"{shift.describe()}.\n\n"
-        "  Students: you can keep working. This run uses a corrected transform.\n"
-        f"  Expect errors of roughly {shift.error_at_tag * 1000:.0f} mm near the tag "
-        f"and {shift.error_away * 1000:.0f} mm {ERROR_RADIUS:.1f} m away\n"
-        "  from it, and possibly a few times that.\n\n"
-        "  TA: please redo the hand-eye calibration on this bench:\n"
-        "      python -m xarm7_lib.calibrate_handeye run\n"
-        "  If it was the tag that got moved rather than the camera, this\n"
-        "  correction is wrong and the calibration still needs redoing.\n"
+        "  Camera has moved since its last calibration.\n"
+        f"  Measured from the table tag, {shift.rotation:.2f} deg "
+        f"{shift.range_change * 1000:+.0f} mm.\n"
+        "  You may keep working, but let a TA know to recalibrate "
+        f"{socket.gethostname().split('.')[0]}.\n"
         f"{bar}",
         file=sys.stderr,
         flush=True,
