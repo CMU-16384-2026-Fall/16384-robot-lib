@@ -142,6 +142,16 @@ DEFAULT_SPEED = 0.25  # rad/s between poses; no hurry, and it keeps the board st
 # A corner has to turn up in this fraction of the frames, in both eyes, to be
 # used. A corner that flickers is one the detector is unsure about.
 FRAME_QUORUM = 0.6
+# A frame's sighting of a corner only counts if it lands this close to the
+# median of that corner's sightings. The detector occasionally puts a corner
+# somewhere else entirely for a frame or two, and a plain mean blends that in:
+# on a real bench, a handful of such frames moved corners by 100 px and made
+# one pose's board triangulate at three times its size.
+CORNER_AGREEMENT_PX = 1.0
+# How badly the triangulated corners may miss the board's known geometry before
+# a pose is thrown away. A sound pose fits to well under a millimetre at bench
+# distances; this allows for a board further off, where stereo depth is noisier.
+MAX_BOARD_FIT = 0.003  # m
 # Below this many corners a pose is not worth keeping: the stereo fit that
 # starts the solver off needs a good spread across the board, not three
 # corners in one row.
@@ -320,30 +330,63 @@ def _average_detections(detector, frames):
     Returns `{id: (u, v)}` per eye. Averaging is worth the frames it costs: the
     detector's sub-pixel refinement still scatters by a few tenths of a pixel
     frame to frame, and that scatter is what the final accuracy is made of.
+
+    Only the sightings that agree with the corner's median are averaged, and a
+    corner needs a quorum of those, not merely of sightings. A corner the
+    detector put in two places is one it is unsure of, and dropping it costs
+    one corner where blending it can cost the whole calibration.
     """
     seen = ({}, {})
+    per_frame = []  # DEBUG (temporary)
     for left, right in frames:
+        found = []
         for eye, image in enumerate((left, right)):
             ids, corners = detector.detect(image)
+            found += [ids, corners]
             for corner_id, corner in zip(ids, corners):
                 seen[eye].setdefault(int(corner_id), []).append(corner)
+        per_frame.append(found)
+    if _DEBUG is not None:  # DEBUG (temporary)
+        _DEBUG.frames = per_frame
 
     quorum = max(1, int(round(FRAME_QUORUM * len(frames))))
-    return tuple(
-        {
-            corner_id: np.mean(points, axis=0)
-            for corner_id, points in eye.items()
-            if len(points) >= quorum
-        }
-        for eye in seen
-    )
+    averaged = ({}, {})
+    for eye, out in zip(seen, averaged):
+        for corner_id, points in eye.items():
+            points = np.asarray(points)
+            agree = points[
+                np.linalg.norm(points - np.median(points, axis=0), axis=1)
+                <= CORNER_AGREEMENT_PX
+            ]
+            if len(agree) >= quorum:
+                out[corner_id] = agree.mean(axis=0)
+    return averaged
 
 
-def observe(camera, detector, flange, frames=DEFAULT_FRAMES, preview=None, note=()):
+def board_fit_error(observation, intrinsics, object_points):
+    """How far the triangulated corners are from the board's own shape, RMS metres.
+
+    The one check on a pose that needs no calibration: whatever the camera's
+    pose, the corners seen in both eyes have to triangulate into the board that
+    was printed. Corners matched to the wrong ids do not, and a pose built on
+    them pulls the closed-form solve far enough off that the refinement can
+    leave the board behind the camera.
+    """
+    measured = intrinsics.triangulate(observation.left, observation.right)
+    board = fit_board_pose(observation, intrinsics, object_points)
+    known = np.asarray(object_points, dtype=float)[observation.ids]
+    fitted = known @ board[:3, :3].T + board[:3, 3]
+    return float(np.sqrt(np.mean(np.sum((measured - fitted) ** 2, axis=1))))
+
+
+def observe(camera, detector, flange, frames=DEFAULT_FRAMES, preview=None, note=(),
+            intrinsics=None):
     """Look at the board from where the arm is now. Returns an `Observation` or None.
 
     None, with a reason printed, when the board is not usably in view -- which
-    is an ordinary outcome for a generated pose, not an error.
+    is an ordinary outcome for a generated pose, not an error. With
+    `intrinsics`, also None when the corners do not triangulate into the board
+    (see `board_fit_error`).
 
     With a `preview`, the averaged detections are drawn on the last frame
     grabbed, including the ones only one eye saw. A pose that fails is drawn
@@ -355,6 +398,29 @@ def observe(camera, detector, flange, frames=DEFAULT_FRAMES, preview=None, note=
     left, right = _average_detections(detector, grabbed)
 
     shared = sorted(set(left) & set(right))
+    observation, problem = None, None
+    if len(shared) < MIN_CORNERS:
+        problem = (
+            f"{len(shared)} corners in both eyes "
+            f"({len(left)} left, {len(right)} right), need {MIN_CORNERS}"
+        )
+    else:
+        observation = Observation(
+            flange=flange,
+            ids=np.asarray(shared, dtype=int),
+            left=np.array([left[i] for i in shared]),
+            right=np.array([right[i] for i in shared]),
+        )
+        if intrinsics is not None:
+            error = board_fit_error(observation, intrinsics, detector.object_points)
+            if error > MAX_BOARD_FIT:
+                problem = (
+                    f"the corners triangulate {error * 1000:.1f} mm off the "
+                    f"board's shape (allowed {MAX_BOARD_FIT * 1000:.0f} mm), so "
+                    "some are matched to the wrong ids"
+                )
+                observation = None
+
     if preview is not None:
         lonely = sorted(set(left) - set(right))
         preview.show(
@@ -364,23 +430,12 @@ def observe(camera, detector, flange, frames=DEFAULT_FRAMES, preview=None, note=
             note=list(note) + [
                 f"{len(shared)} corners in both eyes"
                 + (f", {len(lonely)} in the left only" if lonely else "")
-            ],
+            ] + ([f"skipped: {problem}"] if problem else []),
         )
         preview.hold(DETECTION_HOLD)
-    if len(shared) < MIN_CORNERS:
-        print(
-            f"      skipped: {len(shared)} corners in both eyes "
-            f"({len(left)} left, {len(right)} right), need {MIN_CORNERS}"
-        )
-        return None
-
-    ids = np.asarray(shared, dtype=int)
-    return Observation(
-        flange=flange,
-        ids=ids,
-        left=np.array([left[i] for i in shared]),
-        right=np.array([right[i] for i in shared]),
-    )
+    if problem:
+        print(f"      skipped: {problem}")
+    return observation
 
 
 # ----------------------------------------------------------------------
@@ -703,7 +758,7 @@ def _move_watching(arm, camera, preview, goal, speed, note=()):
     arm.wait_for_motion()
 
 
-def _capture_automatic(arm, camera, detector, kinematics, args, preview):
+def _capture_automatic(arm, camera, detector, kinematics, intrinsics, args, preview):
     """Walk the arm through a generated sweep, observing at each stop."""
     seed = arm.joint_values
     print(f"  seed pose {np.round(np.degrees(seed), 1)} deg (where the arm is now)")
@@ -738,7 +793,7 @@ def _capture_automatic(arm, camera, detector, kinematics, args, preview):
             measured = arm.joint_values
             observation = observe(
                 camera, detector, kinematics.flange_pose(measured), args.frames,
-                preview=preview, note=[label],
+                preview=preview, note=[label], intrinsics=intrinsics,
             )
             _debug_pose(index, arm, camera, detector, kinematics, q, measured,
                         observation)  # DEBUG (temporary)
@@ -780,7 +835,7 @@ def _pose_from_window(camera, detector, preview, index, frames):
             return "done"
 
 
-def _capture_manual(arm, camera, detector, kinematics, args, preview):
+def _capture_manual(arm, camera, detector, kinematics, intrinsics, args, preview):
     """Let the TA push the arm to each pose by hand.
 
     The controller's teaching mode, the same one `python -m
@@ -827,7 +882,7 @@ def _capture_manual(arm, camera, detector, kinematics, args, preview):
             measured = arm.joint_values
             observation = observe(
                 camera, detector, kinematics.flange_pose(measured), args.frames,
-                preview=preview, note=[f"pose {index}"],
+                preview=preview, note=[f"pose {index}"], intrinsics=intrinsics,
             )
             _debug_pose(index, arm, camera, detector, kinematics, None, measured,
                         observation)  # DEBUG (temporary)
@@ -988,6 +1043,14 @@ class _DebugLog:
                 f"{geometry_rms * 1000:.2f} mm, scale {scale:.4f}, row error "
                 f"{np.max(np.abs(record['row_error_px'])):.2f} px"
             )
+        frames = getattr(self, "frames", None)
+        if frames is not None:
+            # One row per frame: left ids, left corners, right ids, right corners.
+            packed = np.empty((len(frames), 4), dtype=object)
+            for row, found in enumerate(frames):
+                for column, value in enumerate(found):
+                    packed[row, column] = value
+            record["frames"] = packed
         np.savez(self.dir / f"{tag}.npz", **record)
         print(line)
 
@@ -1128,7 +1191,7 @@ def cmd_run(args):
             try:
                 capture = _capture_manual if args.manual else _capture_automatic
                 observations = capture(
-                    arm, camera, detector, kinematics, args, preview
+                    arm, camera, detector, kinematics, intrinsics, args, preview
                 )
             finally:
                 # Closed before the report, so the solver's numbers are not
