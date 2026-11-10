@@ -31,6 +31,7 @@ import ctypes
 import os
 import pathlib
 import re
+import time
 
 import numpy as np
 
@@ -76,6 +77,13 @@ PROFILE_KEYS = ("exposure", "gain") + tuple(CONTROLS)
 # Long enough that a dropped frame does not look like a dead camera, short
 # enough that a dead camera does not look like a slow one.
 FRAME_TIMEOUT_MS = 200
+
+# How long `close` waits after releasing the camera. Without it, a camera
+# released and then immediately reopened (by the next run, or by `read_serial`
+# followed by a stream in the same process) has been seen to stop answering
+# the request that reads its serial number until it is unplugged. Half a
+# second has been enough on the bench.
+CLOSE_SETTLE_S = 0.5
 
 LIBRARY_NAME = "libzed_oc_shim.so"
 SHIM_ENV = "ZED_OC_SHIM"
@@ -428,10 +436,15 @@ class ZedControls:
         return self.profile()
 
     def close(self):
-        """Release the camera, which has to happen before anything streams it."""
+        """Release the camera, which has to happen before anything streams it.
+
+        Waits `CLOSE_SETTLE_S` afterwards, so the camera is in a state to be
+        opened again by the time this returns.
+        """
         if self._handle is not None:
             self._library.zed_oc_close(self._handle)
             self._handle = None
+            time.sleep(CLOSE_SETTLE_S)
 
     def __enter__(self):
         return self
