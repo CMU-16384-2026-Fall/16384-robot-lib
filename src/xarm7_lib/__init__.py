@@ -16,7 +16,9 @@ first use so that the simulator needs neither OpenCV nor the native shim.
 point the camera measures can be reached for. It is calibrated once per bench
 by a TA with `python -m xarm7_lib.calibrate_handeye` and filed inside this
 installation, so there is nothing for a student to run or configure. Unlike the
-camera itself this costs no OpenCV, and so is imported normally.
+camera itself this costs no OpenCV, and so is imported normally. A tag fixed to
+the table and recorded with it lets whatever streams the camera notice a
+knocked one and correct for it; see `handeye.py`.
 """
 
 import importlib

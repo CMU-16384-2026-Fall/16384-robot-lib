@@ -278,7 +278,9 @@ handeye.project(pts)           # base frame -> rectified pixels, for drawing
 ```
 
 If it raises `HandEyeError`, the station has not been calibrated — that is a
-TA's job, not something to work around.
+TA's job, not something to work around. It never opens the camera, and it is
+the calibration as filed: checking it against the table tag is the light-stick
+detector's job (see [If the camera gets knocked](#if-the-camera-gets-knocked)).
 
 ## Calibrating a bench (TAs)
 
@@ -289,7 +291,7 @@ camera is, and where the board ended up on the flange.
 **1. Print the board.**
 
 ```bash
-python -m xarm7_lib.calibrate_handeye board
+python -m xarm7_lib.fiducials board
 ```
 
 That writes `charuco_board.pdf`: the board at exact scale, centred on a sheet
@@ -383,20 +385,108 @@ anywhere. Leaving it under `~/.config` is also how a TA tries a candidate
 without disturbing the class's copy: `$XARM7_HANDEYE`, then `~/.config`, then
 the installation, first hit winning.
 
-**5. Check it.**
+**5. Check it.** A tape measure to the camera is worth one more minute: the
+reported position should be where the camera physically is, to within a few
+centimetres.
 
-```bash
-python -m xarm7_lib.calibrate_handeye verify
+## If the camera gets knocked
+
+A small tag fixed to the table lets a bench keep working after a bump. It is
+recorded with the calibration, and the capstone's `LightsaberDetector`, which
+streams the camera, compares what it sees against that record whenever the tag
+is in view. At the dark exposure the sticks need it usually isn't, so students
+are told to shine a phone flashlight on it if the arm's aim looks off. If the
+camera has moved, the detector switches to a corrected calibration and prints a
+warning for a TA:
+
+```
+[xarm7_lib] WARNING: THE CAMERA HAS MOVED
+========================================================================
+  Camera has moved since its last calibration.
+  Measured from the table tag, 1.96 deg -2 mm.
+  You may keep working, but let a TA know to recalibrate bench3.
+========================================================================
 ```
 
-Compares the board pose the camera measures against the one forward kinematics
-predicts, live, while you move the arm by hand. The window draws both: magenta
-rings where the calibration says the corners are, green dots where they
-actually are. Rings sitting on dots is a good calibration, and the gap between
-them is the error the table is reporting. Do this at poses the fit never
-saw — it is the only check that catches a calibration that is self-consistent
-and wrong. A tape measure to the camera is worth one more minute: the reported
-position should be where the camera physically is, to within a few centimetres.
+Students change nothing in their code.
+
+**Setting it up (TAs).** Print the tag, with a different id on every bench, so a
+camera that can see a neighbour's tag cannot mistake it for its own. Ids 0-16 are
+the calibration board's markers and are refused; the default is 49, so counting
+down from there works (`--id 48`, `--id 47`, ...). 45 mm suits a tag up to about
+1.25 m from the camera. Further than that, make it bigger with `--length 70`,
+and pass the same size to `register-tag --length 70` or `run --tag-length 70`.
+
+```bash
+python -m xarm7_lib.fiducials tag --id 48
+```
+
+Print `reference_tag.pdf` at 100% and fix it to the table:
+
+- **Somewhere nothing moves it.** The camera cannot tell a tag that moved from
+  a camera that moved, and a moved tag gives a wrong correction with no error.
+- **Near the middle of where students work,** but where the arm will not cover
+  it. The correction is accurate near the tag and gets worse with distance.
+- **As face-on to the camera as you can manage.** Flat on the table it is
+  foreshortened, so propping it on a wedge towards the camera helps. `run` and
+  `register-tag` say so if it comes out too small.
+- **With its white margin intact.** The detector needs it.
+
+`run` records the tag when it finishes. For a calibration that is already filed:
+
+```bash
+python -m xarm7_lib.calibrate_handeye register-tag
+```
+
+Both record whichever tag is in view and print its id, so check it is this
+bench's. If more than one tag is in view, or the same id appears twice, they
+refuse and list what they saw: cover the other benches' tags and run it again,
+or pass `--id` (`--tag-id` for `run`) to pick one. Once recorded, only that id is
+ever looked for, and a check that sees it twice treats it as not in view.
+
+Recording it vouches for the calibration as it stands, so recalibrate with `run`
+instead if the camera may have been knocked since it was calibrated. Like `run`, this files
+under `~/.config` and prints the `sudo` line that moves it into the installation.
+
+**How it behaves.**
+
+| what the detector sees | what happens |
+|---|---|
+| the tag moved less than 0.1° in the picture, and less than 10 mm in range | the calibration as filed |
+| more than that, or the camera turned more than 2° | a corrected calibration, and the warning above, however far it moved |
+| the tag not in view | the calibration as filed, unchecked |
+
+Nothing is saved: every run starts from the calibration as filed, and is
+corrected again when the tag is lit. `load_handeye()` itself only ever returns
+the calibration as filed; it never opens the camera.
+
+**How far to trust it.** It is a stopgap. The tag is read at 2K whatever the
+calibration was made at, because a tag this size is too small to read reliably
+in HD. One small tag measures its direction and distance well and its own tilt
+badly, so the correction assumes a bump mostly turned the camera and slid it by
+no more than about a centimetre. A camera that really did slide further than
+that is corrected less well away from the tag: about 4 mm of extra error for
+every centimetre of sideways slide, half a metre from the tag at 1.25 m.
+
+Rendered through the real detector, for bumps of 1-5° and 2-15 mm, the error half
+a metre from the tag is:
+
+| tag, distance, height above the table | clean images | poor images |
+|---|---|---|
+| 45 mm, 1.0 m, 50° | about 1 mm | about 1 mm |
+| 45 mm, 1.25 m, 40° | 1-2 mm | 2-3 mm |
+| 45 mm, 1.5 m, 30° | 2-3 mm | 6-7 mm |
+| 45 mm, 1.5 m, 20° | 8-13 mm | 8-11 mm |
+| 70 mm, 1.5 m, 30° | 2-3 mm | 2-3 mm |
+| 70 mm, 1.5 m, 20° | 3-5 mm | 3-5 mm |
+
+Uncorrected, the same bumps are 16-112 mm out. These are renders, not a real ZED,
+so treat them as a best case. The errors quoted in the warning are the fit's own
+estimate and run low on a small tag or a poor image, which is why it says a few
+times that. The thresholds were set on renders too: light the tag in the
+light-stick live window (`python -m libcapstone.light_stick`) a few times as the
+camera warms up, and if a camera nobody touched warns that it moved, raise
+`MOVED_BEARING` and `MOVED_RANGE` in `handeye.py`.
 
 ## What goes wrong quietly
 
@@ -412,16 +502,6 @@ Three things, none of which announces itself:
   differing only in position leave the camera's orientation unconstrained. The
   generated sweep turns each wrist joint in turn for this reason, and the
   leave-one-out number is what exposes it.
-
-The solver itself can be checked without a camera or an arm:
-
-```bash
-python -m xarm7_lib.calibrate_handeye self-test
-```
-
-A synthetic bench with a known answer, real kinematics and real board geometry.
-It recovers the camera to about 0.03° and 0.5 mm, and fails loudly if any
-transform is composed the wrong way round.
 
 # The picture
 
@@ -564,9 +644,7 @@ by *opening* the camera, and the visualizer is already streaming it: asked
 instead of told, the library would open a camera that is busy, get nothing
 back, and go quiet about the one camera it is certainly looking through.
 Without a serial it falls back to probing the bus, which is right for a
-visualizer that owns no camera and fails for one that does. `handeye=` on
-`register_visualizer` hands a calibration over outright and skips the lookup
-either way.
+visualizer that owns no camera and fails for one that does.
 
 With `frame = "camera"` and no calibration filed on the bench, nothing is
 drawn, and the reason is printed once. That is deliberate: camera coordinates
