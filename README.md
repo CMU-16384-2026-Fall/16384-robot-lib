@@ -238,6 +238,18 @@ safety box this is what gets it back in. It is also the quickest check that
 your machine can talk to the controller at all: it connects, prints the joint
 angles, and doesn't move the arm anywhere on its own.
 
+## Setting the gripper from a terminal
+
+```
+python -m xarm7_lib.grip 1.0
+```
+
+Moves the jaws to an opening, 0.0 shut to 1.0 wide open, the same fraction
+`grip` takes, and prints where they stopped. `--speed` sets the speed as a
+fraction of full speed (half by default). Like `free_drive`, it reads
+`$ROBOT_IP` or takes an address after the opening, and connects with the guard
+off: a grip is never checked against the guard, and nothing but the jaws moves.
+
 # Hand-eye calibration
 
 The ZED is bolted down relative to the arm's base, so one transform carries
