@@ -79,6 +79,7 @@ import traceback
 
 import numpy as np
 
+from xarm.core.config.x_code import ControllerError, ControllerWarn
 from xarm.core.config.x_config import XCONF
 from xarm.wrapper import XArmAPI
 
@@ -149,22 +150,54 @@ _TOOL_XARM_GRIPPER = 1  # ... and with the xArm Gripper on it
 _VELOCITY_HORIZON = 5.0  # s
 
 
+# API codes that mean "the controller is latching something", not that the
+# command itself was bad (APIState.HAS_ERROR / HAS_WARN / STATE_NOT_READY).
+_LATCHED_CODES = (
+    XCONF.UxbusState.ERR_CODE,
+    XCONF.UxbusState.WAR_CODE,
+    XCONF.UxbusState.STATE_NOT_READY,
+)
+
+
+def _describe_controller(arm):
+    """Name the error and warning the controller is latching, if any.
+
+    Returns "" when the report shows nothing wrong.
+    """
+    lines = []
+    error = arm.error_code or 0
+    warn = arm.warn_code or 0
+    if error:
+        title = ControllerError(error).title["en"]
+        # The SDK's titles for the emergency stops end in a dangling "to stop".
+        title = title.removesuffix(" to stop")
+        lines.append(f"controller error {error}: {title}.")
+    if warn:
+        lines.append(f"controller warning {warn}: {ControllerWarn(warn).title['en']}.")
+    return "\n".join(lines)
+
+
 class XArmError(RuntimeError):
     """The controller refused a command, or isn't in a state to serve one.
 
     `code` is the SDK's API code when the failure came from a call; `error_code`
-    is whatever error the controller itself is latching, if any.
+    is whatever error the controller itself is latching, if any. `hint`, when
+    given, is a plain-language account of why and what to do about it, and is
+    printed on the lines after the summary.
     """
 
-    def __init__(self, what, code=0, error_code=0):
+    def __init__(self, what, code=0, error_code=0, hint=""):
         detail = what
         if code:
             detail += f" (code={code})"
         if error_code:
             detail += f" (controller error={error_code})"
+        if hint:
+            detail += "\n" + hint
         super().__init__(detail)
         self.code = code
         self.error_code = error_code
+        self.hint = hint
 
 
 class RealXArm7(RobotInterface):
@@ -273,10 +306,24 @@ class RealXArm7(RobotInterface):
         if clear_errors and self.arm.has_err_warn:
             self.arm.clean_warn()
             self.arm.clean_error()
+            # Some errors can't be cleared while their cause is still there —
+            # an emergency stop held in is the usual one. Say so here, rather
+            # than let the next call fail with a bare "has warning" code. The
+            # error code comes off the report, so give it a moment to catch up.
+            deadline = time.monotonic() + _MODE_REPORT_TIMEOUT
+            while self.arm.error_code and time.monotonic() < deadline:
+                time.sleep(_POLL_PERIOD)
+            if self.arm.error_code:
+                raise XArmError(
+                    "controller error would not clear",
+                    error_code=self.arm.error_code,
+                    hint=_describe_controller(self.arm),
+                )
         elif self.arm.error_code:
             raise XArmError(
                 "controller is in an error state; clear it or pass clear_errors=True",
                 error_code=self.arm.error_code,
+                hint=_describe_controller(self.arm),
             )
 
         self._guard = (
@@ -843,7 +890,8 @@ class RealXArm7(RobotInterface):
 
     def _check(self, code, what):
         if code != 0:
-            raise XArmError(f"{what} failed", code, self.arm.error_code)
+            hint = _describe_controller(self.arm) if code in _LATCHED_CODES else ""
+            raise XArmError(f"{what} failed", code, self.arm.error_code, hint)
         return code
 
     def _joint_states(self):
