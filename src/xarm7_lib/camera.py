@@ -398,3 +398,17 @@ class ZedOpenCapture:
     def __repr__(self):
         serial = f"SN{self.serial}" if self.serial else "unknown serial"
         return f"<ZedOpenCapture {serial} {self.resolution} {self.size[0]}x{self.size[1]}>"
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--resolution", default="2K", choices=["2K", "FHD", "HD", "VGA"])
+    args = parser.parse_args()
+
+    with ZedOpenCapture(resolution=args.resolution) as camera:
+        print(camera)
+        while True:
+            cv2.imshow("zed (left | right)", camera.read_raw())
+            if cv2.waitKey(1) & 0xFF in (ord("q"), 27):
+                break
+    cv2.destroyAllWindows()
