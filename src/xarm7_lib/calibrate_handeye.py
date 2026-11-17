@@ -1173,8 +1173,10 @@ def cmd_run(args):
                     "what the calibration is filed under. Pass --serial — it is "
                     "printed on the camera's back panel."
                 )
-            lens = "fisheye" if camera.calibration.fisheye else "pinhole"
-            print(f"  SN{serial} at {camera.size[0]}x{camera.size[1]}, {lens} lens")
+            print(
+                f"  SN{serial} at {camera.size[0]}x{camera.size[1]}, "
+                f"{camera.calibration.lens} lens"
+            )
             intrinsics = Intrinsics.from_stereo(camera.calibration)
 
             # DEBUG (temporary)

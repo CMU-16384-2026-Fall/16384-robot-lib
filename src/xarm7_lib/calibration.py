@@ -41,6 +41,12 @@ handing fisheye coefficients to the pinhole routines leaves nearly all of the
 distortion in place, and quietly, because the numbers are the same size and
 the result still looks like a picture. Which model a file means is read off
 its keys, and `StereoCalibration.fisheye` says which was found.
+
+A second wrinkle: the per-resolution sections are not the whole pinhole model.
+A `[LEFT_DISTO]`/`[RIGHT_DISTO]` pair carries the same coefficients plus k4..k6,
+cv2's rational denominator, and without it the rectification can crop most of
+the image away. See `_rational`; `StereoCalibration.rational` says whether it
+was used.
 """
 
 import configparser
@@ -48,6 +54,7 @@ import os
 import pathlib
 import re
 import urllib.request
+import warnings
 
 import cv2
 import numpy as np
@@ -78,6 +85,8 @@ _DOWNLOAD_TIMEOUT = 10.0
 # no tangential terms, and spends the same key names on further radial ones.
 _PINHOLE_KEYS = ("k1", "k2", "p1", "p2", "k3")
 _FISHEYE_KEYS = ("k1", "k2", "k3", "k4")
+# cv2's rational model: the pinhole five plus a denominator, k4..k6.
+_RATIONAL_KEYS = _PINHOLE_KEYS + ("k4", "k5", "k6")
 
 _NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
@@ -166,6 +175,45 @@ def _intrinsics(conf, section):
     return K, D, fisheye
 
 
+def _rational(conf, eye, D):
+    """The 8-coefficient rational distortion for one eye, or None to keep `D`.
+
+    Stereolabs files carry a `[LEFT_DISTO]`/`[RIGHT_DISTO]` section beside the
+    per-resolution ones, holding the lens's full model: the same k1, k2, k3, p1
+    and p2, plus k4..k6, which cv2 reads as the denominator of its rational
+    model. The per-resolution sections leave that denominator out, and the
+    five coefficients on their own are not a smaller version of the same lens
+    -- they are a polynomial that, on some units, folds back before it reaches
+    the image corners. `stereoRectify` then finds hardly any pixel valid in
+    both eyes and zooms in fivefold, and the rows it does keep misalign by
+    several pixels.
+
+    The section is used only when it agrees with the per-resolution one on the
+    five shared coefficients. They are written together at the factory, so a
+    mismatch means one was rewritten -- most likely a recalibration that
+    replaced the per-resolution numbers and left a stale DISTO behind -- and
+    then the five are the ones to trust.
+    """
+    section = f"{eye}_DISTO"
+    if section not in conf:
+        return None
+    values = conf[section]
+    try:
+        coefficients = np.array(
+            [_number(values[key]) if key in values else 0.0 for key in _RATIONAL_KEYS]
+        )
+    except ValueError as error:
+        raise CalibrationError(f"[{section}] is malformed: {error}") from error
+    if not np.allclose(coefficients[:5], D, rtol=1e-6, atol=1e-12):
+        warnings.warn(
+            f"[{section}] disagrees with the per-resolution {eye.lower()} "
+            "coefficients, so it is ignored and the 5-coefficient model is used",
+            stacklevel=3,
+        )
+        return None
+    return coefficients
+
+
 def _extrinsics(conf, resolution):
     if "STEREO" not in conf:
         raise CalibrationError("conf file has no [STEREO] section")
@@ -226,6 +274,14 @@ class StereoCalibration:
                 "rectification that spans two models, so this conf file is malformed"
             )
         self.fisheye = left_fisheye
+        # Both eyes or neither: rectification itself would cope with a mix, but
+        # one eye on the folded 5-coefficient model is the bug this avoids.
+        self.rational = False
+        if not self.fisheye:
+            left = _rational(conf, "LEFT", self.D1)
+            right = _rational(conf, "RIGHT", self.D2)
+            if left is not None and right is not None:
+                self.D1, self.D2, self.rational = left, right, True
         self.R, self.T = _extrinsics(conf, resolution)
         self._rectified = None
         self._maps = None
@@ -392,5 +448,11 @@ class StereoCalibration:
 
     def __repr__(self):
         serial = f"SN{self.serial}" if self.serial else "unknown serial"
-        lens = "fisheye" if self.fisheye else "pinhole"
-        return f"<StereoCalibration {serial} {self.resolution} {lens}>"
+        return f"<StereoCalibration {serial} {self.resolution} {self.lens}>"
+
+    @property
+    def lens(self):
+        """The distortion model in use: "fisheye", "pinhole (rational)" or "pinhole"."""
+        if self.fisheye:
+            return "fisheye"
+        return "pinhole (rational)" if self.rational else "pinhole"

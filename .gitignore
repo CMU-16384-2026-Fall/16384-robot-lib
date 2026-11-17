@@ -24,3 +24,5 @@ reference_tag.*
 debug/
 docs/
 handeye_debug/
+
+reference_tag*.pdf
